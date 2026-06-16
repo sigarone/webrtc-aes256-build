@@ -9,10 +9,19 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # plain bash (NO -e): we manage failures explicitly so the apt->opam fallback
+    # and the `tee` of a query-FALSE verdict do not abort the job.
+    shell: bash
+
 jobs:
   proverif:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      OPAMYES: "1"
+      OPAMCONFIRMLEVEL: unsafe-yes   # let opam depext run `sudo apt-get` for GTK2 (lablgtk)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,45 +29,56 @@ jobs:
       - name: Install ProVerif (apt -> opam fallback)
         run: |
           set -x
-          # --- Path 1: apt (proverif is NOT in the Ubuntu archive, so this is
-          #     expected to fail; we try it per the gate instructions, then fall
-          #     back to opam, which is the official ProVerif distribution). ---
+          # --- Path 1: apt.  ProVerif is NOT in the Ubuntu archive, so this is
+          #     expected to fall through; we try it per the gate instructions. ---
           if sudo apt-get update && sudo apt-get install -y proverif; then
             echo "INSTALLED_VIA=apt" >> "$GITHUB_ENV"
-          else
-            echo "apt path unavailable (expected: no 'proverif' package); falling back to opam."
-            # opam needs an OCaml toolchain; lablgtk (a proverif dep) needs GTK2 dev libs.
-            sudo apt-get install -y opam m4 pkg-config \
-              libgtk2.0-dev libgtksourceview2.0-dev || true
-            opam init -y --disable-sandboxing --bare
-            # a recent OCaml that proverif 2.05 builds against
-            opam switch create proverif 4.14.2 || opam switch proverif
-            eval "$(opam env --switch=proverif)"
-            opam install -y proverif
-            echo "INSTALLED_VIA=opam" >> "$GITHUB_ENV"
-            # subsequent steps re-eval `opam env` themselves (see below); we do not
-            # push opam's shell-export lines into $GITHUB_ENV (wrong format).
+            echo "apt provided proverif (unexpected but fine)."
+            exit 0
           fi
+          echo "apt has no 'proverif' package (expected); falling back to opam (official distribution)."
+
+          # --- Path 2: opam.  Install opam ALONE (a single-package apt call so a
+          #     bad sibling name can never sink it).  GTK2 dev libs for lablgtk are
+          #     installed by opam's depext (OPAMCONFIRMLEVEL=unsafe-yes), and we
+          #     also pre-install the known-good one explicitly as a belt-and-braces. ---
+          sudo apt-get install -y opam
+          sudo apt-get install -y m4 pkg-config libgtk2.0-dev || true
+
+          # init with a < 5.0 OCaml (lablgtk conflicts with ocaml >= 5.0).
+          opam init -y --disable-sandboxing --compiler=4.14.2 --bare || opam init -y --disable-sandboxing --bare
+          opam switch create proverif 4.14.2 || opam switch set proverif || true
+          eval "$(opam env --switch=proverif --set-switch 2>/dev/null || opam env)"
+          opam --version
+          ocaml -version || true
+
+          # depext + build proverif.  --confirm-level lets opam call sudo apt for
+          # system deps (conf-gtk2 -> libgtk2.0-dev) non-interactively.
+          opam install -y --confirm-level=unsafe-yes proverif
+
+          echo "INSTALLED_VIA=opam" >> "$GITHUB_ENV"
+          # persist ONLY the opam-relevant env vars (KEY=value) into $GITHUB_ENV
+          # so later steps find `proverif` on PATH without re-evaluating opam env.
+          opam env --switch=proverif --set-switch | sed -n "s/^\([A-Za-z_][A-Za-z0-9_]*\)='\(.*\)'; export .*/\1=\2/p" >> "$GITHUB_ENV"
 
       - name: Show ProVerif version
         run: |
           set -x
-          if [ "${INSTALLED_VIA:-}" = "opam" ]; then eval "$(opam env --switch=proverif)"; fi
-          which proverif || true
-          proverif -help 2>&1 | head -5 || true
+          which proverif || { echo "proverif not on PATH"; exit 1; }
+          # ProVerif prints its banner/version on a bare invocation or -help.
+          proverif 2>&1 | head -3 || true
 
       - name: Run ProVerif on the ratchet model
         id: run
         run: |
           set -x
-          if [ "${INSTALLED_VIA:-}" = "opam" ]; then eval "$(opam env --switch=proverif)"; fi
-          # Capture full stdout+stderr; do NOT fail the step on a query-FALSE
-          # verdict (we still want to upload the output for review).
-          proverif proof/ratchet-model.pv 2>&1 | tee proverif-output.txt
-          # The RESULT lines are the tool output that matters; surface a summary.
-          echo "----- RESULT lines -----"
-          grep -E '^(RESULT|Verification summary)' proverif-output.txt || \
-            echo "(no RESULT lines -- likely a parse error; see full output artifact)"
+          which proverif || { echo "proverif missing; cannot run"; exit 1; }
+          # Capture full stdout+stderr; the `|| true` ensures a query-FALSE verdict
+          # (proverif exit != 0) does NOT abort the step -- we still upload output.
+          proverif proof/ratchet-model.pv 2>&1 | tee proverif-output.txt || true
+          echo "----- RESULT / summary lines -----"
+          grep -E '^(RESULT|Verification summary|--------)' proverif-output.txt \
+            || echo "(no RESULT lines -- likely a parse error; see full artifact)"
 
       - name: Upload ProVerif output
         if: always()
