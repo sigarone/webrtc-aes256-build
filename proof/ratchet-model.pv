@@ -480,19 +480,15 @@ event Resent(aeadctx, bitstring).
    crash/resume that reads back and re-seals the SAME persisted bytes.  No parallel
    contention on the slot => no TOCTOU, no mutex needed (ProVerif tables are sound
    under sequential access).                                                        *)
-let wa_seal_seq(slot: aeadctx, ka: key, ci: idx, hh: hi, m_orig: bitstring) =
-    event Attempt(slot, m_orig);
+(* RESUME-or-RE-SEND helper: read the slot's persisted bytes; if present, re-send
+   VERBATIM (§10 pt.4); if (somehow) absent, this is the first writer.  A macro call
+   is a valid process TAIL, so it is sequenced AFTER the first write below.          *)
+let wa_resume(slot: aeadctx, ka: key, ci: idx, hh: hi) =
     get wa_log(=slot, m_stored) in
-        (* RESUME path: slot already persisted -> re-send the STORED bytes VERBATIM
-           (§10 pt.4 "re-transmit the persisted sealed bytes verbatim"). *)
         ( event Resent(slot, m_stored);
-          event Sealed(slot, m_stored);
+          event Sealed(slot, m_stored);                 (* re-seal SAME bytes *)
           out(net, senc(ka, ci, hh, m_stored, mkAD(V4, SUITE01))) )
-    else
-        (* FIRST-WRITE path: durably persist BEFORE seal (§10 pt.1), then seal. *)
-        ( insert wa_log(slot, m_orig);
-          event Sealed(slot, m_orig);
-          out(net, senc(ka, ci, hh, m_orig, mkAD(V4, SUITE01))) ).
+    else 0.   (* nothing persisted -> nothing to re-send *)
 
 let P_writeahead(ck_gen_send: key) =
     let ka = k_aead(k_text(hmac_msg(ck_gen_send))) in
@@ -502,11 +498,18 @@ let P_writeahead(ck_gen_send: key) =
     new ci_shared: idx;
     out(net, ci_shared);
     let slot_a = aeadCtx(D_text, ka, ci_shared, hh) in
-    (* (1) original write at slot_a, and (2) a crash/resume that re-runs slot_a:
-       the resume reads back wa_msg_a and re-seals it VERBATIM -- sequential, so the
-       `get` in the resume sees the insert from the first write. *)
-    ( wa_seal_seq(slot_a, ka, ci_shared, hh, wa_msg_a);   (* first write *)
-      wa_seal_seq(slot_a, ka, ci_shared, hh, wa_msg_a) )   (* resume: re-send verbatim *)
+    (* (1) FIRST WRITE at slot_a: persist wa_msg_a BEFORE seal (§10 pt.1), seal it,
+       THEN (sequentially, as the tail) (2) a crash/resume re-reads slot_a and
+       re-sends wa_msg_a VERBATIM.  Because it is one sequential process, the resume's
+       `get` sees the `insert` from the first write -- no race, no mutex.            *)
+    get wa_log(=slot_a, m_dup) in
+        ( 0 )   (* already persisted (e.g. earlier replica): do not double-write *)
+    else
+        ( insert wa_log(slot_a, wa_msg_a);
+          event Attempt(slot_a, wa_msg_a);
+          event Sealed(slot_a, wa_msg_a);
+          out(net, senc(ka, ci_shared, hh, wa_msg_a, mkAD(V4, SUITE01)));
+          wa_resume(slot_a, ka, ci_shared, hh) )           (* resume: re-send verbatim *)
     |
     (* (3) a genuinely DIFFERENT plaintext (wa_msg_b) is a resubmission: §10 pt.4 says
        it is assigned the NEXT FREE idx -> a DISTINCT slot.  It seals wa_msg_b at
@@ -515,7 +518,10 @@ let P_writeahead(ck_gen_send: key) =
     ( new ci_next: idx;
       out(net, ci_next);
       let slot_b = aeadCtx(D_text, ka, ci_next, hh) in
-      wa_seal_seq(slot_b, ka, ci_next, hh, wa_msg_b) ).
+      event Attempt(slot_b, wa_msg_b);
+      insert wa_log(slot_b, wa_msg_b);
+      event Sealed(slot_b, wa_msg_b);
+      out(net, senc(ka, ci_next, hh, wa_msg_b, mkAD(V4, SUITE01))) ).
 (* NOTE (sanity, for the human reviewer): query (b) is non-vacuous -- Sealed fires
    with wa_msg_a (at slot_a, first write AND resume re-send) and with wa_msg_b (at the
    distinct slot_b).  The §10 invariant being tested is "no DIFFERENT plaintext at a
