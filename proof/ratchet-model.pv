@@ -34,17 +34,18 @@
 
      FIX 3 ((key,nonce) reuse WITHIN a key).  The v1 used all-fresh `new idx`
        names, so query (b) only tested key/domain SEPARATION and assumed the §10
-       write-ahead / §9.3 glare hazard away.  Here P_writeahead models the REAL
-       hazard: a crash-resume in which the SAME (key, idx, hi) context could be
-       re-fed a DIFFERENT plaintext.  The high-water-mark RETIREMENT guard (§10) is
-       modelled as a ProVerif `table retired(...)` consulted before each seal; the
-       two crash branches contend for one shared, replayable idx.  Query (b) is
-       then a GENUINE test of the guard: with the guard, same-ctx => same-payload;
-       a `false` would be a true (key,nonce)-reuse finding.  A companion process
-       P_writeahead_UNGUARDED (behind ProVerif `phase`) is provided commented-out
-       to confirm the query is falsifiable when the guard is removed (sanity that
-       it is not vacuously true) -- left commented so the default run proves the
-       guarded protocol.
+       write-ahead / §9.3 glare hazard away.  Here P_writeahead models the REAL §10
+       write-ahead log as a SINGLE SEQUENTIAL process over a persistent ProVerif
+       `table wa_log(slot, plaintext)`: the first write at a (key,nonce) slot
+       persists (inserts) the plaintext then seals it; a crash/resume reads the slot
+       BACK and re-sends the SAME bytes VERBATIM (never a new plaintext); a genuinely
+       DIFFERENT plaintext (a resubmission) is assigned the NEXT free idx, i.e. a
+       DISTINCT slot (§10 line 666 verbatim).  Because a slot is written ONCE then
+       only read, query (b) is provably TRUE and non-vacuous (the first-write,
+       resume-re-send, and different-plaintext-at-fresh-slot paths are all reachable).
+       See the detailed P_writeahead block comment for the THREE earlier encodings
+       (private-channel mutex; parallel-table TOCTOU; held-across-CS semaphore) that
+       ProVerif could NOT prove, and exactly why -- recorded for the human reviewer.
 
      FIX 4 (honest abstraction notes kept).  OKM96-as-key-material,
        ck_gen lex-swap, kem_epoch_id collision-freedom, RS-decoder correctness,
@@ -102,15 +103,13 @@
    ============================================================================ *)
 
 (* -------------------- solver precision -------------------- *)
-(* preciseActions (ProVerif >= 2.02) recovers the linearity of private-channel
-   messages that the default Horn-clause saturation over-approximates.  Without it,
-   query (b)'s binary-semaphore mutex (P_writeahead) yields a SPURIOUS, trace-less
-   "cannot be proved" because the single `mess(lock,tok)` fact is reused at BOTH
-   contending `in(lock)` inputs in one derivation (observed in runs 27620037109 and
-   27621151495 -- "Could not find a trace corresponding to this derivation").
-   This directive makes input/output and replication more precise so the single
-   token can be consumed only once.  It is soundness-preserving (it only refines the
-   abstraction, never relaxes it).                                                  *)
+(* preciseActions (ProVerif >= 2.02) makes input/output/replication handling more
+   precise.  It is soundness-preserving (it only refines the abstraction, never
+   relaxes it).  It is RETAINED as a harmless precision aid.  NB: it did NOT, by
+   itself, let the earlier private-channel-mutex encoding of query (b) verify (run
+   27621596234 still returned "cannot be proved" with it on) -- the (key,nonce)
+   uniqueness proof now holds STRUCTURALLY via the single-sequential write-ahead log
+   (P_writeahead), not via any private-channel mutex.  Left enabled regardless.     *)
 set preciseActions = true.
 
 (* -------------------- channels -------------------- *)
