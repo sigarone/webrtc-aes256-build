@@ -1,30 +1,21 @@
-From: Q-Audion <dep.ivanov@gmail.com>
-Subject: [PATCH] FrameCryptor: AES-256-GCM when key material is 32 bytes
+FrameCryptor: AES-256-GCM when the shared key material is 32 bytes.
 
 The AEAD already selects AES-256-GCM when the derived key is 32 bytes
-(GetAesGcmAlgorithmFromKeySize). The only blocker is ParticipantKeyHandler::
-SetKeyFromMaterial hardcoding the derived length to 128 bits. Derive the length
-from the key-material size instead: a 32-byte shared key -> 256-bit key ->
-AES-256-GCM; any other size keeps the original 128-bit behavior. The app then
-chooses the cipher purely by the byte length it passes to setSharedKey() — no
-Java/JNI API change. ratchet_window_size=0 (no ratcheting) so the .cc ratchet
-paths are not exercised; left unchanged to keep this a single, low-risk hunk.
+(GetAesGcmAlgorithmFromKeySize). ParticipantKeyHandler::SetKeyFromMaterial
+hardcoded the derived length to 128 bits; derive it from the key-material size
+instead (32 -> 256, else 128). No Java/JNI API change — the app picks the cipher
+by the byte length it passes to setSharedKey(). ratchet_window_size=0 so the .cc
+ratchet paths are unused; single hunk. Ref: livekit/client-sdk-android#952.
 
 diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
 --- a/api/crypto/frame_crypto_transformer.h
 +++ b/api/crypto/frame_crypto_transformer.h
-@@ -201,8 +201,12 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
-   void SetKeyFromMaterial(std::vector<uint8_t> password, int key_index) {
-     webrtc::MutexLock lock(&mutex_);
-     if (key_index >= 0) {
+@@ -204,7 +204,7 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
        current_key_index_ = key_index % crypto_key_ring_.size();
      }
-+    // Q-Audion AES-256 E2EE: pick the derived encryption-key length from the
-+    // key-material size. 32-byte shared key -> 256-bit key -> AES-256-GCM
-+    // (GetAesGcmAlgorithmFromKeySize selects the variant by size); any other
-+    // size preserves the original 128-bit behavior.
      crypto_key_ring_[current_key_index_] =
 -        DeriveKeys(password, key_provider_->options().ratchet_salt, 128);
-+        DeriveKeys(password, key_provider_->options().ratchet_salt,
-+                   password.size() == 32 ? 256 : 128);
++        DeriveKeys(password, key_provider_->options().ratchet_salt, password.size() == 32 ? 256 : 128);
    }
+
+   bool DecryptionFailure() {
