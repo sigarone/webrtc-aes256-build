@@ -1,0 +1,100 @@
+name: build-webrtc-aes256-aar
+
+# Builds the LiveKit/webrtc-sdk fork of libwebrtc (M144) with the AES-256
+# FrameCryptor patch, producing an Android AAR (arm64-v8a). Free public-repo
+# runner: disk reclaimed via maximize-build-space, swap as link-OOM insurance.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Android ABI(s), space separated"
+        default: "arm64-v8a"
+      webrtc_ref:
+        description: "webrtc-sdk/webrtc branch/tag"
+        default: "m144_release"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 12288
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: '/home/runner/webrtc'
+
+      - name: Checkout this repo (patch + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: ctrl
+
+      - name: Install depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+
+      - name: gclient config + sync (Android, shallow)
+        working-directory: /home/runner/webrtc
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/depot_tools:$PATH"
+          cat > .gclient <<EOF
+          solutions = [{
+            "name": "src",
+            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_deps": {},
+          }]
+          target_os = ["android", "unix"]
+          EOF
+          echo "::group::gclient sync"
+          gclient sync --no-history --shallow --nohooks
+          echo "::endgroup::"
+          echo "::group::runhooks"
+          gclient runhooks
+          echo "::endgroup::"
+          du -sh src 2>/dev/null || true
+          df -h /home/runner/webrtc || true
+
+      - name: Apply AES-256 FrameCryptor patch
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== target line BEFORE ==="
+          grep -n "DeriveKeys(password, key_provider_->options().ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
+          echo "=== target lines AFTER ==="
+          grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
+
+      - name: Build AAR
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/depot_tools:$PATH"
+          vpython3 ./tools_webrtc/android/build_aar.py \
+            --build-dir out/aar \
+            --output "$GITHUB_WORKSPACE/libwebrtc-aes256.aar" \
+            --arch ${{ github.event.inputs.arch }} \
+            --extra-gn-args 'is_java_debug=false rtc_include_tests=false rtc_use_h264=true rtc_use_h265=true is_component_build=false use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false rtc_enable_symbol_export=true use_custom_libcxx=false'
+          ls -lh "$GITHUB_WORKSPACE/libwebrtc-aes256.aar"
+
+      - name: Upload AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-aes256-aar
+          path: libwebrtc-aes256.aar
+          if-no-files-found: error
