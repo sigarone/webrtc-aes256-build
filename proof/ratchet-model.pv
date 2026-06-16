@@ -101,6 +101,18 @@
      (key,nonce)-reuse hazard.
    ============================================================================ *)
 
+(* -------------------- solver precision -------------------- *)
+(* preciseActions (ProVerif >= 2.02) recovers the linearity of private-channel
+   messages that the default Horn-clause saturation over-approximates.  Without it,
+   query (b)'s binary-semaphore mutex (P_writeahead) yields a SPURIOUS, trace-less
+   "cannot be proved" because the single `mess(lock,tok)` fact is reused at BOTH
+   contending `in(lock)` inputs in one derivation (observed in runs 27620037109 and
+   27621151495 -- "Could not find a trace corresponding to this derivation").
+   This directive makes input/output and replication more precise so the single
+   token can be consumed only once.  It is soundness-preserving (it only refines the
+   abstraction, never relaxes it).                                                  *)
+set preciseActions = true.
+
 (* -------------------- channels -------------------- *)
 free net: channel.                 (* public network -- Dolev-Yao attacker controls it *)
 
