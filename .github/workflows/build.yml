@@ -104,7 +104,7 @@ jobs:
             --build-dir out/aar \
             --output "$GITHUB_WORKSPACE/libwebrtc-aes256.aar" \
             --arch ${{ github.event.inputs.arch }} \
-            --extra-gn-args 'is_java_debug=false rtc_include_tests=false rtc_use_h264=true rtc_use_h265=true is_component_build=false use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false rtc_enable_symbol_export=true use_custom_libcxx=false use_clang_modules=false'
+            --extra-gn-args 'is_component_build=false rtc_include_tests=false is_debug=false enable_dsyms=false rtc_libvpx_build_vp9=true use_goma=false rtc_enable_symbol_export=true rtc_build_examples=false rtc_use_h264=true use_rtti=true libcxx_abi_unstable=false use_custom_libcxx=false is_java_debug=false'
           ls -lh "$GITHUB_WORKSPACE/libwebrtc-aes256.aar"
 
       - name: Upload AAR artifact
