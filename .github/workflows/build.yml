@@ -1,8 +1,11 @@
 name: build-webrtc-aes256-aar
 
 # Builds the LiveKit/webrtc-sdk fork of libwebrtc (M144) with the AES-256
-# FrameCryptor patch, producing an Android AAR (arm64-v8a). Free public-repo
-# runner: disk reclaimed via maximize-build-space, swap as link-OOM insurance.
+# FrameCryptor patch -> Android AAR (arm64-v8a). Free public-repo runner: a big
+# LVM volume is mounted at /home/runner/webrtc (maximize-build-space) and EVERY
+# heavy thing (depot_tools, cipd cache, all build caches, the checkout, out/)
+# lives there - the ~14GB root fs is NOT used for build data (that was the v1
+# OOM-on-disk: depot_tools .cipd_bin filled root).
 
 on:
   workflow_dispatch:
@@ -17,6 +20,14 @@ on:
 permissions:
   contents: write
 
+env:
+  WEBRTC_DIR: /home/runner/webrtc
+  CIPD_CACHE_DIR: /home/runner/webrtc/.cipd
+  XDG_CACHE_HOME: /home/runner/webrtc/.cache
+  PIP_CACHE_DIR: /home/runner/webrtc/.pipcache
+  VPYTHON_VIRTUALENV_ROOT: /home/runner/webrtc/.vpython
+  DEPOT_TOOLS_UPDATE: "0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,7 +36,7 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 2048
+          root-reserve-mb: 4096
           swap-size-mb: 12288
           remove-dotnet: 'true'
           remove-android: 'true'
@@ -39,18 +50,23 @@ jobs:
         with:
           path: ctrl
 
-      - name: Install depot_tools
+      - name: Prep dirs on the big volume
         run: |
           set -euo pipefail
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
-          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
-          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+          sudo chown -R "$USER" "$WEBRTC_DIR"
+          mkdir -p "$CIPD_CACHE_DIR" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$VPYTHON_VIRTUALENV_ROOT"
+          df -h "$WEBRTC_DIR" /
+
+      - name: Install depot_tools (on the big volume)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WEBRTC_DIR/depot_tools"
+          echo "$WEBRTC_DIR/depot_tools" >> "$GITHUB_PATH"
 
       - name: gclient config + sync (Android, shallow)
         working-directory: /home/runner/webrtc
         run: |
           set -euo pipefail
-          export PATH="$HOME/depot_tools:$PATH"
           cat > .gclient <<EOF
           solutions = [{
             "name": "src",
@@ -68,25 +84,24 @@ jobs:
           gclient runhooks
           echo "::endgroup::"
           du -sh src 2>/dev/null || true
-          df -h /home/runner/webrtc || true
+          df -h "$WEBRTC_DIR" /
 
       - name: Apply AES-256 FrameCryptor patch
         working-directory: /home/runner/webrtc/src
         run: |
           set -euo pipefail
-          echo "=== target line BEFORE ==="
-          grep -n "DeriveKeys(password, key_provider_->options().ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
+          echo "=== BEFORE ==="
+          grep -n "ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
           git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
-          echo "=== target lines AFTER ==="
+          echo "=== AFTER ==="
           grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
 
       - name: Build AAR
         working-directory: /home/runner/webrtc/src
         run: |
           set -euo pipefail
-          export PATH="$HOME/depot_tools:$PATH"
           vpython3 ./tools_webrtc/android/build_aar.py \
-            --build-dir out/aar \
+            --build-dir /home/runner/webrtc/out/aar \
             --output "$GITHUB_WORKSPACE/libwebrtc-aes256.aar" \
             --arch ${{ github.event.inputs.arch }} \
             --extra-gn-args 'is_java_debug=false rtc_include_tests=false rtc_use_h264=true rtc_use_h265=true is_component_build=false use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false rtc_enable_symbol_export=true use_custom_libcxx=false'
