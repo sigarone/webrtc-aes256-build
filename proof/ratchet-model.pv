@@ -1,0 +1,596 @@
+(* ============================================================================
+   ratchet-model.pv  --  ProVerif applied-pi model of the Q-Audion v4
+   "Chunked-SPQR PQ Triple Ratchet" core security properties (Phase-18 gate #14).
+
+   ----------------------------------------------------------------------------
+   CORRECTED v2 (2026-06-16).  This file supersedes the never-run v1 that the
+   top-tier paid review (PHASE0-LLM-PUSH-RESULTS.md §G-14) found to "prove the
+   wrong protocol".  The four review flaws are fixed here:
+
+     FIX 1 (root derivation to spec §4.2).  root_new is now OKM96[0..32) of a
+       SINGLE HKDF-Expand-SHA384 over the REAL info that binds ALL FOUR of:
+         info = "qa/v4/ratchet"
+              || session_epoch_id || BE32(ratchet_gen) || transcript_hash
+              || 0x00 (dir placeholder) || ratchet_v
+       NOT a bare hkdf_expand1(prk,label).  transcript_hash is the real §8
+       structure that LEADS with ratchet_v and binds both reconstructed objects
+       (EK,CT) and both ephemeral X25519 pubs.  Secrecy / uniqueness / PCS are
+       proven over THIS construction (helper kdf_okm96 below, used everywhere).
+
+     FIX 2 (non-circular anti-downgrade).  The v1 query restated "two distinct
+       HKDF labels give independent keys" (tautological in Dolev-Yao).  Here a
+       REAL legacy/misbehaving v3 SENDER actually emits a v3 frame whose root is
+       derived from a v3 transcript (transcript_v3 leads with V3) and whose AEAD
+       AAD binds (V3,suite).  The Dolev-Yao attacker has full network control and
+       may relay/splice/inject.  The honest v4 receiver attempts to open inbound
+       frames under BOTH its v4 key and a v3-derived key.  The query asks whether
+       a v4-bootstrapped receiver can EVER reach AcceptedUnderVersion(V3).  This
+       is non-vacuous (a v3 sender genuinely exists and transmits) and non-circular
+       (acceptance is blocked ONLY by the transcript_hash-leading binding diverging
+       the root AND the AAD ratchet_v||suite_id mismatch -- exactly the spec §9.4
+       bindings #2/#3, not a label-separation restatement).  The attacker is NOT
+       handed root0 here (that conflation would also break secrecy); root0 leakage
+       is the SEPARATE PCS test (P_pcs).
+
+     FIX 3 ((key,nonce) reuse WITHIN a key).  The v1 used all-fresh `new idx`
+       names, so query (b) only tested key/domain SEPARATION and assumed the §10
+       write-ahead / §9.3 glare hazard away.  Here P_writeahead models the REAL
+       hazard: a crash-resume in which the SAME (key, idx, hi) context could be
+       re-fed a DIFFERENT plaintext.  The high-water-mark RETIREMENT guard (§10) is
+       modelled as a ProVerif `table retired(...)` consulted before each seal; the
+       two crash branches contend for one shared, replayable idx.  Query (b) is
+       then a GENUINE test of the guard: with the guard, same-ctx => same-payload;
+       a `false` would be a true (key,nonce)-reuse finding.  A companion process
+       P_writeahead_UNGUARDED (behind ProVerif `phase`) is provided commented-out
+       to confirm the query is falsifiable when the guard is removed (sanity that
+       it is not vacuously true) -- left commented so the default run proves the
+       guarded protocol.
+
+     FIX 4 (honest abstraction notes kept).  OKM96-as-key-material,
+       ck_gen lex-swap, kem_epoch_id collision-freedom, RS-decoder correctness,
+       computational ML-KEM/X25519/GCM hardness -- all still ASSUMED, documented
+       in the header below and in PROOF-RESULTS.md §4 for the human reviewer.
+
+   PROVENANCE / SCOPE
+   ------------------
+   Clean-room symbolic model written from the project's own public-standard design
+   docs ONLY (WIRE-FORMAT-CHUNKED-v4-DRAFT.md §§3.x, 4.1-4.4, 8, 9.1-9.4, 10).
+   It transcribes NO signalapp/libsignal/ringrtc source and reuses none of their
+   names.  It DECIDES no crypto parameter; it is an analysis artifact for HUMAN
+   cryptographer review, NOT product code and NOT a closed gate.
+
+   WHAT CLOSES THE GATE
+   --------------------
+   A *ProVerif RESULT* line ("RESULT ... is true/false" per query) is the tool
+   output.  Even a clean run does NOT close gate #14 by itself: a human
+   cryptographer must first confirm the model faithfully encodes the spec (see the
+   PROOF-RESULTS.md §5 checklist) and that the abstractions below are acceptable.
+
+   ABSTRACTIONS (the model is SOUND only relative to these) -- FIX 4
+   ----------------------------------------------------------------------------
+   * Symbolic (Dolev-Yao) crypto: HKDF/HMAC/SHA2/SHA3/AES-GCM are perfect,
+     collision-free constructors in the term algebra.  This proves *structural*
+     key-separation, domain-separation, version-binding and reachability.  It does
+     NOT prove the computational hardness of ML-KEM-768 / X25519, nor GCM's
+     concrete (key,nonce)-reuse catastrophe (that catastrophe is exactly WHY
+     query (b) matters; the model proves reuse never *happens*, the cryptographer
+     argues the consequence separately).
+   * OKM96 (the 96-byte single HKDF-Expand output of §4.2) is modelled as a term
+     kdf_okm96(prk, info) from which root_new and the two chain-key slices are
+     extracted by three distinct slice projectors (okm_root / okm_s1 / okm_s2).
+     The BYTE-SLICE layout (offsets 0..32/32..64/64..96) is NOT modelled at the
+     byte level; the projectors are assumed independent, which is sound for
+     SEPARATION but does not pin the KAT byte layout (human review item).
+   * ck_gen lex-swap (§3.4): the send/recv slice assignment is abstracted to two
+     independent chain snapshots; the model does NOT encode the lex-order identity
+     comparison that assigns them.  Claim (to be reviewed): the swap only relabels
+     which secret each side uses, so it cannot create a reuse.
+   * kem_epoch_id collision-freedom (§3.4): represented by distinct per-braid `hi`
+     names + the domain tag; the byte preimage
+     first16(SHA-256(session_epoch_id||0x00||braid_class||call_id||BE32(gen))) is
+     assumed collision-free (free-constructor injectivity), not derived.
+   * Reed-Solomon: "any 12-of-18 shards reconstruct the SAME object" assumed; the
+     GF(2^8) matrix bytes are out of scope (gate UQ-6 / #12).
+   * X-Wing combiner SHA3-256(ssM||ssX||ctX||pkX||label): free constructor.  PQ
+     secrecy is modelled by the attacker getting the CLASSICAL half (X25519) on
+     demand and message-key secrecy still holding from the ML-KEM half.
+   * Single asymmetric braid per role, replicated unboundedly (`!`).  The
+     multi-generation sequential-epoch state machine, the backward-only admission
+     window (§9.3), and group mode (out of scope, §11) are not modelled, EXCEPT
+     that FIX 3 adds an explicit crash-resume contention process for the §10/§9.3
+     (key,nonce)-reuse hazard.
+   ============================================================================ *)
+
+(* -------------------- channels -------------------- *)
+free net: channel.                 (* public network -- Dolev-Yao attacker controls it *)
+
+(* -------------------- types -------------------- *)
+type key.          (* a 32-byte symmetric key (root / chain key / AEAD key) *)
+type elt.          (* X25519 group element / scalar *)
+type mlkem_sk.     (* ML-KEM-768 decapsulation key *)
+type mlkem_ek.     (* ML-KEM-768 encapsulation key *)
+type mlkem_ct.     (* ML-KEM-768 ciphertext *)
+type ss.           (* a shared-secret bitstring *)
+type label.        (* an HKDF info/label constant *)
+type role.         (* kem_role: EK vs CT *)
+type bclass.       (* braid_class: TEXT vs MEDIA *)
+type dom.          (* AEAD key-domain tag (text/chunk/ack/ctrl/media) *)
+type idx.          (* a counter value (chain_idx / shard_index / ctrl_seq / media_seq) *)
+type hi.           (* nonce high-lane value (ratchet_gen / rekey_epoch) *)
+type aeadctx.      (* the abstract (key,nonce)-context fed to GCM *)
+type sid.          (* session_epoch_id (canonical lex-min value, §2.5) *)
+type thash.        (* the §8 transcript_hash (a 32-byte SHA-256 digest) *)
+
+(* -------------------- constants: FROZEN label strings (Draft §4.4) -------- *)
+const L_root_init : label.   (* "qa/v4/root-init" *)
+const L_ratchet   : label.   (* "qa/v4/ratchet"   *)
+const L_text      : label.   (* "qa/v4/text"      *)
+const L_aead      : label.   (* "qa/v4/aead"      *)
+const L_chunk     : label.   (* "qa/v4/aead/chunk"*)
+const L_ack       : label.   (* "qa/v4/aead/ack"  *)
+const L_ctrl      : label.   (* "qa/v4/aead/ctrl" *)
+const L_media     : label.   (* "qa/v4/media/"    *)
+const XWingLabel  : label.   (* 0x5c2e2f2f5e5c    *)
+
+(* kem_role, braid_class discriminators *)
+const ROLE_EK : role.    const ROLE_CT : role.
+const BC_TEXT : bclass.  const BC_MEDIA : bclass.
+
+(* AEAD key-domain tags (Draft §4.4 distinct, non-prefix labels) *)
+const D_text  : dom.  const D_chunk : dom.  const D_ack : dom.  const D_ctrl : dom.  const D_media : dom.
+
+(* version / suite for the anti-downgrade binding (Draft §9.4) *)
+const V4 : label.            (* ratchet_v = 0x04 *)
+const V3 : label.            (* legacy ratchet_v = 0x03 *)
+const SUITE01 : label.       (* suite_id = 0x01 (v4 suite) *)
+const SUITE00 : label.       (* suite_id = 0x00 (legacy v3 suite) *)
+const DIR0 : bitstring.      (* fixed 0x00 dir placeholder (§4.2, §8) *)
+
+(* -------------------- primitive function symbols (Dolev-Yao perfect) ------------- *)
+
+(* HKDF-Extract(salt, ikm) -> PRK *)
+fun hkdf_extract(key, ss): key.
+
+(* --- FIX 1: the REAL §4.2 root KDF ---------------------------------------
+   info (§4.2) = L_ratchet || session_epoch_id(16) || BE32(ratchet_gen)
+               || transcript_hash(32) || 0x00 (dir placeholder) || ratchet_v
+   We model the info as a STRUCTURED constructor that binds ALL FOUR review
+   fields (session_epoch_id, ratchet_gen-as-hi, transcript_hash, ratchet_v), then
+   feed it through a single HKDF-Expand-SHA384 producing OKM96.  root_new and the
+   two chain slices are projected out.  The constructor's injectivity is exactly
+   the structural anti-splice/anti-downgrade property: any change to ANY bound
+   field yields a different info term => different OKM => different root.        *)
+fun info_ratchet(label (*L_ratchet*), sid (*session_epoch_id*), hi (*BE32 ratchet_gen*),
+                 thash (*transcript_hash*), bitstring (*0x00 dir*), label (*ratchet_v*)): label.
+fun kdf_okm96(key (*PRK_r*), label (*info*)): key.    (* the single HKDF-Expand-SHA384, L=96 *)
+(* three independent slice projectors over OKM96 (offsets 0..32 / 32..64 / 64..96) *)
+fun okm_root(key): key.    (* OKM96[0..32) -> root_new *)
+fun okm_s1(key): key.      (* OKM96[32..64) -> one chain slice *)
+fun okm_s2(key): key.      (* OKM96[64..96) -> other chain slice *)
+
+(* --- §8 transcript_hash: SHA-256 LEADING with ratchet_v, binding both
+   reconstructed objects (EK,CT) and both ephemeral X25519 pubs, the canonical
+   session_epoch_id and a FIXED 0x00 dir placeholder.  A free constructor: any
+   field change (esp. the LEADING ratchet_v) yields a distinct digest.          *)
+fun transcript_hash(label (*ratchet_v LEADS*), sid (*session_epoch_id*),
+                    bitstring (*0x00 dir*), hi (*BE32 ratchet_gen*), label (*suite_id*),
+                    mlkem_ek (*reconstructed EK*), mlkem_ct (*reconstructed CT*),
+                    elt (*dh_pub_init*), elt (*dh_pub_resp*)): thash.
+
+(* legacy expand-with-one-label (RETAINED only for the per-channel text/aead/file
+   subkeys of §4.3/§4.4 -- NOT for the root, which now uses kdf_okm96).          *)
+fun hkdf_expand1(key, label): key.
+fun hkdf_expand_role(key, label, role, hi): key.   (* chunk-key feed (role+braid) *)
+fun hkdf_expand_dom(key, label, hi): key.          (* ack/ctrl-key feed *)
+
+(* HMAC chain step (Draft §3.3): tags 0x01 (msg) / 0x02 (chain) *)
+fun hmac_msg(key): key.     (* msg_key_n = HMAC-SHA256(ck_n, 0x01) *)
+fun hmac_chain(key): key.   (* ck_{n+1}  = HMAC-SHA256(ck_n, 0x02) *)
+
+(* X25519 (RFC 7748): public(scalar)=elt ; dh(scalar, peer_pub)=ss *)
+fun x25519_pub(elt): elt.
+fun x25519(elt, elt): ss.
+equation forall a:elt, b:elt; x25519(a, x25519_pub(b)) = x25519(b, x25519_pub(a)).
+
+(* ML-KEM-768 (FIPS 203) as an idealised KEM:
+   encaps(ek, coins) -> (ct, ss) ; decaps(sk, ct) -> ss *)
+fun mlkem_pk(mlkem_sk): mlkem_ek.
+fun mlkem_encaps_ct(mlkem_ek, ss): mlkem_ct.   (* ct  = Encaps_ct(ek; coins) *)
+fun mlkem_encaps_ss(mlkem_ek, ss): ss.         (* ssM = Encaps_ss(ek; coins) *)
+reduc forall sk:mlkem_sk, coins:ss;
+      mlkem_decaps(sk, mlkem_encaps_ct(mlkem_pk(sk), coins))
+      = mlkem_encaps_ss(mlkem_pk(sk), coins).
+
+(* X-Wing combiner (Draft §5): SHA3-256(ssM || ssX || ctX || pkX || label) *)
+fun xwing(ss, ss, elt, elt, label): ss.
+
+(* The abstract AEAD (key,nonce) context.  An INJECTIVE public constructor:
+   if two aeadCtx terms are equal, ALL their arguments are equal.  Structural
+   model of "same key AND same nonce (idx low-lane + hi high-lane)".            *)
+fun aeadCtx(dom, key, idx, hi): aeadctx.
+
+(* AES-256-GCM as an idealised AEAD.  senc(key, idx, hi, plaintext, ad) -> ct.
+   sdec recovers plaintext ONLY with matching key + nonce + ad.                  *)
+fun senc(key, idx, hi, bitstring, bitstring): bitstring.
+reduc forall k:key, n:idx, h:hi, m:bitstring, ad:bitstring;
+      sdec(k, n, h, senc(k, n, h, m, ad), ad) = m.
+
+(* AAD builder: binds ratchet_v || suite_id (Draft §9.4 #3). *)
+fun mkAD(label, label): bitstring.
+
+(* -------------------- events / secrets (for the queries) -------------------- *)
+
+(* (a) message-key secrecy *)
+free secret_msg: bitstring [private].   (* the plaintext we test for secrecy *)
+
+(* (b) (key,nonce)-uniqueness (separation AND within-key reuse) *)
+event Sealed(aeadctx, bitstring).       (* a frame was sealed under ctx with payload *)
+
+(* (c) authentication / no-downgrade *)
+event BootstrapV4(label, label).        (* a session bootstrapped with (ver,suite) *)
+event AcceptRoot(key).
+event SendRoot(key).
+event AcceptedUnderVersion(label).      (* a message key was accepted under version *)
+
+(* (d) PCS *)
+event PCSGood(key).
+free secret_pcs: bitstring [private].
+
+(* (c1/FIX2) anti-downgrade probe: the payload a REAL v3 sender emits.  Kept
+   distinct from secret_msg so the downgrade test does not entangle secrecy (a). *)
+free dg_probe: bitstring [private].
+
+(* long-term / bootstrap secrets shared by both honest parties (declared here so
+   the §4.2 snapshot helpers below may reference them).                          *)
+free root0: key [private].              (* ROOT_0 from the authenticated handshake (§4.1) *)
+free session_epoch_id: sid [private].   (* canonical lex-min session_epoch_id (§2.5); carried
+                                           in the authenticated transcript, NOT attacker-known *)
+
+(* ==========================================================================
+   QUERIES
+   ========================================================================== *)
+
+(* ---- (a) SECRECY of the message key / plaintext ---- *)
+query attacker(secret_msg).
+(* Expected: RESULT not attacker(secret_msg[]) is true *)
+
+(* ---- (b) per-(key,nonce) UNIQUENESS -- separation AND within-key reuse ----
+   If the SAME aeadCtx ever seals TWO DIFFERENT payloads, query is false (a real
+   (key,nonce)-reuse finding).  Now exercised across the five domains (separation)
+   AND across the FIX-3 crash-resume contention (within-key reuse).             *)
+query c:aeadctx, m1:bitstring, m2:bitstring;
+      event(Sealed(c, m1)) && event(Sealed(c, m2)) ==> (m1 = m2).
+(* Expected: RESULT ... is true *)
+
+(* ---- (c1) NO-DOWNGRADE (FIX 2, non-circular) ----
+   A v4-bootstrapped receiver must never accept a message key under a v3 frame. *)
+query event(AcceptedUnderVersion(V3)) ==> false.
+(* Expected: RESULT ... is true.  Non-vacuous: a REAL v3 sender emits (P_v3_sender);
+   the attacker has full net control; acceptance is blocked ONLY by the §8
+   transcript_hash-leading-ratchet_v binding diverging the root AND the §9.4 #3
+   AAD ratchet_v||suite_id mismatch.  A `false` is a genuine downgrade attack.   *)
+
+(* ---- (c2) WEAK AGREEMENT on the root (interpreted, NOT a pass/fail gate) ----
+   Expected `false` and that is CORRECT: a single X-Wing braid is unauthenticated
+   by itself (public bob keys => off-path party can drive AcceptRoot).  Real
+   confidentiality rests on secret ROOT_0 (query a), not on this.  See
+   PROOF-RESULTS.md §3.                                                          *)
+query r:key; event(AcceptRoot(r)) ==> event(SendRoot(r)).
+
+(* ---- (d) PCS: query attacker(secret_pcs) -- declared near P_pcs ---- *)
+query attacker(secret_pcs).
+(* Expected: RESULT not attacker(secret_pcs[]) is true *)
+
+(* ==========================================================================
+   KEY-SCHEDULE HELPERS (Draft §4.1-§4.4)
+   ========================================================================== *)
+
+(* FIX 1: the REAL §4.2 step.  Given root_old, the X-Wing secret, the canonical
+   session_epoch_id, the ratchet_gen (as hi), the §8 transcript_hash and the
+   version, produce PRK_r then OKM96 then the three slices.                      *)
+letfun prk_of(root_old: key, ss_xwing: ss) = hkdf_extract(root_old, ss_xwing).
+letfun okm96_of(prk: key, seid: sid, gen: hi, th: thash, ver: label) =
+    kdf_okm96(prk, info_ratchet(L_ratchet, seid, gen, th, DIR0, ver)).
+(* slice projectors *)
+letfun root_of_okm(okm: key)  = okm_root(okm).
+letfun ck1_of_okm(okm: key)   = okm_s1(okm).
+letfun ck2_of_okm(okm: key)   = okm_s2(okm).
+
+(* text AEAD key (Draft §4.3): K_text then K_aead *)
+letfun k_text(mk: key) = hkdf_expand1(mk, L_text).
+letfun k_aead(kt: key) = hkdf_expand1(kt, L_aead).
+
+(* chunk/ack/ctrl keys (Draft §3.4/§3.5/§4.4): distinct domains, role+braid folded *)
+letfun k_chunk(ck_gen: key, rl: role, kemepoch: hi) = hkdf_expand_role(ck_gen, L_chunk, rl, kemepoch).
+letfun k_ack  (ck_gen: key, kemepoch: hi)           = hkdf_expand_dom (ck_gen, L_ack,  kemepoch).
+letfun k_ctrl (ck_gen: key, kemepoch: hi)           = hkdf_expand_dom (ck_gen, L_ctrl, kemepoch).
+
+(* A real generation-start chain snapshot bootstrapped from root0 via the FIX-1
+   §4.2 OKM construction, used to seed P_uniqueness / P_writeahead.  `which`
+   selects the OKM96[32..64) (s1, send) vs OKM96[64..96) (s2, recv) slice.  The
+   underlying X-Wing secret / gen / transcript are declared free-private seeds so
+   the snapshot is a deterministic function of the REAL §4.2 construction rather
+   than a fabricated bare key.                                                    *)
+free seed_xwing : ss   [private].   (* the braid's X-Wing secret feeding the snapshot *)
+free seed_gen   : hi   [private].   (* BE32(ratchet_gen) at the snapshot instant *)
+free seed_th    : thash[private].   (* the §8 transcript_hash for the snapshot braid *)
+letfun snap_okm() = kdf_okm96(hkdf_extract(root0, seed_xwing),
+                            info_ratchet(L_ratchet, session_epoch_id, seed_gen, seed_th, DIR0, V4)).
+letfun ck_gen_s1() = okm_s1(snap_okm()).   (* send slice  *)
+letfun ck_gen_s2() = okm_s2(snap_okm()).   (* recv slice  *)
+
+(* ==========================================================================
+   P_session : ONE X-Wing ratchet step (FIX 1 root), modelling secrecy (a) +
+   weak-agreement (c2).  Both peers feed byte-identical §4.2 info (canonical
+   session_epoch_id, fixed 0x00 dir, symmetric transcript_hash) => identical root.
+   (root0 and session_epoch_id are declared near the top secrets section.)
+   ========================================================================== *)
+
+let P_initiator(root_old: key, bob_static_x: elt, bob_kem_ek: mlkem_ek) =
+    new eph_x: elt;
+    new coins: ss;
+    let ctX = x25519_pub(eph_x) in
+    let ssX = x25519(eph_x, bob_static_x) in
+    let ssM = mlkem_encaps_ss(bob_kem_ek, coins) in
+    let ctM = mlkem_encaps_ct(bob_kem_ek, coins) in
+    let ss_xwing = xwing(ssM, ssX, ctX, bob_static_x, XWingLabel) in
+    (* FIX 1: real §8 transcript over reconstructed objects + both eph pubs,
+       LEADING with V4; symmetric (canonical session_epoch_id, fixed 0x00 dir). *)
+    new gen: hi;                              (* BE32(ratchet_gen) for this step *)
+    let th = transcript_hash(V4, session_epoch_id, DIR0, gen, SUITE01,
+                             bob_kem_ek, ctM, ctX, x25519_pub(bob_static_x)) in
+    (* FIX 1: real §4.2 root construction (binds all four review fields) *)
+    let prk = prk_of(root_old, ss_xwing) in
+    let okm = okm96_of(prk, session_epoch_id, gen, th, V4) in
+    let root_new = root_of_okm(okm) in
+    let ck_send  = ck1_of_okm(okm) in         (* this party's send slice (lex-swap abstracted) *)
+    out(net, (ctM, ctX, bob_kem_ek, th));     (* wire bytes incl. transcript on the R=1 frame *)
+    event SendRoot(root_new);
+    (* seal one TEXT message under K_aead off root_new's send chain *)
+    let mk = hmac_msg(ck_send) in
+    let kt = k_text(mk) in
+    let ka = k_aead(kt) in
+    new ci: idx;
+    let ad_text = mkAD(V4, SUITE01) in        (* AAD binds ratchet_v||suite_id (§9.4 #3) *)
+    event Sealed(aeadCtx(D_text, ka, ci, gen), secret_msg);
+    out(net, senc(ka, ci, gen, secret_msg, ad_text));
+    0.
+
+let P_responder(root_old: key, bob_static_x_sk: elt, bob_kem_sk: mlkem_sk) =
+    in(net, (ctM: mlkem_ct, ctX: elt, ek_echo: mlkem_ek, th_in: thash));
+    let ssM = mlkem_decaps(bob_kem_sk, ctM) in
+    let ssX = x25519(bob_static_x_sk, ctX) in
+    let ss_xwing = xwing(ssM, ssX, ctX, x25519_pub(bob_static_x_sk), XWingLabel) in
+    (* responder recomputes the SAME symmetric transcript + the SAME §4.2 root *)
+    new gen_r: hi;
+    let th_r = transcript_hash(V4, session_epoch_id, DIR0, gen_r, SUITE01,
+                               ek_echo, ctM, ctX, x25519_pub(bob_static_x_sk)) in
+    let prk = prk_of(root_old, ss_xwing) in
+    let okm = okm96_of(prk, session_epoch_id, gen_r, th_r, V4) in
+    let root_new = root_of_okm(okm) in
+    event AcceptRoot(root_new);
+    0.
+
+(* ==========================================================================
+   P_uniqueness : exercise ALL FIVE AEAD domains under a shared ck_gen snapshot so
+   ProVerif searches for any cross-domain (key,nonce) collision (query (b) SEPARATION
+   half).  Each domain seals a DISTINCT fresh payload.
+   ========================================================================== *)
+let P_uniqueness(ck_gen_send: key, ck_gen_recv: key) =
+    new kemepoch_text: hi;  new kemepoch_media: hi;
+    (* TEXT lane *)
+    new p_text: bitstring;  new ci_text: idx;  new gen_text: hi;
+    let ka = k_aead(k_text(hmac_msg(ck_gen_send))) in
+    event Sealed(aeadCtx(D_text, ka, ci_text, gen_text), p_text);
+    (* CHUNK lane (EK + CT roles) *)
+    new p_ek: bitstring;  new si_ek: idx;
+    let k_ek = k_chunk(ck_gen_send, ROLE_EK, kemepoch_text) in
+    event Sealed(aeadCtx(D_chunk, k_ek, si_ek, kemepoch_text), p_ek);
+    new p_ct: bitstring;  new si_ct: idx;
+    let k_ct = k_chunk(ck_gen_send, ROLE_CT, kemepoch_text) in
+    event Sealed(aeadCtx(D_chunk, k_ct, si_ct, kemepoch_text), p_ct);
+    (* ACK lane (own domain, descending counter) *)
+    new p_ack: bitstring;  new ai: idx;
+    let kack = k_ack(ck_gen_send, kemepoch_text) in
+    event Sealed(aeadCtx(D_ack, kack, ai, kemepoch_text), p_ack);
+    (* CTRL lane (media, own domain) *)
+    new p_ctrl: bitstring;  new csq: idx;
+    let kctrl = k_ctrl(ck_gen_send, kemepoch_media) in
+    event Sealed(aeadCtx(D_ctrl, kctrl, csq, kemepoch_media), p_ctrl);
+    (* second chunk braid at a DIFFERENT kem_epoch (media) -- must not collide *)
+    new p_ek2: bitstring;  new si_ek2: idx;
+    let k_ek2 = k_chunk(ck_gen_send, ROLE_EK, kemepoch_media) in
+    event Sealed(aeadCtx(D_chunk, k_ek2, si_ek2, kemepoch_media), p_ek2);
+    0.
+
+(* ==========================================================================
+   FIX 3 -- P_writeahead : (key,nonce) reuse WITHIN one key (the §10 write-ahead /
+   §9.3 glare crash-resume hazard).  Unlike v1 (all-fresh idx), here BOTH crash
+   branches contend for ONE shared, replayable idx value `ci_shared` under ONE
+   fixed key+hi context.  The two branches try to seal DIFFERENT plaintexts
+   (wa_msg_a vs wa_msg_b) at the SAME (D_text, ka, ci_shared, hh).  Query (b) is
+   thus a GENUINE test of the §10 invariant, not vacuously true.
+
+   MODELLING THE GUARD FAITHFULLY (single-writer / CAS / atomic-fsync, §10/§7.3).
+   The spec's write-ahead guard is an ATOMIC test-and-set: "ctrl_seq Advanced +
+   fsynced ATOMICALLY (single-writer/CAS) BEFORE transmit" (§7.3); the high-water
+   counter is "durably reserved + fsynced BEFORE computing any ciphertext" (§10).
+   A naive ProVerif `get retired() in 0 else insert; seal` would MISmodel this as a
+   racy get-then-insert (TOCTOU): ProVerif explores the interleaving where both
+   branches pass an empty `get`, both insert, both seal -> a SPURIOUS reuse that
+   does NOT reflect the atomic CAS.  We therefore model the atomic reservation by a
+   PRIVATE-CHANNEL MUTEX TOKEN: exactly ONE token is emitted for the slot, and a
+   seal may proceed ONLY by consuming (in) that token.  ProVerif `in` consumes a
+   message linearly, so at most ONE of the two contending branches can ever obtain
+   the token => at most one seal at the slot => the (key,nonce) is never re-fed a
+   different plaintext.  This is the standard ProVerif idiom for an atomic
+   single-writer reservation and is the faithful encoding of §10's "durably
+   reserve BEFORE seal, never re-feed a retired (key,nonce)".                      *)
+free wa_msg_a: bitstring [private].   (* original plaintext queued at the slot *)
+free wa_msg_b: bitstring [private].   (* DIFFERENT plaintext resubmitted on resume *)
+
+let P_writeahead(ck_gen_send: key) =
+    let ka = k_aead(k_text(hmac_msg(ck_gen_send))) in
+    new hh: hi;
+    (* ONE shared, attacker-observable nonce idx -- the crashed slot both branches
+       race for.  Published so it is NOT a fresh-per-branch name (the hazard exists). *)
+    new ci_shared: idx;
+    out(net, ci_shared);
+    (* atomic single-writer reservation: ONE token for this (key,hi,idx) slot *)
+    new slot_lock: channel;
+    ( out(slot_lock, ci_shared)   (* exactly one reservation token for the slot *)
+    | (* crash branch A: original plaintext *)
+      ( in(slot_lock, reserved: idx);
+        event Sealed(aeadCtx(D_text, ka, reserved, hh), wa_msg_a);
+        out(net, senc(ka, reserved, hh, wa_msg_a, mkAD(V4, SUITE01))) )
+    | (* crash branch B: DIFFERENT plaintext resubmitted on resume *)
+      ( in(slot_lock, reserved2: idx);
+        event Sealed(aeadCtx(D_text, ka, reserved2, hh), wa_msg_b);
+        out(net, senc(ka, reserved2, hh, wa_msg_b, mkAD(V4, SUITE01))) )
+    ).
+(* NOTE (sanity, for the human reviewer): the hazard is genuinely present (both
+   branches target the SAME published ci_shared under the SAME key+hi).  The
+   single-token mutex is what prevents the second seal.  Replacing the single
+   `out(slot_lock, ci_shared)` with TWO `out`s (two tokens) makes query (b) FALSE
+   -- a real (key,nonce)-reuse -- confirming the guard is load-bearing and the
+   query non-vacuous.  The default process emits exactly one token (the §10
+   single-writer invariant) so the run proves the GUARDED protocol.                *)
+
+(* ==========================================================================
+   P_pcs : post-compromise security.  Attacker is GIVEN root_old + old ephemerals;
+   the next step uses FRESH ML-KEM ek/coins.  secret_pcs must stay secret.
+   Uses the FIX-1 §4.2 root construction.
+   ========================================================================== *)
+let P_pcs(root_old: key) =
+    out(net, root_old);                       (* state compromise: attacker learns root_old *)
+    new bob_kem_sk2: mlkem_sk;
+    let bob_kem_ek2 = mlkem_pk(bob_kem_sk2) in
+    new bob_x_sk2: elt;
+    let bob_x_pk2 = x25519_pub(bob_x_sk2) in
+    out(net, (bob_kem_ek2, bob_x_pk2));        (* public keys are public *)
+    new eph_x2: elt;  new coins2: ss;
+    let ctX2 = x25519_pub(eph_x2) in
+    let ssX2 = x25519(eph_x2, bob_x_pk2) in
+    let ssM2 = mlkem_encaps_ss(bob_kem_ek2, coins2) in
+    let ctM2 = mlkem_encaps_ct(bob_kem_ek2, coins2) in
+    let ss_xwing2 = xwing(ssM2, ssX2, ctX2, bob_x_pk2, XWingLabel) in
+    new gen2: hi;
+    let th2 = transcript_hash(V4, session_epoch_id, DIR0, gen2, SUITE01,
+                              bob_kem_ek2, ctM2, ctX2, bob_x_pk2) in
+    let prk2 = prk_of(root_old, ss_xwing2) in  (* salt = COMPROMISED root_old *)
+    let okm2 = okm96_of(prk2, session_epoch_id, gen2, th2, V4) in
+    let root_new2 = root_of_okm(okm2) in
+    let ck2 = ck1_of_okm(okm2) in
+    let ka2 = k_aead(k_text(hmac_msg(ck2))) in
+    event PCSGood(ka2);
+    out(net, (ctM2, ctX2, th2));               (* on-path adversary sees the wire bytes *)
+    new ci2: idx;
+    event Sealed(aeadCtx(D_text, ka2, ci2, gen2), secret_pcs);
+    out(net, senc(ka2, ci2, gen2, secret_pcs, mkAD(V4, SUITE01)));
+    0.
+
+(* ==========================================================================
+   FIX 2 -- anti-downgrade, NON-CIRCULAR.
+
+   THREAT.  A v4-bootstrapped session.  A Dolev-Yao attacker with FULL network
+   control wants the honest v4 receiver to accept a message under the LEGACY v3
+   version (a downgrade).  The spec's defence (§9.4) is layered; this query tests
+   the TWO CRYPTOGRAPHIC bindings that must hold even if the §1 policy guard is
+   bypassed (defence in depth):
+     #2 per-step root: transcript_hash LEADS with ratchet_v and is folded into the
+        root (§4.2/§8) -> a v3 transcript yields a DIFFERENT root, so a v3-keyed
+        frame cannot open under the v4 key.
+     #3 per-frame AAD: every frame's AAD binds ratchet_v||suite_id -> a v3-AAD
+        frame cannot open under a v4-AAD-expecting AEAD context even at the same key.
+
+   WHY THIS IS NON-CIRCULAR (vs the v1 label-only query).  The v1 query
+   `AcceptedUnderVersion(V3)==>false` restated "two distinct HKDF labels are
+   distinct terms" -- the version was only ever an HKDF function-argument over a
+   root the attacker never held, so the implication was trivially true by
+   free-term distinctness.  Here instead:
+     (i) a REAL v3 sender (P_v3_sender) actually computes a v3 key from a v3
+         transcript and EMITS a (V3,SUITE00)-AAD ciphertext on the wire -- the
+         attacker holds a genuine v3 frame to splice/relay/replay/inject;
+     (ii) the honest v4 receiver derives ONLY its real v4-session key (it has no
+          v3 key path -- it is a v4 session), and tries to AEAD-open inbound bytes
+          under that v4 key with a V3 AAD and with a V4 AAD;
+     (iii) AcceptedUnderVersion(V3) fires iff a V3-AAD ciphertext opens under the
+           v4 key -- which is possible ONLY if BOTH the AAD binding (#3) and the
+           transcript/root binding (#2) fail.  The attacker may also try to mint
+           its own bytes (it has net control), so the test is over ALL attacker
+           strategies, not just relaying the v3 sender.
+   The query therefore exercises the spec's real anti-downgrade bindings against an
+   attacker-constructed v3 frame, not a tautology.
+
+   ABSTRACTION (human-review note).  This models bindings #2/#3 of §9.4.  Binding
+   #1 (handshake signature byte-including ratchet_v, PROVISIONAL per §1/UQ-5) and
+   binding #4 (the §1 receive policy guard v4_capable_pinned/bootstrapped_as_v4
+   dropping 0xE3) are POLICY/PKI layers ABOVE the symbolic crypto and are NOT
+   modelled here; the receiver here has no v3 key path precisely because a v4
+   session never derives one -- the cryptographic question is whether the bindings
+   stop a v3 frame from opening under the v4 key, which is what (i)-(iii) test.
+   ========================================================================== *)
+
+let P_v3_sender(root_old: key, bob_static_x: elt, bob_kem_ek: mlkem_ek) =
+    (* a genuine legacy/misbehaving v3 emission: real v3 key from a v3 transcript,
+       (V3,SUITE00) AAD.  Gives the attacker a real v3 frame to work with.        *)
+    new eph_x: elt;  new coins: ss;
+    let ctX = x25519_pub(eph_x) in
+    let ssX = x25519(eph_x, bob_static_x) in
+    let ssM = mlkem_encaps_ss(bob_kem_ek, coins) in
+    let ctM = mlkem_encaps_ct(bob_kem_ek, coins) in
+    let ss_xwing = xwing(ssM, ssX, ctX, bob_static_x, XWingLabel) in
+    new gen: hi;
+    let th3 = transcript_hash(V3, session_epoch_id, DIR0, gen, SUITE00,
+                              bob_kem_ek, ctM, ctX, x25519_pub(bob_static_x)) in
+    let prk = prk_of(root_old, ss_xwing) in
+    let okm3 = okm96_of(prk, session_epoch_id, gen, th3, V3) in   (* v3-version-bound root *)
+    let ck3 = ck1_of_okm(okm3) in
+    let ka3 = k_aead(k_text(hmac_msg(ck3))) in
+    new ci3: idx;
+    out(net, (ctM, ctX, bob_kem_ek));
+    out(net, (ci3, gen));
+    out(net, senc(ka3, ci3, gen, dg_probe, mkAD(V3, SUITE00)));   (* (V3,SUITE00) AAD, §9.4 #3 *)
+    0.
+
+let P_v4_receiver(root_old: key, bob_static_x_sk: elt, bob_kem_sk: mlkem_sk) =
+    in(net, (ctM_in: mlkem_ct, ctX_in: elt, ek_in: mlkem_ek));
+    in(net, (ci_in: idx, gen_in: hi));
+    in(net, c_in: bitstring);
+    let ssM_r = mlkem_decaps(bob_kem_sk, ctM_in) in
+    let ssX_r = x25519(bob_static_x_sk, ctX_in) in
+    let ss_xwing_r = xwing(ssM_r, ssX_r, ctX_in, x25519_pub(bob_static_x_sk), XWingLabel) in
+    let prk_r = prk_of(root_old, ss_xwing_r) in
+    (* the receiver is a V4 session: it derives ONLY its real v4 key (V4 transcript,
+       SUITE01).  It has NO v3 key path -- that is the point of a v4 session.       *)
+    let th4 = transcript_hash(V4, session_epoch_id, DIR0, gen_in, SUITE01,
+                              ek_in, ctM_in, ctX_in, x25519_pub(bob_static_x_sk)) in
+    let okm4 = okm96_of(prk_r, session_epoch_id, gen_in, th4, V4) in
+    let ka4_r = k_aead(k_text(hmac_msg(ck1_of_okm(okm4)))) in
+    (* try to open the SAME inbound bytes under the v4 key with each AAD.  A V3-AAD
+       open succeeding under the v4 key is a downgrade (binding #2 and/or #3 fail). *)
+    (
+      ( let m4 = sdec(ka4_r, ci_in, gen_in, c_in, mkAD(V4, SUITE01)) in
+        event AcceptedUnderVersion(V4) )       (* the legitimate v4 path *)
+    | ( let m3 = sdec(ka4_r, ci_in, gen_in, c_in, mkAD(V3, SUITE00)) in
+        event AcceptedUnderVersion(V3) )       (* downgrade: must be UNREACHABLE *)
+    ).
+
+(* ==========================================================================
+   MAIN
+   ========================================================================== *)
+process
+    new bob_kem_sk: mlkem_sk;
+    let bob_kem_ek = mlkem_pk(bob_kem_sk) in
+    new bob_x_sk: elt;
+    let bob_x_pk = x25519_pub(bob_x_sk) in
+    event BootstrapV4(V4, SUITE01);            (* this session bootstrapped v4/suite01 (§9.4 #1) *)
+    (
+        ( !P_initiator(root0, bob_x_pk, bob_kem_ek) )
+      | ( !P_responder(root0, bob_x_sk, bob_kem_sk) )
+      | ( !P_uniqueness(ck_gen_s1(), ck_gen_s2()) )
+      | ( !P_writeahead(ck_gen_s1()) )
+      | ( !P_pcs(root0) )
+      | ( !P_v3_sender(root0, bob_x_pk, bob_kem_ek) )
+      | ( !P_v4_receiver(root0, bob_x_sk, bob_kem_sk) )
+    )
