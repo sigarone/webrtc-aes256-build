@@ -1,0 +1,69 @@
+name: proverif
+
+# Runs the Phase-18 gate G-14 ProVerif applied-pi model (proof/ratchet-model.pv)
+# and uploads the REAL tool output (per-query RESULT lines) as an artifact for
+# human cryptographer review.  Manual trigger only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proverif:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ProVerif (apt -> opam fallback)
+        run: |
+          set -x
+          # --- Path 1: apt (proverif is NOT in the Ubuntu archive, so this is
+          #     expected to fail; we try it per the gate instructions, then fall
+          #     back to opam, which is the official ProVerif distribution). ---
+          if sudo apt-get update && sudo apt-get install -y proverif; then
+            echo "INSTALLED_VIA=apt" >> "$GITHUB_ENV"
+          else
+            echo "apt path unavailable (expected: no 'proverif' package); falling back to opam."
+            # opam needs an OCaml toolchain; lablgtk (a proverif dep) needs GTK2 dev libs.
+            sudo apt-get install -y opam m4 pkg-config \
+              libgtk2.0-dev libgtksourceview2.0-dev || true
+            opam init -y --disable-sandboxing --bare
+            # a recent OCaml that proverif 2.05 builds against
+            opam switch create proverif 4.14.2 || opam switch proverif
+            eval "$(opam env --switch=proverif)"
+            opam install -y proverif
+            echo "INSTALLED_VIA=opam" >> "$GITHUB_ENV"
+            # subsequent steps re-eval `opam env` themselves (see below); we do not
+            # push opam's shell-export lines into $GITHUB_ENV (wrong format).
+          fi
+
+      - name: Show ProVerif version
+        run: |
+          set -x
+          if [ "${INSTALLED_VIA:-}" = "opam" ]; then eval "$(opam env --switch=proverif)"; fi
+          which proverif || true
+          proverif -help 2>&1 | head -5 || true
+
+      - name: Run ProVerif on the ratchet model
+        id: run
+        run: |
+          set -x
+          if [ "${INSTALLED_VIA:-}" = "opam" ]; then eval "$(opam env --switch=proverif)"; fi
+          # Capture full stdout+stderr; do NOT fail the step on a query-FALSE
+          # verdict (we still want to upload the output for review).
+          proverif proof/ratchet-model.pv 2>&1 | tee proverif-output.txt
+          # The RESULT lines are the tool output that matters; surface a summary.
+          echo "----- RESULT lines -----"
+          grep -E '^(RESULT|Verification summary)' proverif-output.txt || \
+            echo "(no RESULT lines -- likely a parse error; see full output artifact)"
+
+      - name: Upload ProVerif output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proverif-output
+          path: proverif-output.txt
+          if-no-files-found: warn
