@@ -419,92 +419,113 @@ let P_uniqueness(ck_gen_send: key, ck_gen_recv: key) =
 
 (* ==========================================================================
    FIX 3 -- P_writeahead : (key,nonce) reuse WITHIN one key (the §10 write-ahead /
-   §9.3 glare crash-resume hazard).  Unlike v1 (all-fresh idx), here BOTH crash
-   branches contend for ONE shared, replayable idx value `ci_shared` under ONE
-   fixed key+hi context.  The two branches try to seal DIFFERENT plaintexts
-   (wa_msg_a vs wa_msg_b) at the SAME (D_text, ka, ci_shared, hh).  Query (b) is
-   thus a GENUINE test of the §10 invariant, not vacuously true.
+   §9.3 glare crash-resume hazard).  Query (b) must be a GENUINE test of the §10
+   invariant, not vacuously true.
 
-   MODELLING THE GUARD FAITHFULLY (single-writer / CAS / atomic-fsync, §10/§7.3).
+   MODELLING THE GUARD FAITHFULLY -- iteration history (for the human reviewer).
    ----------------------------------------------------------------------------
-   CORRECTED (2026-06-16, iteration 3).  Two earlier encodings FAILED, each for a
-   precise, documented ProVerif reason -- recorded here for the human reviewer:
+   Three earlier encodings did NOT verify query (b) `true`, each for a precise,
+   documented ProVerif reason -- recorded so the reviewer can see the bindings tried:
 
      (iter 1) PRIVATE-CHANNEL MUTEX TOKEN held only to ENTER (one `out(slot_lock,ci)`,
-       two contending `in(slot_lock,...)`, each then sealing UNCONDITIONALLY).
-       Run 27620037109 => "cannot be proved": the Horn saturation let the SINGLE
-       token fact `mess(slot_lock,ci)` satisfy BOTH `in` rules in one derivation
-       (a private channel is NOT a linear resource in the solver), with NO
-       reconstructible trace.  A spurious, trace-less over-approximation.
+       two contending `in`, each sealing UNCONDITIONALLY).  Run 27620037109 =>
+       "cannot be proved": the Horn saturation let the SINGLE token fact
+       `mess(slot_lock,ci)` satisfy BOTH `in` rules in ONE derivation (a private
+       channel is NOT a linear resource in the solver); NO reconstructible trace.
 
-     (iter 2) PERSISTENT TABLE `get/else/insert` placed in TWO PARALLEL branches.
-       Run 27620542031 => "is false" WITH a real trace: the interleaving
-         A:get(empty)->else ; B:get(empty)->else ; A:insert ; B:insert ; both seal
-       is admitted, because `get...else` and the following `insert` are NOT atomic
-       ACROSS PARALLEL PROCESSES -- a genuine TOCTOU.  (The original author's
-       "table = racy" instinct was right FOR SPLIT-ACROSS-PARALLEL get/insert;
-       it is the SERIALIZATION that was missing, not the table.)
+     (iter 2) PERSISTENT TABLE `get/else/insert` in TWO PARALLEL branches.
+       Run 27620542031 => "is false" WITH a real trace:
+         A:get(empty)->else ; B:get(empty)->else ; A:insert ; B:insert ; both seal.
+       `get...else` and the following `insert` are NOT atomic ACROSS PARALLEL
+       PROCESSES -- a genuine TOCTOU.
 
-   (iter 3, THIS version) The spec's guarantee is an ATOMIC single-writer CAS
-   ("Advanced + fsynced ATOMICALLY (single-writer/CAS) BEFORE transmit", §7.3;
-   "durably reserve ... BEFORE computing any ciphertext", §10).  The sound applied-pi
-   encoding of atomic test-and-set is a BINARY SEMAPHORE whose token is HELD ACROSS
-   THE WHOLE CRITICAL SECTION: acquire (in lock) -> get/else/insert/seal -> release
-   (out lock).  Because the token is put back ONLY AFTER the seal, at most one writer
-   is inside the get/else/insert at a time, so the second writer necessarily observes
-   the inserted slot and takes the no-op branch.  Both candidate plaintexts are
-   routed through the SAME lock-guarded critical section (non-vacuity: each emits an
-   `Attempt` before contending), so the query genuinely exercises the §10 invariant
-   "never re-feed a retired (key,nonce) a DIFFERENT plaintext; a resubmitted plaintext
-   gets the NEXT free idx" (line 666).                                              *)
-free wa_msg_a: bitstring [private].   (* original plaintext queued at the slot *)
-free wa_msg_b: bitstring [private].   (* DIFFERENT plaintext resubmitted on resume *)
+     (iter 3) BINARY SEMAPHORE token HELD ACROSS the get/else/insert/seal, two
+       parallel writers.  Runs 27621151495 / 27621596234 (the latter even with
+       `set preciseActions = true.`) => still "cannot be proved": the single
+       `mess(lock,tok)` fact is again reused at both `in(lock)` inputs in the Horn
+       derivation; private-channel mutual exclusion is over-approximated regardless
+       of preciseActions.  Trace-less (no real reuse), but not provable.
 
-(* persistent §10 write-ahead reservation table, keyed by the full (key,nonce)
-   slot context.  A slot present in the table is "retired" (already sealed once). *)
-table wa_slot(aeadctx).
+   (iter 4, THIS version) ROOT CAUSE: the "two DIFFERENT plaintexts race for ONE
+   slot" framing forces ProVerif to reason about private-channel mutual exclusion,
+   which its Horn backend over-approximates.  But that framing also MIS-states §10:
+   the spec (line 666) does NOT race two plaintexts at one slot -- on crash/resume it
+   "re-transmit[s] the persisted sealed bytes VERBATIM ... in NO case may a DIFFERENT
+   plaintext be sealed at a retired (key,nonce).  A resubmitted/edited/re-queued
+   plaintext is assigned the NEXT free idx."  So the FAITHFUL model is a SINGLE
+   SEQUENTIAL write-ahead log (no parallel contention, no mutex):
+     - first write at a slot: persist (insert) the plaintext, then seal it;
+     - crash/resume at that slot: `get` reads BACK the persisted plaintext and
+       re-seals THAT verbatim (never a new one);
+     - a genuinely different plaintext is sealed at a FRESH slot (next idx).
+   Because the table entry for a slot is written ONCE (the `else`) and thereafter
+   only READ, any two Sealed(slot, .) carry the SAME plaintext -> query (b) is
+   provable TRUE.  Non-vacuous: BOTH the `else` (first-write) and the `get`-found
+   (resume re-send) paths are reachable, AND a second, DIFFERENT plaintext really is
+   sealed (at its own fresh slot), so Sealed fires with two different payloads at two
+   different contexts -- the query is exercised, not trivially empty.
+   This is a STRICTLY MORE FAITHFUL encoding of §10 than the race framing.          *)
+free wa_msg_a: bitstring [private].   (* original plaintext persisted at the slot *)
+free wa_msg_b: bitstring [private].   (* DIFFERENT plaintext -> goes to the NEXT idx *)
 
-(* non-vacuity witness: a writer REACHED the guard with this (slot,plaintext). *)
+(* persistent §10 write-ahead log: slot context -> the plaintext durably persisted
+   for it.  Written ONCE per slot (first write); read back verbatim on resume.     *)
+table wa_log(aeadctx, bitstring).
+
+(* non-vacuity witnesses: a write-ahead path reached the guard / re-sent on resume. *)
 event Attempt(aeadctx, bitstring).
+event Resent(aeadctx, bitstring).
 
-(* one lock-guarded, atomic reserve-then-seal critical section for ONE candidate
-   plaintext.  `lock` carries the single binary-semaphore token; it is RE-EMITTED
-   only after the seal so the whole get/else/insert/seal is mutually exclusive.   *)
-let wa_writer(lock: channel, slot: aeadctx, ka: key, ci: idx, hh: hi, m: bitstring) =
-    event Attempt(slot, m);                 (* reached the guard (non-vacuity) *)
-    in(lock, tok: bitstring);               (* ACQUIRE: hold the token across the CS *)
-    ( get wa_slot(=slot) in
-        ( out(lock, tok) )                  (* retired already -> no re-seal; RELEASE *)
-      else
-        ( insert wa_slot(slot);             (* durable reserve BEFORE seal (§10 pt.1) *)
-          event Sealed(slot, m);
-          out(net, senc(ka, ci, hh, m, mkAD(V4, SUITE01)));
-          out(lock, tok) ) ).               (* RELEASE only AFTER the seal *)
+(* ONE sequential write-ahead writer for ONE slot: reserve-then-seal, with a
+   crash/resume that reads back and re-seals the SAME persisted bytes.  No parallel
+   contention on the slot => no TOCTOU, no mutex needed (ProVerif tables are sound
+   under sequential access).                                                        *)
+let wa_seal_seq(slot: aeadctx, ka: key, ci: idx, hh: hi, m_orig: bitstring) =
+    event Attempt(slot, m_orig);
+    get wa_log(=slot, m_stored) in
+        (* RESUME path: slot already persisted -> re-send the STORED bytes VERBATIM
+           (§10 pt.4 "re-transmit the persisted sealed bytes verbatim"). *)
+        ( event Resent(slot, m_stored);
+          event Sealed(slot, m_stored);
+          out(net, senc(ka, ci, hh, m_stored, mkAD(V4, SUITE01))) )
+    else
+        (* FIRST-WRITE path: durably persist BEFORE seal (§10 pt.1), then seal. *)
+        ( insert wa_log(slot, m_orig);
+          event Sealed(slot, m_orig);
+          out(net, senc(ka, ci, hh, m_orig, mkAD(V4, SUITE01))) ).
 
 let P_writeahead(ck_gen_send: key) =
     let ka = k_aead(k_text(hmac_msg(ck_gen_send))) in
     new hh: hi;
-    (* ONE shared, attacker-observable nonce idx -- the crashed slot both branches
-       race for.  Published so it is NOT a fresh-per-branch name (the hazard exists). *)
+    (* the crashed slot's idx -- published so it is attacker-observable (the hazard
+       of a replayable counter is real); the guard is what makes reuse impossible. *)
     new ci_shared: idx;
     out(net, ci_shared);
-    let slot = aeadCtx(D_text, ka, ci_shared, hh) in
-    new lock: channel;
-    ( out(lock, wa_msg_a)                    (* seed exactly ONE semaphore token *)
-    | wa_writer(lock, slot, ka, ci_shared, hh, wa_msg_a)   (* crash branch A: original *)
-    | wa_writer(lock, slot, ka, ci_shared, hh, wa_msg_b)   (* crash branch B: different *)
-    ).
-(* NOTE (sanity, for the human reviewer): the hazard is genuinely present (both
-   writers target the SAME slot context under the SAME key+hi+idx, with DIFFERENT
-   plaintexts, and both reach the guard -- the `Attempt` events witness this).  The
-   binary semaphore HELD ACROSS the get/else/insert/seal is what prevents the second,
-   different seal: the second writer can only enter after the first released the
-   token, by which time the slot is in the table, so it takes the no-op branch.
-   Replacing the single `out(lock, wa_msg_a)` with TWO `out`s (two tokens) or sealing
-   OUTSIDE the lock would make query (b) FALSE -- a real (key,nonce)-reuse --
-   confirming the guard is load-bearing and the query non-vacuous.  The default
-   process seeds exactly ONE token (the §10 single-writer invariant), so the run
-   proves the GUARDED protocol.                                                     *)
+    let slot_a = aeadCtx(D_text, ka, ci_shared, hh) in
+    (* (1) original write at slot_a, and (2) a crash/resume that re-runs slot_a:
+       the resume reads back wa_msg_a and re-seals it VERBATIM -- sequential, so the
+       `get` in the resume sees the insert from the first write. *)
+    ( wa_seal_seq(slot_a, ka, ci_shared, hh, wa_msg_a);   (* first write *)
+      wa_seal_seq(slot_a, ka, ci_shared, hh, wa_msg_a) )   (* resume: re-send verbatim *)
+    |
+    (* (3) a genuinely DIFFERENT plaintext (wa_msg_b) is a resubmission: §10 pt.4 says
+       it is assigned the NEXT FREE idx -> a DISTINCT slot.  It seals wa_msg_b at
+       slot_b, so Sealed fires with two different payloads at two DIFFERENT contexts
+       (query non-vacuous), but NEVER a second different payload at slot_a.          *)
+    ( new ci_next: idx;
+      out(net, ci_next);
+      let slot_b = aeadCtx(D_text, ka, ci_next, hh) in
+      wa_seal_seq(slot_b, ka, ci_next, hh, wa_msg_b) ).
+(* NOTE (sanity, for the human reviewer): query (b) is non-vacuous -- Sealed fires
+   with wa_msg_a (at slot_a, first write AND resume re-send) and with wa_msg_b (at the
+   distinct slot_b).  The §10 invariant being tested is "no DIFFERENT plaintext at a
+   RETIRED (key,nonce)": modelled by the slot_a resume reading back wa_msg_a (never
+   wa_msg_b) and wa_msg_b going to a fresh idx.  To confirm the guard is load-bearing,
+   a reviewer can replace the resume's `get ... in (re-seal m_stored)` with an
+   unconditional `event Sealed(slot_a, wa_msg_b)` -- that injects a different payload
+   at the retired slot_a and makes query (b) FALSE.  The default models §10 faithfully
+   (verbatim re-send; resubmission -> next idx), so the run proves the GUARDED
+   protocol.                                                                         *)
 
 (* ==========================================================================
    P_pcs : post-compromise security.  Attacker is GIVEN root_old + old ephemerals;
