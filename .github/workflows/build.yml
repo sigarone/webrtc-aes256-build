@@ -101,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           vpython3 ./tools_webrtc/android/build_aar.py \
-            --build-dir /home/runner/webrtc/out/aar \
+            --build-dir out/aar \
             --output "$GITHUB_WORKSPACE/libwebrtc-aes256.aar" \
             --arch ${{ github.event.inputs.arch }} \
             --extra-gn-args 'is_java_debug=false rtc_include_tests=false rtc_use_h264=true rtc_use_h265=true is_component_build=false use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false rtc_enable_symbol_export=true use_custom_libcxx=false'
