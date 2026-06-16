@@ -118,7 +118,9 @@ type dom.          (* AEAD key-domain tag (text/chunk/ack/ctrl/media) *)
 type idx.          (* a counter value (chain_idx / shard_index / ctrl_seq / media_seq) *)
 type hi.           (* nonce high-lane value (ratchet_gen / rekey_epoch) *)
 type aeadctx.      (* the abstract (key,nonce)-context fed to GCM *)
-type sid.          (* session_epoch_id (canonical lex-min value, §2.5) *)
+type seid_t.       (* session_epoch_id (canonical lex-min value, §2.5).  NB: named
+                      seid_t (not `sid`) because `sid` is a ProVerif predefined
+                      identifier (session-id machinery) and cannot be redeclared. *)
 type thash.        (* the §8 transcript_hash (a 32-byte SHA-256 digest) *)
 
 (* -------------------- constants: FROZEN label strings (Draft §4.4) -------- *)
@@ -160,7 +162,7 @@ fun hkdf_extract(key, ss): key.
    two chain slices are projected out.  The constructor's injectivity is exactly
    the structural anti-splice/anti-downgrade property: any change to ANY bound
    field yields a different info term => different OKM => different root.        *)
-fun info_ratchet(label (*L_ratchet*), sid (*session_epoch_id*), hi (*BE32 ratchet_gen*),
+fun info_ratchet(label (*L_ratchet*), seid_t (*session_epoch_id*), hi (*BE32 ratchet_gen*),
                  thash (*transcript_hash*), bitstring (*0x00 dir*), label (*ratchet_v*)): label.
 fun kdf_okm96(key (*PRK_r*), label (*info*)): key.    (* the single HKDF-Expand-SHA384, L=96 *)
 (* three independent slice projectors over OKM96 (offsets 0..32 / 32..64 / 64..96) *)
@@ -172,7 +174,7 @@ fun okm_s2(key): key.      (* OKM96[64..96) -> other chain slice *)
    reconstructed objects (EK,CT) and both ephemeral X25519 pubs, the canonical
    session_epoch_id and a FIXED 0x00 dir placeholder.  A free constructor: any
    field change (esp. the LEADING ratchet_v) yields a distinct digest.          *)
-fun transcript_hash(label (*ratchet_v LEADS*), sid (*session_epoch_id*),
+fun transcript_hash(label (*ratchet_v LEADS*), seid_t (*session_epoch_id*),
                     bitstring (*0x00 dir*), hi (*BE32 ratchet_gen*), label (*suite_id*),
                     mlkem_ek (*reconstructed EK*), mlkem_ct (*reconstructed CT*),
                     elt (*dh_pub_init*), elt (*dh_pub_resp*)): thash.
@@ -243,7 +245,7 @@ free dg_probe: bitstring [private].
 (* long-term / bootstrap secrets shared by both honest parties (declared here so
    the §4.2 snapshot helpers below may reference them).                          *)
 free root0: key [private].              (* ROOT_0 from the authenticated handshake (§4.1) *)
-free session_epoch_id: sid [private].   (* canonical lex-min session_epoch_id (§2.5); carried
+free session_epoch_id: seid_t [private].   (* canonical lex-min session_epoch_id (§2.5); carried
                                            in the authenticated transcript, NOT attacker-known *)
 
 (* ==========================================================================
@@ -289,7 +291,7 @@ query attacker(secret_pcs).
    session_epoch_id, the ratchet_gen (as hi), the §8 transcript_hash and the
    version, produce PRK_r then OKM96 then the three slices.                      *)
 letfun prk_of(root_old: key, ss_xwing: ss) = hkdf_extract(root_old, ss_xwing).
-letfun okm96_of(prk: key, seid: sid, gen: hi, th: thash, ver: label) =
+letfun okm96_of(prk: key, seid: seid_t, gen: hi, th: thash, ver: label) =
     kdf_okm96(prk, info_ratchet(L_ratchet, seid, gen, th, DIR0, ver)).
 (* slice projectors *)
 letfun root_of_okm(okm: key)  = okm_root(okm).
