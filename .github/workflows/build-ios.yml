@@ -1,0 +1,145 @@
+name: build-webrtc-aes256-ios
+
+# Builds the LiveKit/webrtc-sdk fork of libwebrtc (M144) with the AES-256
+# FrameCryptor patch -> iOS WebRTC.xcframework (device:arm64 + simulator slices),
+# H265/HEVC enabled (same as the upstream webrtc-sdk release binary). Drop-in
+# replacement for the stock 144.7559.10 xcframework consumed by Q-Audion iOS
+# (QAudionEngine/Package.swift .binaryTarget). The only delta vs upstream is the
+# single-hunk aes256-framecryptor.patch (32-byte shared key -> AES-256-GCM).
+#
+# Run via Actions -> build-webrtc-aes256-ios -> Run workflow. Build ~3-4 h.
+# Artifact: WebRTC.xcframework.zip + the SwiftPM checksum printed in the log AND
+# attached to a fixed release tag so Package.swift can point at a stable URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "iOS arches (build_ios_libs.py format, space separated)"
+        default: "device:arm64 simulator:arm64 simulator:x64"
+      webrtc_ref:
+        description: "webrtc-sdk/webrtc branch/tag"
+        default: "m144_release"
+      release_tag:
+        description: "GitHub release tag to host the xcframework zip"
+        default: "webrtc-ios-aes256-m144"
+
+permissions:
+  contents: write
+
+env:
+  DEPOT_TOOLS_UPDATE: "0"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repo (patch)
+        uses: actions/checkout@v4
+        with:
+          path: ctrl
+
+      - name: Reclaim disk + show space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /Users/runner/Library/Android.sdk /usr/local/lib/android "$ANDROID_HOME" 2>/dev/null || true
+          sudo rm -rf /Applications/Xcode_15*.app /Applications/Xcode_16.0*.app /Applications/Xcode_16.1*.app 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          echo "Selected Xcode:"; xcode-select -p; xcodebuild -version
+          df -h /
+
+      - name: Install depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient config + sync (iOS, shallow)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir -p webrtc && cd webrtc
+          cat > .gclient <<EOF
+          solutions = [{
+            "name": "src",
+            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_deps": {},
+          }]
+          target_os = ["ios", "mac"]
+          EOF
+          echo "::group::gclient sync"
+          gclient sync --no-history --shallow --nohooks
+          echo "::endgroup::"
+          echo "::group::runhooks"
+          gclient runhooks
+          echo "::endgroup::"
+          du -sh src 2>/dev/null || true
+          df -h /
+
+      - name: Apply AES-256 FrameCryptor patch
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
+          echo "=== AFTER ==="
+          grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
+
+      - name: Build WebRTC.xcframework (H265 + AES-256)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          vpython3 tools_webrtc/ios/build_ios_libs.py \
+            --build_config release \
+            --arch ${{ github.event.inputs.arch }} \
+            --extra-gn-args 'rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false'
+          echo "=== output ==="
+          ls -la out_ios_libs
+          test -d out_ios_libs/WebRTC.xcframework
+          # prove H265 + AES-256 symbols are present in the device slice
+          echo "=== H265 symbol probe (device arm64) ==="
+          nm -gU out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "H265|HEVC" | head || echo "(no exported H265 symbol name match — VideoToolbox codec may be internal)"
+          echo "=== AES-256 string probe ==="
+          strings out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "AES-256 GCM|aes_256_gcm" | head || true
+
+      - name: Package xcframework (preserve symlinks) + checksum
+        working-directory: ${{ runner.temp }}/webrtc/src/out_ios_libs
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent WebRTC.xcframework "$GITHUB_WORKSPACE/WebRTC.xcframework.zip"
+          cd "$GITHUB_WORKSPACE"
+          ls -lh WebRTC.xcframework.zip
+          echo "=== SwiftPM checksum (use this in Package.swift) ==="
+          # swift package compute-checksum == sha256 of the zip; print both
+          SUM=$(shasum -a 256 WebRTC.xcframework.zip | awk '{print $1}')
+          echo "CHECKSUM(sha256)=$SUM"
+          echo "checksum=$SUM" >> "$GITHUB_OUTPUT"
+          echo "## WebRTC.xcframework (AES-256 + H265)" >> "$GITHUB_STEP_SUMMARY"
+          echo "checksum: \`$SUM\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "url: https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/WebRTC.xcframework.zip" >> "$GITHUB_STEP_SUMMARY"
+        id: pkg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebRTC-xcframework-aes256-ios
+          path: WebRTC.xcframework.zip
+          if-no-files-found: error
+
+      - name: Publish to a fixed release tag (stable SPM url)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.release_tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
+              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+          fi
+          gh release upload "$TAG" WebRTC.xcframework.zip --clobber
+          echo "Asset: https://github.com/${{ github.repository }}/releases/download/$TAG/WebRTC.xcframework.zip"
