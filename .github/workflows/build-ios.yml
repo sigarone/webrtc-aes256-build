@@ -40,15 +40,22 @@ jobs:
         with:
           path: ctrl
 
-      - name: Reclaim disk + show space
+      - name: Select full Xcode
         run: |
           set -euo pipefail
-          sudo rm -rf /Users/runner/Library/Android.sdk /usr/local/lib/android "$ANDROID_HOME" 2>/dev/null || true
-          sudo rm -rf /Applications/Xcode_15*.app /Applications/Xcode_16.0*.app /Applications/Xcode_16.1*.app 2>/dev/null || true
-          xcrun simctl delete all 2>/dev/null || true
-          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
-          echo "Selected Xcode:"; xcode-select -p; xcodebuild -version
+          sudo xcode-select -s /Applications/Xcode.app
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Reclaim disk (best-effort, never fails)
+        shell: bash
+        run: |
+          set +e
+          xcrun simctl delete all >/dev/null 2>&1
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"/* >/dev/null 2>&1
+          sudo rm -rf /usr/local/lib/android "${ANDROID_HOME:-}" >/dev/null 2>&1
           df -h /
+          exit 0
 
       - name: Install depot_tools
         run: |
