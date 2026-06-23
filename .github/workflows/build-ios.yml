@@ -32,7 +32,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 360
     steps:
       - name: Checkout this repo (patch)
@@ -40,12 +40,18 @@ jobs:
         with:
           path: ctrl
 
-      - name: Select full Xcode
+      - name: Select full Xcode (16.x — M144 needs the iOS 18 SDK modulemaps)
         run: |
           set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode.app
+          ls -d /Applications/Xcode*.app || true
+          XC="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XC" ]; then XC="$(ls -d /Applications/Xcode_1*.app 2>/dev/null | sort -V | tail -1)"; fi
+          if [ -z "$XC" ]; then XC="/Applications/Xcode.app"; fi
+          echo "Selecting $XC"
+          sudo xcode-select -s "$XC"
           xcode-select -p
           xcodebuild -version
+          echo "=== iOS SDKs ==="; xcodebuild -showsdks | grep -i ios || true
 
       - name: Reclaim disk (best-effort, never fails)
         shell: bash
