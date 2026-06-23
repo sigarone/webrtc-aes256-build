@@ -104,7 +104,7 @@ jobs:
           vpython3 tools_webrtc/ios/build_ios_libs.py \
             --build_config release \
             --arch ${{ github.event.inputs.arch }} \
-            --extra-gn-args 'rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false'
+            --extra-gn-args 'use_siso=false rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false'
           echo "=== output ==="
           ls -la out_ios_libs
           test -d out_ios_libs/WebRTC.xcframework
