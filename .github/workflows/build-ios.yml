@@ -103,10 +103,26 @@ jobs:
           echo "=== AFTER ==="
           grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
 
+      - name: Force real ninja (Siso's iOS dep-scan invents missing SDK modulemaps)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          f=tools_webrtc/ios/build_ios_libs.py
+          # build_ios_libs hardcodes use_siso=true AND invokes the siso binary
+          # directly (ignores the gn arg). Both caused the DarwinBasic/
+          # DarwinFoundation1.modulemap "no known rule to make it" failures.
+          sed -i '' "s/gn_args.append('use_siso=true')/gn_args.append('use_siso=false')/" "$f"
+          sed -i '' "/'third_party', 'siso', 'cipd', 'siso'/d" "$f"
+          echo "=== patched build cmd + use_siso ==="
+          grep -nE "use_siso|'ninja'|gn_target_name," "$f" | head
+          # sanity: the siso path line must be gone and 'ninja' must be cmd[0]
+          ! grep -q "siso', 'cipd', 'siso'" "$f"
+
       - name: Build WebRTC.xcframework (H265 + AES-256)
         working-directory: ${{ runner.temp }}/webrtc/src
         run: |
           set -euo pipefail
+          command -v ninja && ninja --version || true
           vpython3 tools_webrtc/ios/build_ios_libs.py \
             --build_config release \
             --arch ${{ github.event.inputs.arch }} \
