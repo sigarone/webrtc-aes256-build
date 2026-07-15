@@ -76,6 +76,7 @@ COMMON_ARGS="
       rtc_use_h265 = true
       treat_warnings_as_errors = false
       use_siso = false
+      use_clang_modules = false
       use_rtti = true"
 # rtc_use_h264/h265=true (upstream trims h264 off; Q-Audion needs both, see
 # build-ios.yml's H265 rationale). treat_warnings_as_errors relaxed to false
@@ -83,6 +84,13 @@ COMMON_ARGS="
 # had to patch around in build_ios_libs.py (see "Force real ninja" step there)
 # — this script calls `gn gen`/`ninja` directly so there is no equivalent
 # Python wrapper to patch; setting the gn arg here is the direct equivalent.
+# use_clang_modules=false is ALSO required even with use_siso=false: run
+# 29425842369 still hit "DarwinFoundation1.modulemap ... missing and no
+# known rule to make it" under plain ninja because the iOS 18.5 SDK
+# (Xcode 16.4) doesn't ship that modulemap either — build-ios.yml's own
+# build_ios_libs.py invocation passes both flags together
+# (--extra-gn-args '... use_clang_modules=false use_siso=false ...'),
+# this script only had the second one.
 
 PLATFORMS=(
   "iOS-arm64-device:target_os=\"ios\" target_environment=\"device\" target_cpu=\"arm64\" ios_deployment_target=\"13.0\""
