@@ -128,8 +128,13 @@ index 8ce74e2c8c..2e88760d0a 100644
    }
  
    generate_jni("generated_peerconnection_jni") {
-@@ -1585,11 +1596,13 @@ if (current_os == "linux" || is_android) {
+@@ -1585,16 +1596,18 @@ if (current_os == "linux" || is_android) {
        "api/org/webrtc/TurnCustomizer.java",
+       "api/org/webrtc/audio/AudioProcessingComponentOptions.java",
+       "api/org/webrtc/audio/AudioProcessingComponentState.java",
+       "api/org/webrtc/audio/AudioProcessingImplementation.java",
+       "api/org/webrtc/audio/AudioProcessingMode.java",
+       "api/org/webrtc/audio/AudioProcessingState.java",
      ]
      namespace = "webrtc::jni"
 +    package_prefix = android_package_prefix
