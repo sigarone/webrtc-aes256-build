@@ -165,7 +165,17 @@ jobs:
           echo "python3_bin_reldir.txt: $(cat "$HOME/depot_tools/python3_bin_reldir.txt")"
           chmod +x "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh"
           mkdir -p out_livekit_ios_libs
-          . "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh" release "$PWD" out_livekit_ios_libs LiveKit
+          # EXECUTE, do not source (`.`): the script does `cd "$OUT_DIR"`
+          # right before its final `zip` call (post-processing section) and
+          # never cds back. Sourcing leaks that cd into THIS shell, so the
+          # very next line here (`ls -la out_livekit_ios_libs`) looked for
+          # out_livekit_ios_libs/out_livekit_ios_libs from inside
+          # out_livekit_ios_libs itself and failed — the actual xcframework
+          # build+zip had ALREADY succeeded by then (run 29426989535's own
+          # log shows the full zip completing right before the failure).
+          # The script already has its own `#!/bin/bash` + `set -e`, so
+          # running it as a subprocess is the correct fix, not a workaround.
+          "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh" release "$PWD" out_livekit_ios_libs LiveKit
           echo "=== output ==="
           ls -la out_livekit_ios_libs
           test -d out_livekit_ios_libs/LiveKitWebRTC.xcframework
