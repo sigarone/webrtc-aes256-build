@@ -213,9 +213,24 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.release_tag }}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
+          REPO="${{ github.repository }}"
+          # This step has no `working-directory`, so it defaults to
+          # $GITHUB_WORKSPACE — which is NOT a git repo here (actions/checkout
+          # above used `with: path: ctrl`, so the actual checkout lives at
+          # $GITHUB_WORKSPACE/ctrl). `gh` auto-detects the target repo from
+          # the cwd's git remote when --repo is omitted, so every gh command
+          # here failed with "fatal: not a git repository" (confirmed live,
+          # run 29429853994) despite the xcframework build+zip+artifact-upload
+          # all succeeding earlier in the same run. This exact bug is ALSO
+          # latent in the sibling build-ios.yml (same missing --repo, same
+          # missing working-directory) — that job's one successful run's
+          # publish step also failed instantly and the release asset only
+          # appeared minutes later via what was almost certainly a manual
+          # `gh release upload`, not the workflow itself. Passing --repo
+          # explicitly removes the cwd dependency entirely.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
               --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + apple_prefix.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
           fi
-          gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --clobber
-          echo "Asset: https://github.com/${{ github.repository }}/releases/download/$TAG/LiveKitWebRTC.xcframework.zip"
+          gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --repo "$REPO" --clobber
+          echo "Asset: https://github.com/$REPO/releases/download/$TAG/LiveKitWebRTC.xcframework.zip"
