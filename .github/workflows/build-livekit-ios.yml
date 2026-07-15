@@ -142,17 +142,27 @@ jobs:
         run: |
           set -euo pipefail
           command -v ninja && ninja --version || true
-          # Bootstrap depot_tools' plain `python3` wrapper (writes its
-          # python3_bin_reldir.txt cache file) BEFORE the first direct `gn
-          # gen` call below. build-ios.yml never hits this because it drives
-          # everything through `vpython3 tools_webrtc/ios/build_ios_libs.py`,
-          # whose own bootstrap happens to cover the plain-python3 wrapper too
-          # (same underlying cache) before build_ios_libs.py's internal `gn
-          # gen` call. This script calls `gn gen` directly with no vpython3
-          # in front of it, so without this line the FIRST `gn` invocation
-          # fails with "python3_bin_reldir.txt not found. need to initialize
-          # depot_tools..." (observed in run 29422227429).
-          vpython3 -c "print('depot_tools python3 bootstrap ok')"
+          # This job's `env.DEPOT_TOOLS_UPDATE: "0"` disables gclient's
+          # self-update wrapper, which is the ONLY thing that normally runs
+          # depot_tools/bootstrap_python3 (see depot_tools/update_depot_tools
+          # line ~128) and writes python3_bin_reldir.txt. build-ios.yml never
+          # notices because it drives everything through
+          # `vpython3 tools_webrtc/ios/build_ios_libs.py` — vpython3 has its
+          # own, SEPARATE CIPD-based bootstrap and never touches this file.
+          # But GN's exec_script() (used all over webrtc's BUILD.gn files)
+          # shells out to plain `python3` resolved via PATH, i.e. depot_tools'
+          # wrapper — which hard-fails on the missing file with no
+          # auto-bootstrap fallback (confirmed by reading
+          # depot_tools/python-bin/python3 directly: `[[ ! -f
+          # python3_bin_reldir.txt ]] && exit 1`, no lazy-init branch).
+          # A prior fix here that called `vpython3 -c ...` did NOT help
+          # (still failed in run 29423341150) because vpython3's bootstrap is
+          # unrelated. Real fix: run depot_tools' own bootstrap function
+          # directly, exactly like update_depot_tools would.
+          source "$HOME/depot_tools/bootstrap_python3"
+          bootstrap_python3
+          test -f "$HOME/depot_tools/python3_bin_reldir.txt"
+          echo "python3_bin_reldir.txt: $(cat "$HOME/depot_tools/python3_bin_reldir.txt")"
           chmod +x "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh"
           mkdir -p out_livekit_ios_libs
           . "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh" release "$PWD" out_livekit_ios_libs LiveKit
