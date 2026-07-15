@@ -1,0 +1,190 @@
+name: build-webrtc-aes256-livekit-ios
+
+# Builds an LK-symbol-prefixed "LiveKitWebRTC.xcframework" (drop-in for
+# livekit/webrtc-xcframework's `LiveKitWebRTC` SwiftPM product, which
+# `client-sdk-swift` depends on for GROUP calls — see
+# apps/qaudion-ios/QAudionEngine/Package.swift) with the SAME
+# aes256-framecryptor.patch already used by build-ios.yml for the 1:1-call
+# WebRTC.xcframework, PLUS the apple_prefix.patch that gives LiveKit's fork
+# its `LK`-prefixed Objective-C symbols (RTCPeerConnection ->
+# LKRTCPeerConnection, etc.) so it can coexist in the same binary as this
+# repo's plain WebRTC.xcframework without symbol collisions — exactly the
+# "Symbol Namespace Isolation" contract QAudionEngine/Package.swift already
+# documents for the dual-WebRTC (1:1 vs group-call) setup.
+#
+# Provenance: apple_prefix.patch and apple/xcframework-livekit-ios.sh are
+# vendored (MIT license) from https://github.com/webrtc-sdk/webrtc-build —
+# the SAME repo livekit/webrtc-xcframework's own README says its releases
+# are built from ("Built using: webrtc-sdk/webrtc + webrtc-sdk/webrtc-build").
+# xcframework-livekit-ios.sh is an iOS-only trim of that repo's
+# build/apple/xcframework.sh (drops the macOS/catalyst/tvOS/xrOS slices
+# Q-Audion's SwiftPM binaryTarget never consumes) — see that file's header
+# for the exact diff from upstream.
+#
+# NOT a from-scratch fork: same webrtc-sdk/webrtc@m144_release checkout as
+# build-ios.yml, two patches applied in sequence (no overlapping hunks —
+# aes256-framecryptor.patch only touches api/crypto/frame_crypto_transformer.h;
+# apple_prefix.patch touches sdk/objc/base/RTCMacros.h, sdk/BUILD.gn,
+# tools_webrtc/ios/*, sdk/objc/Info.plist), then a direct gn/ninja/xcodebuild
+# build (not tools_webrtc/ios/build_ios_libs.py, which upstream's
+# apple_prefix.patch also retargets to "LiveKitWebRTC.xcframework" naming but
+# which this job does not invoke).
+#
+# Run via Actions -> build-webrtc-aes256-livekit-ios -> Run workflow.
+# Expected build time: in the same range as build-ios.yml (~1h, well under
+# the 3-4h conservative estimate) — but this is a NEW packaging path never
+# run before in this repo; budget for at least one failed/iterated run
+# (GN arg mismatch, missing gn target, etc.) before it goes green
+# unattended, same as build-ios.yml's own history before it stabilized.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_ref:
+        description: "webrtc-sdk/webrtc branch/tag"
+        default: "m144_release"
+      release_tag:
+        description: "GitHub release tag to host the LiveKitWebRTC.xcframework zip"
+        default: "webrtc-ios-aes256-livekit-m144"
+
+permissions:
+  contents: write
+
+env:
+  DEPOT_TOOLS_UPDATE: "0"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repo (patches + build script)
+        uses: actions/checkout@v4
+        with:
+          path: ctrl
+
+      - name: Select full Xcode (16.x — M144 needs the iOS 18 SDK modulemaps)
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          XC="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$XC" ]; then XC="$(ls -d /Applications/Xcode_1*.app 2>/dev/null | sort -V | tail -1)"; fi
+          if [ -z "$XC" ]; then XC="/Applications/Xcode.app"; fi
+          echo "Selecting $XC"
+          sudo xcode-select -s "$XC"
+          xcode-select -p
+          xcodebuild -version
+          echo "=== iOS SDKs ==="; xcodebuild -showsdks | grep -i ios || true
+
+      - name: Reclaim disk (best-effort, never fails)
+        shell: bash
+        run: |
+          set +e
+          xcrun simctl delete all >/dev/null 2>&1
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"/* >/dev/null 2>&1
+          sudo rm -rf /usr/local/lib/android "${ANDROID_HOME:-}" >/dev/null 2>&1
+          df -h /
+          exit 0
+
+      - name: Install depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient config + sync (iOS, shallow)
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          mkdir -p webrtc && cd webrtc
+          cat > .gclient <<EOF
+          solutions = [{
+            "name": "src",
+            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_deps": {},
+          }]
+          target_os = ["ios", "mac"]
+          EOF
+          echo "::group::gclient sync"
+          gclient sync --no-history --shallow --nohooks
+          echo "::endgroup::"
+          echo "::group::runhooks"
+          gclient runhooks
+          echo "::endgroup::"
+          du -sh src 2>/dev/null || true
+          df -h /
+
+      - name: Apply AES-256 FrameCryptor patch
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
+          echo "=== AFTER ==="
+          grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
+
+      - name: Apply LK symbol-prefix patch (LiveKit fork parity)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "RTC_OBJC_TYPE_PREFIX" sdk/objc/base/RTCMacros.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/apple-prefix-livekit.patch"
+          echo "=== AFTER ==="
+          grep -n "define RTC_OBJC_TYPE_PREFIX LK" sdk/objc/base/RTCMacros.h
+          grep -n 'output_name = "LiveKitWebRTC"' sdk/BUILD.gn
+
+      - name: Build LiveKitWebRTC.xcframework (H265 + AES-256 + LK-prefix)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          command -v ninja && ninja --version || true
+          chmod +x "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh"
+          mkdir -p out_livekit_ios_libs
+          . "$GITHUB_WORKSPACE/ctrl/apple/xcframework-livekit-ios.sh" release "$PWD" out_livekit_ios_libs LiveKit
+          echo "=== output ==="
+          ls -la out_livekit_ios_libs
+          test -d out_livekit_ios_libs/LiveKitWebRTC.xcframework
+          echo "=== LK-prefix symbol probe (device arm64) ==="
+          nm -gU out_livekit_ios_libs/LiveKitWebRTC.xcframework/ios-arm64/LiveKitWebRTC.framework/LiveKitWebRTC 2>/dev/null | grep -iE "LKRTCPeerConnection" | head || echo "(no exported LKRTCPeerConnection symbol match — objc class may be exported differently)"
+          echo "=== AES-256 string probe ==="
+          strings out_livekit_ios_libs/LiveKitWebRTC.xcframework/ios-arm64/LiveKitWebRTC.framework/LiveKitWebRTC 2>/dev/null | grep -iE "AES-256 GCM|aes_256_gcm" | head || true
+
+      - name: Copy zip to workspace + checksum
+        working-directory: ${{ runner.temp }}/webrtc/src/out_livekit_ios_libs
+        run: |
+          set -euo pipefail
+          cp LiveKitWebRTC.xcframework.zip "$GITHUB_WORKSPACE/LiveKitWebRTC.xcframework.zip"
+          cd "$GITHUB_WORKSPACE"
+          ls -lh LiveKitWebRTC.xcframework.zip
+          echo "=== SwiftPM checksum (use this in Package.swift) ==="
+          SUM=$(shasum -a 256 LiveKitWebRTC.xcframework.zip | awk '{print $1}')
+          echo "CHECKSUM(sha256)=$SUM"
+          echo "checksum=$SUM" >> "$GITHUB_OUTPUT"
+          echo "## LiveKitWebRTC.xcframework (AES-256 + H265 + LK-prefix)" >> "$GITHUB_STEP_SUMMARY"
+          echo "checksum: \`$SUM\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "url: https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/LiveKitWebRTC.xcframework.zip" >> "$GITHUB_STEP_SUMMARY"
+        id: pkg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveKitWebRTC-xcframework-aes256-ios
+          path: LiveKitWebRTC.xcframework.zip
+          if-no-files-found: error
+
+      - name: Publish to a fixed release tag (stable SPM url)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.release_tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
+              --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + apple_prefix.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+          fi
+          gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --clobber
+          echo "Asset: https://github.com/${{ github.repository }}/releases/download/$TAG/LiveKitWebRTC.xcframework.zip"
