@@ -41,8 +41,25 @@ on:
   workflow_dispatch:
     inputs:
       webrtc_ref:
-        description: "webrtc-sdk/webrtc branch/tag"
-        default: "m144_release"
+        description: "webrtc-sdk/webrtc branch/tag/commit"
+        # Pinned to the exact commit livekit/webrtc-xcframework's real
+        # 144.7559.03 release was built from (published 2026-03-31; this is
+        # the last m144_release commit dated 2026-03-30, one day prior —
+        # verified: RTCAudioDeviceModule.h at this SHA still has the plain
+        # isVoiceProcessingEnabled/setVoiceProcessingEnabled API
+        # client-sdk-swift 2.13.0's AudioManager.swift calls directly).
+        # NOT "m144_release" (a rolling branch, not a fixed ref) — the first
+        # build from that default picked up 2.5 months of subsequent commits
+        # including "Audio processing state v2: factory-owned read-back,
+        # redesigned state API (#254)" (2026-06-11), which REMOVED that
+        # property in favor of a new RTCPlatformAudioProcessingState API,
+        # breaking compile against client-sdk-swift 2.13.0 (confirmed live,
+        # CI run 29452170871: "value of type 'LKRTCAudioDeviceModule' has no
+        # member 'isVoiceProcessingEnabled'"). Any future re-dispatch of this
+        # workflow MUST keep using a fixed commit SHA, not a branch name, or
+        # the exact same class of drift will recur silently whenever webrtc-sdk
+        # ships a new commit on this branch.
+        default: "770e5461892d"
       release_tag:
         description: "GitHub release tag to host the LiveKitWebRTC.xcframework zip"
         default: "webrtc-ios-aes256-livekit-m144"

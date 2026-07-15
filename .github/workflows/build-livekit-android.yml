@@ -33,8 +33,17 @@ on:
         description: "Android ABI(s), space separated"
         default: "arm64-v8a"
       webrtc_ref:
-        description: "webrtc-sdk/webrtc branch/tag"
-        default: "m144_release"
+        description: "webrtc-sdk/webrtc branch/tag/commit"
+        # Pinned to the same exact commit as build-livekit-ios.yml — the last
+        # m144_release commit before livekit/webrtc-xcframework's real
+        # 144.7559.03 release (2026-03-31) was cut, and before a 2026-06-11
+        # API redesign ("Audio processing state v2 #254") that broke
+        # client-sdk-swift 2.13.0's compile on iOS (confirmed live, run
+        # 29452170871). Not observed to affect this Android build directly,
+        # but pinning both platforms to the SAME upstream commit (not a
+        # rolling branch name) avoids any other latent API drift and keeps
+        # the two builds byte-comparable going forward.
+        default: "770e5461892d"
 
 permissions:
   contents: write
