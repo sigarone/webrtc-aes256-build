@@ -1,0 +1,35 @@
+// Minimal standalone Gradle module that reproduces webrtc-sdk/android's own
+// `android-prefixed/shadow/build.gradle` bytecode-relocation step (MIT
+// license, https://github.com/webrtc-sdk/android) — NOT re-derived, copied
+// near-verbatim on purpose so this repackage stays byte-shape-identical to
+// what `io.github.webrtc-sdk:android-prefixed` actually ships.
+//
+// Input: libs/classes.jar — the classes.jar unzipped from the RAW aar that
+// build_aar.py produced after jni_prefix.patch + aes256-framecryptor.patch
+// (still declares `package org.webrtc;` at the .class level, but the native
+// .so was compiled expecting `Java_livekit_org_webrtc_...` JNI symbols — see
+// jni_prefix.patch). This task rewrites every `org.webrtc.*` class reference
+// in that jar to `livekit.org.webrtc.*` via the Shadow plugin's relocation
+// (a bytecode-level package rename, not a recompile), which is exactly what
+// makes the native symbol names (pre-named for the FUTURE relocated package)
+// match the actual Java classes once this step runs.
+//
+// Output: build/libs/shadow-relocate-all.jar — the relocated classes.jar,
+// copied back into the final repackaged AAR by the CI workflow step that
+// invokes this module.
+plugins {
+    id 'java-library'
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+dependencies {
+    api files("libs/classes.jar")
+}
+
+import com.github.jengelman.gradle.plugins.shadow.tasks.ConfigureShadowRelocation
+
+task relocateShadowJar(type: ConfigureShadowRelocation) {
+    target = tasks.shadowJar
+    prefix = "livekit" // matches android_package_prefix in jni_prefix.patch
+}
+tasks.shadowJar.dependsOn tasks.relocateShadowJar

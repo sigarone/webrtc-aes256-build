@@ -1,0 +1,224 @@
+name: build-webrtc-aes256-livekit-android-aar
+
+# Builds the SAME LiveKit/webrtc-sdk fork of libwebrtc (M144) + the SAME
+# AES-256 FrameCryptor patch as build.yml, but ALSO applies jni_prefix.patch
+# (vendored from webrtc-sdk/webrtc-build, MIT license) and then reproduces
+# webrtc-sdk/android's own package-relocation + native-lib-rename repackage
+# step (shadow-relocate/, mirrored from android-prefixed/shadow in that repo)
+# so the output is a drop-in replacement for the
+# `io.github.webrtc-sdk:android-prefixed` artifact that
+# `io.livekit:livekit-android:2.27.0` pulls transitively for the GROUP-CALL
+# (SFU) media path on Android — see qaudion-android-new
+# feature/feature-call/data/livekit/GroupSfuKeyProvider.kt kdoc for why that
+# path is still AES-128-only today (no keySize knob on this SDK's
+# BaseKeyProvider; the native FrameCryptor derives a fixed-length key). The
+# existing build.yml's plain `org.webrtc` AAR (libwebrtc-aes256.aar) already
+# covers 1:1 calls and is UNCHANGED/UNAFFECTED by this workflow.
+#
+# HONESTY NOTE (do not remove): this is a NEW, UNTESTED build variant. The
+# plain-AAR build.yml needed ~15 iterations to stabilize (see this repo's git
+# log) before the aes256-framecryptor.patch alone reliably produced a valid
+# AAR. This workflow adds MORE moving parts on top (jni_prefix.patch context-
+# drift risk vs whatever webrtc-sdk/webrtc commit it was authored against,
+# plus a brand-new shadow-relocation + repackage step never exercised in CI
+# before) — expect it NOT to succeed unattended on the first run. Every step
+# below fails loudly (no swallowed errors, no silent hunk-skipping) so a
+# human can see exactly which step broke and iterate, per this repo's own
+# established pattern.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Android ABI(s), space separated"
+        default: "arm64-v8a"
+      webrtc_ref:
+        description: "webrtc-sdk/webrtc branch/tag"
+        default: "m144_release"
+
+permissions:
+  contents: write
+
+env:
+  WEBRTC_DIR: /home/runner/webrtc
+  CIPD_CACHE_DIR: /home/runner/webrtc/.cipd
+  XDG_CACHE_HOME: /home/runner/webrtc/.cache
+  PIP_CACHE_DIR: /home/runner/webrtc/.pipcache
+  VPYTHON_VIRTUALENV_ROOT: /home/runner/webrtc/.vpython
+  DEPOT_TOOLS_UPDATE: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 12288
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: '/home/runner/webrtc'
+
+      - name: Checkout this repo (patches + workflow + shadow-relocate)
+        uses: actions/checkout@v4
+        with:
+          path: ctrl
+
+      - name: Prep dirs on the big volume
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER" "$WEBRTC_DIR"
+          mkdir -p "$CIPD_CACHE_DIR" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$VPYTHON_VIRTUALENV_ROOT"
+          df -h "$WEBRTC_DIR" /
+
+      - name: Install depot_tools (on the big volume)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WEBRTC_DIR/depot_tools"
+          echo "$WEBRTC_DIR/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient config + sync (Android, shallow)
+        working-directory: /home/runner/webrtc
+        run: |
+          set -euo pipefail
+          cat > .gclient <<EOF
+          solutions = [{
+            "name": "src",
+            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "deps_file": "DEPS",
+            "managed": False,
+            "custom_deps": {},
+          }]
+          target_os = ["android", "unix"]
+          EOF
+          echo "::group::gclient sync"
+          gclient sync --no-history --shallow --nohooks
+          echo "::endgroup::"
+          echo "::group::runhooks"
+          gclient runhooks
+          echo "::endgroup::"
+          du -sh src 2>/dev/null || true
+          df -h "$WEBRTC_DIR" /
+
+      - name: Apply jni_prefix.patch (LiveKit package/native-symbol relocation)
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE (plain native lib name) ==="
+          grep -n 'nativeLibraryName = "jingle_peerconnection_so"' sdk/android/api/org/webrtc/PeerConnectionFactory.java
+          git apply -v "$GITHUB_WORKSPACE/ctrl/jni_prefix.patch"
+          echo "=== AFTER (renamed for the future livekit.org.webrtc relocation) ==="
+          grep -n 'nativeLibraryName = "lkjingle_peerconnection_so"' sdk/android/api/org/webrtc/PeerConnectionFactory.java
+          grep -n 'android_package_prefix = "livekit"' webrtc.gni
+
+      - name: Apply AES-256 FrameCryptor patch
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "ratchet_salt, 128)" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
+          echo "=== AFTER ==="
+          grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
+
+      - name: Build raw AAR (org.webrtc classes, libjingle_peerconnection_so.so)
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          vpython3 ./tools_webrtc/android/build_aar.py \
+            --build-dir out/aar \
+            --output "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" \
+            --arch ${{ github.event.inputs.arch }} \
+            --extra-gn-args 'is_component_build=false rtc_include_tests=false is_debug=false rtc_libvpx_build_vp9=true rtc_enable_symbol_export=true rtc_build_examples=false rtc_use_h264=true use_rtti=true use_clang_modules=false is_java_debug=false'
+          ls -lh "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar"
+
+      - name: Unzip raw AAR
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/pkg/raw"
+          unzip -o "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" -d "$GITHUB_WORKSPACE/pkg/raw"
+          find "$GITHUB_WORKSPACE/pkg/raw" -maxdepth 3
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Shadow plugin 7.1.2 (same version webrtc-sdk/android's own shadow
+      # module pins) targets Gradle <8 — pin 7.6 explicitly rather than
+      # letting setup-gradle default to a newer major that may reject it.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '7.6'
+
+      - name: Relocate classes.jar (org.webrtc -> livekit.org.webrtc)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/ctrl/shadow-relocate/libs"
+          cp "$GITHUB_WORKSPACE/pkg/raw/classes.jar" "$GITHUB_WORKSPACE/ctrl/shadow-relocate/libs/classes.jar"
+          cd "$GITHUB_WORKSPACE/ctrl/shadow-relocate"
+          gradle --no-daemon shadowJar
+          RELOCATED="$(find build/libs -name '*-all.jar' | head -1)"
+          if [[ -z "$RELOCATED" ]]; then
+            echo "shadowJar produced no *-all.jar — see gradle output above" >&2
+            exit 1
+          fi
+          echo "=== spot-check: relocated jar has livekit/org/webrtc, no bare org/webrtc ==="
+          unzip -l "$RELOCATED" | grep -c '^.*livekit/org/webrtc/' || { echo "no livekit/org/webrtc entries found"; exit 1; }
+          if unzip -l "$RELOCATED" | grep -qE '  org/webrtc/'; then
+            echo "relocation incomplete: bare org/webrtc/ classes still present" >&2
+            exit 1
+          fi
+          cp "$RELOCATED" "$GITHUB_WORKSPACE/pkg/raw/classes.jar"
+
+      - name: Rename native lib (libjingle_peerconnection_so.so -> liblkjingle_peerconnection_so.so)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/pkg/raw"
+          shopt -s nullglob
+          renamed=0
+          for f in jni/*/libjingle_peerconnection_so.so; do
+            abi_dir="$(dirname "$f")"
+            mv "$f" "$abi_dir/liblkjingle_peerconnection_so.so"
+            renamed=$((renamed+1))
+          done
+          if [[ "$renamed" -eq 0 ]]; then
+            echo "no jni/*/libjingle_peerconnection_so.so found to rename — build_aar.py output layout may have changed" >&2
+            find . -name '*.so'
+            exit 1
+          fi
+          find jni -type f
+
+      - name: Repackage final AAR (drop-in for io.github.webrtc-sdk:android-prefixed)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/pkg/raw"
+          OUT="$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-prefixed.aar"
+          rm -f "$OUT"
+          # Same member set build_aar.py's own raw AAR ships (AndroidManifest.xml,
+          # classes.jar, R.txt, jni/) plus whichever optional members exist
+          # (proguard.txt, lint.jar) — mirrors prefixmove.sh from
+          # webrtc-sdk/android without inventing a new AAR shape.
+          zip -r "$OUT" AndroidManifest.xml classes.jar jni $(ls R.txt proguard.txt lint.jar 2>/dev/null || true)
+          ls -lh "$OUT"
+          echo "=== final AAR contents ==="
+          unzip -l "$OUT"
+
+      - name: Upload raw AAR artifact (org.webrtc, diagnostic only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-aes256-livekit-raw-aar
+          path: libwebrtc-aes256-livekit-raw.aar
+          if-no-files-found: error
+
+      - name: Upload final prefixed AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-aes256-livekit-prefixed-aar
+          path: libwebrtc-aes256-livekit-prefixed.aar
+          if-no-files-found: error
