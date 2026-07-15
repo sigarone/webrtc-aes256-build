@@ -33,7 +33,7 @@ on:
         description: "Android ABI(s), space separated"
         default: "arm64-v8a"
       webrtc_ref:
-        description: "webrtc-sdk/webrtc branch/tag/commit"
+        description: "tag on sigarone/webrtc (see checkout step below for why not a raw SHA)"
         # Pinned to the same exact commit as build-livekit-ios.yml — the last
         # m144_release commit before livekit/webrtc-xcframework's real
         # 144.7559.03 release (2026-03-31) was cut, and before a 2026-06-11
@@ -42,8 +42,14 @@ on:
         # 29452170871). Not observed to affect this Android build directly,
         # but pinning both platforms to the SAME upstream commit (not a
         # rolling branch name) avoids any other latent API drift and keeps
-        # the two builds byte-comparable going forward.
-        default: "770e5461892d"
+        # the two builds byte-comparable going forward. This is a TAG NAME
+        # (on the sigarone/webrtc fork below), NOT the raw commit SHA
+        # 770e5461892d7d1aaff7ff886ab1fc7c5cd77bd1 itself — GitHub rejects a
+        # shallow `git fetch origin <sha> --depth=1` for an arbitrary commit
+        # not at a ref tip (confirmed live, run 29452649938: "couldn't find
+        # remote ref"), so a lightweight tag was created via the Git Data API
+        # on a fork instead, which IS shallow-fetchable like any real ref.
+        default: "770e5461892d-livekit-aes256"
 
 permissions:
   contents: write
@@ -98,7 +104,7 @@ jobs:
           cat > .gclient <<EOF
           solutions = [{
             "name": "src",
-            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "url": "https://github.com/sigarone/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
             "deps_file": "DEPS",
             "managed": False,
             "custom_deps": {},
