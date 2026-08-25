@@ -96,6 +96,16 @@ jobs:
           echo "=== AFTER ==="
           grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
 
+      - name: Apply Native PLI keyframe-recovery patch (W-NATIVEPLI)
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "last_decrypt_fail_notify_ms_" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/native-pli.patch"
+          echo "=== AFTER ==="
+          grep -n "last_decrypt_fail_notify_ms_{0}" api/crypto/frame_crypto_transformer.h
+
       - name: Build AAR
         working-directory: /home/runner/webrtc/src
         run: |
