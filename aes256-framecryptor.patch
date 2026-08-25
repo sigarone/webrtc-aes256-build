@@ -3,63 +3,27 @@ FrameCryptor: AES-256-GCM when the shared key material is 32 bytes.
 The AEAD already selects AES-256-GCM when the derived key is 32 bytes
 (GetAesGcmAlgorithmFromKeySize). ParticipantKeyHandler::SetKeyFromMaterial
 hardcoded the derived length to 128 bits; derive it from the key-material size
-instead (32 -> 256, else 128). No Java/JNI API change — the app picks the cipher
+instead (32 -> 256, else 128). No Java/JNI API change - the app picks the cipher
 by the byte length it passes to setKey()/setSharedKey(). ratchet_window_size=0
 so the .cc ratchet paths are unused. Ref: livekit/client-sdk-android#952.
 
-W-AES256DIAG (temporary, this build only): also logs pw_len/pw_hex/derived_len/
-derived_hex via __android_log_print(ANDROID_LOG_ERROR, "AES256DIAG", ...) right
-after every SetKeyFromMaterial call, Android-only (#if WEBRTC_ANDROID), to
-verify at runtime that a 32-byte password really derives a 32-byte key on the
-actual linked native library — cross-platform group-call E2EE interop bug,
-Desktop<->Android decrypt fails both directions despite byte-identical SK_0 at
-every application layer. Remove once verified.
+Clean build (2026-08-25): the temporary W-AES256DIAG runtime logging of raw
+key material (pw_hex/derived_hex via __android_log_print at ERROR) that the
+earlier -diag3 artifact carried is DROPPED here. The cross-platform AES-256
+interop it was diagnosing is resolved; shipping raw password + derived-key
+hex to logcat must never reach a distributed build. This patch is now a
+single one-line hunk with no Android logging include.
 
 diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
-index 6d01653..93c51d0 100644
+index 6d01653..77c1a2e 100644
 --- a/api/crypto/frame_crypto_transformer.h
 +++ b/api/crypto/frame_crypto_transformer.h
-@@ -29,6 +29,10 @@
- #include "rtc_base/system/rtc_export.h"
- #include "rtc_base/thread.h"
- 
-+#if defined(WEBRTC_ANDROID)
-+#include <android/log.h>
-+#endif
-+
- namespace webrtc {
- 
- const size_t DEFAULT_KEYRING_SIZE = 16;
-@@ -204,7 +208,31 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+@@ -204,7 +204,7 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
        current_key_index_ = key_index % crypto_key_ring_.size();
      }
      crypto_key_ring_[current_key_index_] =
 -        DeriveKeys(password, key_provider_->options().ratchet_salt, 128);
 +        DeriveKeys(password, key_provider_->options().ratchet_salt, password.size() == 32 ? 256 : 128);
-+#if defined(WEBRTC_ANDROID)
-+    {
-+      static const char kHex[] = "0123456789abcdef";
-+      std::string pw_hex;
-+      for (uint8_t b : password) {
-+        pw_hex += kHex[(b >> 4) & 0xF];
-+        pw_hex += kHex[b & 0xF];
-+      }
-+      auto ks = crypto_key_ring_[current_key_index_];
-+      std::string derived_hex;
-+      size_t derived_len = 0;
-+      if (ks) {
-+        derived_len = ks->encryption_key.size();
-+        for (uint8_t b : ks->encryption_key) {
-+          derived_hex += kHex[(b >> 4) & 0xF];
-+          derived_hex += kHex[b & 0xF];
-+        }
-+      }
-+      __android_log_print(ANDROID_LOG_ERROR, "AES256DIAG",
-+          "W-AES256DIAG idx=%d pw_len=%zu pw_hex=%s derived_len=%zu derived_hex=%s",
-+          current_key_index_, password.size(), pw_hex.c_str(), derived_len,
-+          derived_hex.c_str());
-+    }
-+#endif
    }
- 
+
    bool DecryptionFailure() {
