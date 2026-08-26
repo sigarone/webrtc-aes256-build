@@ -22,13 +22,17 @@ name: build-webrtc-aes256-livekit-ios
 # for the exact diff from upstream.
 #
 # NOT a from-scratch fork: same webrtc-sdk/webrtc@m144_release checkout as
-# build-ios.yml, two patches applied in sequence (no overlapping hunks —
-# aes256-framecryptor.patch only touches api/crypto/frame_crypto_transformer.h;
-# apple_prefix.patch touches sdk/objc/base/RTCMacros.h, sdk/BUILD.gn,
-# tools_webrtc/ios/*, sdk/objc/Info.plist), then a direct gn/ninja/xcodebuild
-# build (not tools_webrtc/ios/build_ios_libs.py, which upstream's
-# apple_prefix.patch also retargets to "LiveKitWebRTC.xcframework" naming but
-# which this job does not invoke).
+# build-ios.yml, three patches applied in sequence (no overlapping hunks —
+# aes256-framecryptor.patch and native-pli.patch only touch
+# api/crypto/frame_crypto_transformer.h/.cc; apple_prefix.patch touches
+# sdk/objc/base/RTCMacros.h, sdk/BUILD.gn, tools_webrtc/ios/*,
+# sdk/objc/Info.plist), then a direct gn/ninja/xcodebuild build (not
+# tools_webrtc/ios/build_ios_libs.py, which upstream's apple_prefix.patch
+# also retargets to "LiveKitWebRTC.xcframework" naming but which this job
+# does not invoke). native-pli.patch adds the W-NATIVEPLI unconditional
+# rate-limited kDecryptionFailed observer notification on decrypt-tag-
+# mismatch — the same patch already wired into the Android AAR builds in
+# build.yml/build-livekit-android.yml (see cc92927e7).
 #
 # Run via Actions -> build-webrtc-aes256-livekit-ios -> Run workflow.
 # Expected build time: in the same range as build-ios.yml (~1h, well under
@@ -65,7 +69,7 @@ on:
         default: "770e5461892d-livekit-aes256"
       release_tag:
         description: "GitHub release tag to host the LiveKitWebRTC.xcframework zip"
-        default: "webrtc-ios-aes256-livekit-m144"
+        default: "webrtc-ios-aes256-livekit-m144-native-pli"
 
 permissions:
   contents: write
@@ -145,6 +149,16 @@ jobs:
           git apply -v "$GITHUB_WORKSPACE/ctrl/aes256-framecryptor.patch"
           echo "=== AFTER ==="
           grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
+
+      - name: Apply Native PLI keyframe-recovery patch (W-NATIVEPLI)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "last_decrypt_fail_notify_ms_" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/native-pli.patch"
+          echo "=== AFTER ==="
+          grep -n "last_decrypt_fail_notify_ms_{0}" api/crypto/frame_crypto_transformer.h
 
       - name: Apply LK symbol-prefix patch (LiveKit fork parity)
         working-directory: ${{ runner.temp }}/webrtc/src
@@ -250,7 +264,7 @@ jobs:
           # explicitly removes the cwd dependency entirely.
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$REPO" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
-              --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + apple_prefix.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+              --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + apple_prefix.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
           fi
           gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --repo "$REPO" --clobber
           echo "Asset: https://github.com/$REPO/releases/download/$TAG/LiveKitWebRTC.xcframework.zip"

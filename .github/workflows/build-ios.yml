@@ -1,11 +1,15 @@
 name: build-webrtc-aes256-ios
 
 # Builds the LiveKit/webrtc-sdk fork of libwebrtc (M144) with the AES-256
-# FrameCryptor patch -> iOS WebRTC.xcframework (device:arm64 + simulator slices),
-# H265/HEVC enabled (same as the upstream webrtc-sdk release binary). Drop-in
+# FrameCryptor patch AND the W-NATIVEPLI native decrypt-failure signal patch
+# -> iOS WebRTC.xcframework (device:arm64 + simulator slices), H265/HEVC
+# enabled (same as the upstream webrtc-sdk release binary). Drop-in
 # replacement for the stock 144.7559.10 xcframework consumed by Q-Audion iOS
-# (QAudionEngine/Package.swift .binaryTarget). The only delta vs upstream is the
-# single-hunk aes256-framecryptor.patch (32-byte shared key -> AES-256-GCM).
+# (QAudionEngine/Package.swift .binaryTarget). Deltas vs upstream:
+# aes256-framecryptor.patch (32-byte shared key -> AES-256-GCM) and
+# native-pli.patch (unconditional rate-limited kDecryptionFailed observer
+# notification on decrypt-tag-mismatch, same patch already wired into the
+# Android AAR builds in build.yml/build-livekit-android.yml — see cc92927e7).
 #
 # Run via Actions -> build-webrtc-aes256-ios -> Run workflow. Build ~3-4 h.
 # Artifact: WebRTC.xcframework.zip + the SwiftPM checksum printed in the log AND
@@ -22,7 +26,7 @@ on:
         default: "m144_release"
       release_tag:
         description: "GitHub release tag to host the xcframework zip"
-        default: "webrtc-ios-aes256-m144"
+        default: "webrtc-ios-aes256-m144-native-pli"
 
 permissions:
   contents: write
@@ -103,6 +107,16 @@ jobs:
           echo "=== AFTER ==="
           grep -n "password.size() == 32 ? 256 : 128" api/crypto/frame_crypto_transformer.h
 
+      - name: Apply Native PLI keyframe-recovery patch (W-NATIVEPLI)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE ==="
+          grep -n "last_decrypt_fail_notify_ms_" api/crypto/frame_crypto_transformer.h || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/native-pli.patch"
+          echo "=== AFTER ==="
+          grep -n "last_decrypt_fail_notify_ms_{0}" api/crypto/frame_crypto_transformer.h
+
       - name: Force real ninja (Siso's iOS dep-scan invents missing SDK modulemaps)
         working-directory: ${{ runner.temp }}/webrtc/src
         run: |
@@ -166,9 +180,15 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.release_tag }}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
-              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+          REPO="${{ github.repository }}"
+          # $GITHUB_WORKSPACE is NOT a git repo here (actions/checkout above
+          # used `with: path: ctrl`) — gh would otherwise fail to auto-detect
+          # the target repo from cwd. Same latent bug already fixed in the
+          # sibling build-livekit-ios.yml (see that workflow's publish-step
+          # comment); pass --repo explicitly here too.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
+              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
           fi
-          gh release upload "$TAG" WebRTC.xcframework.zip --clobber
-          echo "Asset: https://github.com/${{ github.repository }}/releases/download/$TAG/WebRTC.xcframework.zip"
+          gh release upload "$TAG" WebRTC.xcframework.zip --repo "$REPO" --clobber
+          echo "Asset: https://github.com/$REPO/releases/download/$TAG/WebRTC.xcframework.zip"
