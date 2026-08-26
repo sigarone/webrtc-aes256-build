@@ -46,30 +46,64 @@ on:
     inputs:
       webrtc_ref:
         description: "tag on sigarone/webrtc (see checkout step below for why not a raw SHA)"
-        # Pinned to the exact commit livekit/webrtc-xcframework's real
-        # 144.7559.03 release was built from (published 2026-03-31; this is
-        # the last m144_release commit dated 2026-03-30, one day prior —
-        # verified: RTCAudioDeviceModule.h at this SHA still has the plain
-        # isVoiceProcessingEnabled/setVoiceProcessingEnabled API
-        # client-sdk-swift 2.13.0's AudioManager.swift calls directly).
-        # NOT "m144_release" (a rolling branch, not a fixed ref) — the first
-        # build from that default picked up 2.5 months of subsequent commits
-        # including "Audio processing state v2: factory-owned read-back,
-        # redesigned state API (#254)" (2026-06-11), which REMOVED that
-        # property in favor of a new RTCPlatformAudioProcessingState API,
-        # breaking compile against client-sdk-swift 2.13.0 (confirmed live,
-        # CI run 29452170871: "value of type 'LKRTCAudioDeviceModule' has no
-        # member 'isVoiceProcessingEnabled'"). This is a TAG NAME (on the
-        # sigarone/webrtc fork below), NOT the raw commit SHA
-        # 770e5461892d7d1aaff7ff886ab1fc7c5cd77bd1 itself — confirmed live
-        # (run 29452647799) that GitHub rejects `git fetch origin <sha>
-        # --depth=1` for an arbitrary commit not at a ref tip ("couldn't find
-        # remote ref"), so a lightweight tag was created via the Git Data API
-        # on a fork instead, which IS shallow-fetchable like any real ref.
-        default: "770e5461892d-livekit-aes256"
+        # RE-PINNED 2026-08-26 — the previous default below
+        # ("770e5461892d-livekit-aes256", commit 770e5461892d7d1aaff7ff886-
+        # ab1fc7c5cd77bd1, dated 2026-03-30) was NEVER actually the ref that
+        # built the last known-good release. That release
+        # (webrtc-ios-aes256-livekit-m144-7559.10, run 30340955866,
+        # 2026-07-28) was produced by a workflow_dispatch call that manually
+        # OVERRODE this input to "f47af7bc9658-livekit-aes256-7559.10"
+        # (confirmed from that run's own "gclient config + sync" step log) —
+        # but this YAML default was never updated to match, so it silently
+        # stayed on the older March-30 pin. The 2026-08-26 native-pli run
+        # (32959229056) used this stale default as-is (no override given)
+        # and its LiveKitWebRTC.xcframework.zip came out missing
+        # Headers/RTCAudioProcessingState.h relative to the .7559.10 build —
+        # confirmed by downloading both release zips and diffing the actual
+        # Headers/ listing (only that one file differs, everything else
+        # matches). Root-caused to real upstream content, not a build-script
+        # bug: `sdk/objc/api/peerconnection/RTCAudioProcessingState.h` does
+        # not exist anywhere in sigarone/webrtc's tree at 770e5461892d7d1a...
+        # (verified via the GitHub Trees API, non-truncated, zero matches for
+        # "AudioProcessingState") but DOES exist at f47af7bc965851090bef9fce-
+        # 9a4284f468d20a44 ("Fix AudioEngineDevice crash from null
+        # FineAudioBuffer on playout/record start (#256)", 2026-06-15) — i.e.
+        # upstream added this header (part of the "Audio processing state v2"
+        # work, see the #254 note below) sometime between the two pins, and
+        # the March-30 pin simply predates it. Re-pointing the default at the
+        # tag that was actually proven to work restores the header and keeps
+        # every future un-overridden dispatch (like the one that caused this)
+        # on the same known-good source.
+        #
+        # Original 2026-07-15 rationale for pinning away from the rolling
+        # branch (still valid, kept for context): NOT "m144_release" (a
+        # rolling branch, not a fixed ref) — the first build from that
+        # default picked up 2.5 months of subsequent commits including
+        # "Audio processing state v2: factory-owned read-back, redesigned
+        # state API (#254)" (2026-06-11), which REMOVED the
+        # RTCAudioDeviceModule property client-sdk-swift 2.13.0's
+        # AudioManager.swift calls directly (isVoiceProcessingEnabled) in
+        # favor of a new RTCPlatformAudioProcessingState API, breaking
+        # compile (confirmed live, CI run 29452170871: "value of type
+        # 'LKRTCAudioDeviceModule' has no member 'isVoiceProcessingEnabled'").
+        # f47af7bc9658... (2026-06-15) is AFTER #254 and still has the plain
+        # RTCAudioDeviceModule property (unaffected — proven live by the
+        # .7559.10 build client-sdk-swift 2.16.0-aes256-raw4 already
+        # consumes successfully) as well as the new RTCAudioProcessingState
+        # API alongside it, so it satisfies both requirements at once. This
+        # is a TAG NAME (on the sigarone/webrtc fork below), NOT a raw commit
+        # SHA — confirmed live (run 29452647799) that GitHub rejects `git
+        # fetch origin <sha> --depth=1` for an arbitrary commit not at a ref
+        # tip ("couldn't find remote ref"), so a lightweight tag was created
+        # via the Git Data API on a fork instead, which IS shallow-fetchable
+        # like any real ref.
+        default: "f47af7bc9658-livekit-aes256-7559.10"
       release_tag:
         description: "GitHub release tag to host the LiveKitWebRTC.xcframework zip"
-        default: "webrtc-ios-aes256-livekit-m144-native-pli"
+        # webrtc-ios-aes256-livekit-m144-native-pli already exists and holds
+        # the BROKEN (missing-header) build's release notes/asset from
+        # 2026-08-26 — do not reuse it, tag fresh instead.
+        default: "webrtc-ios-aes256-livekit-m144-native-pli-2"
 
 permissions:
   contents: write
