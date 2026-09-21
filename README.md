@@ -58,3 +58,18 @@ flagged rather than hidden:
 Consuming this artifact in `qaudion-android-new` (Gradle dependency
 substitution of `io.github.webrtc-sdk:android-prefixed` → this local AAR) is
 tracked separately — not done by this workflow.
+
+## no-key-log.patch (SECURITY)
+
+Upstream `webrtc-sdk/webrtc` (m144_release .. m150_release) logs the frame-cryptor
+input secret, the salt and the DERIVED AES key as decimal byte lists at
+`RTC_LOG(LS_INFO)` (`api/crypto/frame_crypto_transformer.cc`,
+`DeriveHkdfSha256FromSecret` and `DerivePBKDF2KeyFromRawKey`). Any app that
+enables WebRTC INFO logging leaks the per-call E2EE key into its log capture.
+
+`no-key-log.patch` deletes both statements. Every workflow applies it (after
+`aes256-framecryptor.patch` / `native-pli.patch`), asserts the source no longer
+contains the statements, and after the build asserts that the binary contains
+no `slat << ` string (upstream's own typo of "salt", unique to those
+statements). Do not drop this patch when rebasing on a newer upstream ref; re-check
+with `grep -n "derived_key " api/crypto/frame_crypto_transformer.cc`.

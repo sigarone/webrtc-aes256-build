@@ -1,0 +1,63 @@
+FrameCryptor: stop logging raw key material (secret / salt / derived key).
+
+Upstream webrtc-sdk/webrtc (m144_release, m150_release and every LiveKit
+prebuilt built from them) prints, at RTC_LOG(LS_INFO), the input secret, the
+salt and the DERIVED AES key as decimal byte lists every time a frame-cryptor
+key is installed (DeriveHkdfSha256FromSecret, frame_crypto_transformer.cc:260;
+DerivePBKDF2KeyFromRawKey, :284):
+
+    secret [<32 byte values>] len 32 slat << [<salt bytes>] len 0
+     derived_key [<32 byte values>] len 32
+
+("slat" is upstream's own typo of "salt".) Any app that turns WebRTC INFO
+logging on (iOS: RTCSetMinDebugLogLevel(.info); Android: logcat / Logging
+severity) writes the per-call E2EE frame key into its log capture; Q-Audion iOS
+uploads that capture to the server as W417 live-log blobs.
+
+This patch deletes both statements (no replacement log line, so there is
+nothing to redact). The helper to_uint8_list() stays (external linkage, unused
+-> no -Wunused-function). Apply AFTER aes256-framecryptor.patch and
+native-pli.patch (order is not significant: the hunks do not overlap).
+
+Verified against the byte-exact upstream blobs (git blob ecdcb30a, identical on
+webrtc-sdk/webrtc@m144_release and sigarone/webrtc@f47af7bc9658-livekit-aes256-
+7559.10): git apply --check passes alone and after the two existing patches.
+
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index ecdcb30..31f688a 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -257,12 +257,11 @@ int DeriveHkdfSha256FromSecret(const std::vector<uint8_t>& secret,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "secret " << to_uint8_list(secret.data(), secret.size())
+-                   << " len " << secret.size() << " slat << "
+-                   << to_uint8_list(salt.data(), salt.size()) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key.data(), derived_key.size())
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material. Upstream printed the input secret, the
++  // salt and the derived key here as decimal byte lists at LS_INFO; apps that
++  // enable INFO logging (RTCSetMinDebugLogLevel(.info), logcat, ...) then leak
++  // the E2EE frame key into their log capture and any uploaded diagnostics.
++  // Removed; keep it removed when rebasing on upstream.
+ 
+   return Success;
+ }
+@@ -281,13 +280,8 @@ int DerivePBKDF2KeyFromRawKey(const std::vector<uint8_t> raw_key,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "raw_key "
+-                   << to_uint8_list(raw_key.data(), raw_key.size()) << " len "
+-                   << raw_key.size() << " slat << "
+-                   << to_uint8_list(salt.data(), salt.size()) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key.data(), derived_key.size())
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material (raw key, salt, derived key). See the
++  // note in DeriveHkdfSha256FromSecret().
+ 
+   return Success;
+ }

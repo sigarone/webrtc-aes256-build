@@ -106,6 +106,19 @@ jobs:
           echo "=== AFTER ==="
           grep -n "last_decrypt_fail_notify_ms_{0}" api/crypto/frame_crypto_transformer.h
 
+      - name: Apply no-key-log patch (SECURITY - never log key material)
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE (upstream prints secret/salt/derived key at LS_INFO) ==="
+          grep -nE 'derived_key |slat << ' api/crypto/frame_crypto_transformer.cc || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/no-key-log.patch"
+          echo "=== AFTER (must be empty) ==="
+          if grep -nE 'derived_key |slat << |"raw_key ' api/crypto/frame_crypto_transformer.cc; then
+            echo "::error::key-material log statements still present after no-key-log.patch"
+            exit 1
+          fi
+
       - name: Build AAR
         working-directory: /home/runner/webrtc/src
         run: |
@@ -116,6 +129,12 @@ jobs:
             --arch ${{ github.event.inputs.arch }} \
             --extra-gn-args 'is_component_build=false rtc_include_tests=false is_debug=false rtc_libvpx_build_vp9=true rtc_enable_symbol_export=true rtc_build_examples=false rtc_use_h264=true use_rtti=true use_clang_modules=false is_java_debug=false'
           ls -lh "$GITHUB_WORKSPACE/libwebrtc-aes256.aar"
+          # SECURITY gate: the shipped native lib must not contain the upstream
+          # key-dump log format strings ("slat << " is upstream's own typo and
+          # is unique to those two statements).
+          LEAK=$(unzip -p "$GITHUB_WORKSPACE/libwebrtc-aes256.aar" 'jni/*/libjingle_peerconnection_so.so' | grep -a -c -F 'slat << ' || true)
+          echo "key-dump strings found in libjingle_peerconnection_so.so: $LEAK"
+          test "$LEAK" = "0"
 
       - name: Upload AAR artifact
         uses: actions/upload-artifact@v4

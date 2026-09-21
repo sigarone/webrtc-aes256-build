@@ -117,6 +117,19 @@ jobs:
           echo "=== AFTER ==="
           grep -n "last_decrypt_fail_notify_ms_{0}" api/crypto/frame_crypto_transformer.h
 
+      - name: Apply no-key-log patch (SECURITY - never log key material)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          echo "=== BEFORE (upstream prints secret/salt/derived key at LS_INFO) ==="
+          grep -nE 'derived_key |slat << ' api/crypto/frame_crypto_transformer.cc || true
+          git apply -v "$GITHUB_WORKSPACE/ctrl/no-key-log.patch"
+          echo "=== AFTER (must be empty) ==="
+          if grep -nE 'derived_key |slat << |"raw_key ' api/crypto/frame_crypto_transformer.cc; then
+            echo "::error::key-material log statements still present after no-key-log.patch"
+            exit 1
+          fi
+
       - name: Force real ninja (Siso's iOS dep-scan invents missing SDK modulemaps)
         working-directory: ${{ runner.temp }}/webrtc/src
         run: |
@@ -149,6 +162,13 @@ jobs:
           nm -gU out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "H265|HEVC" | head || echo "(no exported H265 symbol name match — VideoToolbox codec may be internal)"
           echo "=== AES-256 string probe ==="
           strings out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "AES-256 GCM|aes_256_gcm" | head || true
+          # SECURITY gate: the shipped binary must not contain the upstream
+          # key-dump log format strings ("slat << " is upstream's own typo and
+          # is unique to those two statements).
+          echo "=== key-dump string probe (device arm64, must be 0) ==="
+          LEAK=$(strings out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -cE 'slat << |^ derived_key ' || true)
+          echo "key-dump strings found: $LEAK"
+          test "$LEAK" = "0"
 
       - name: Package xcframework (preserve symlinks) + checksum
         working-directory: ${{ runner.temp }}/webrtc/src/out_ios_libs
