@@ -67,9 +67,31 @@ input secret, the salt and the DERIVED AES key as decimal byte lists at
 `DeriveHkdfSha256FromSecret` and `DerivePBKDF2KeyFromRawKey`). Any app that
 enables WebRTC INFO logging leaks the per-call E2EE key into its log capture.
 
-`no-key-log.patch` deletes both statements. Every workflow applies it (after
-`aes256-framecryptor.patch` / `native-pli.patch`), asserts the source no longer
-contains the statements, and after the build asserts that the binary contains
-no `slat << ` string (upstream's own typo of "salt", unique to those
-statements). Do not drop this patch when rebasing on a newer upstream ref; re-check
-with `grep -n "derived_key " api/crypto/frame_crypto_transformer.cc`.
+`no-key-log.patch` deletes both statements. It is written for the m144 line and
+applies to every m144 ref built here (`m150_release` has the same statements in
+a different call form and needs a rebased patch). Every workflow applies it
+(after `aes256-framecryptor.patch` / `native-pli.patch`) and asserts the source
+no longer contains the statements. After the build, `ci/assert-no-key-strings.sh`
+scans EVERY produced binary (each Mach-O slice of the xcframeworks, each
+`jni/<abi>/*.so` of the AARs; the final renamed AAR too) for `derived_key`,
+`slat << ` (upstream's own typo of "salt") and `raw_key`, and fails the job,
+failing closed on a missing/tiny binary or a missing positive control.
+`ci/test-assert-no-key-strings.sh` is its self-test. Do not drop this patch when
+rebasing on a newer upstream ref; re-check with
+`grep -n "derived_key " api/crypto/frame_crypto_transformer.cc`.
+
+## Source pins and release tags
+
+The workflows fetch `sigarone/webrtc` by a TAG (GitHub rejects a shallow fetch of
+a bare SHA), never a rolling branch, so a rebuild differs from the shipped
+binary only by the patches in this repo:
+
+| workflow | default `webrtc_ref` | upstream commit |
+| --- | --- | --- |
+| `build-ios.yml`, `build.yml` | `df1011beabae-livekit-aes256-7559.14` | `webrtc-sdk/webrtc@df1011beabae` (m144.7559.14) |
+| `build-livekit-android.yml` | `df1011beabae-livekit-aes256-7559.14` | same |
+| `build-livekit-ios.yml` | `f47af7bc9658-livekit-aes256-7559.10` | `webrtc-sdk/webrtc@f47af7bc9658` (m144.7559.10) |
+
+The two iOS release workflows refuse to overwrite an existing release asset
+(earlier releases are rollback binaries the app pins by checksum): every build
+needs a NEW `release_tag`, and the tag is created at the built commit.

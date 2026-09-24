@@ -103,7 +103,9 @@ on:
         # webrtc-ios-aes256-livekit-m144-native-pli already exists and holds
         # the BROKEN (missing-header) build's release notes/asset from
         # 2026-08-26 — do not reuse it, tag fresh instead.
-        default: "webrtc-ios-aes256-livekit-m144-native-pli-2"
+        # NEW tag required: an existing release is a rollback asset and the
+        # publish step below refuses to overwrite it.
+        default: "webrtc-ios-aes256-livekit-m144-native-pli-nokeylog"
 
 permissions:
   contents: write
@@ -318,9 +320,16 @@ jobs:
           # appeared minutes later via what was almost certainly a manual
           # `gh release upload`, not the workflow itself. Passing --repo
           # explicitly removes the cwd dependency entirely.
-          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
-              --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + apple_prefix.patch + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+          # NEVER overwrite a published asset (rollback binaries; see above).
+          ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          if [ "$(printf '%s\n' "$ASSETS" | grep -cx 'LiveKitWebRTC.xcframework.zip' || true)" != "0" ]; then
+            echo "::error::release $TAG already has LiveKitWebRTC.xcframework.zip - refusing to overwrite it. Re-run with a NEW release_tag."
+            exit 1
           fi
-          gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --repo "$REPO" --clobber
+          # --target: tag the commit that was actually built (the dispatched ref).
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" --title "LiveKitWebRTC.xcframework AES-256 + H265 + LK-prefix (M144)" \
+              --notes "webrtc-sdk M144 iOS xcframework (LK-symbol-prefixed, LiveKit-compatible) with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + no-key-log.patch (upstream key-material logging removed) + apple_prefix.patch + H265. Source: sigarone/webrtc@${{ github.event.inputs.webrtc_ref }}. checksum: ${{ steps.pkg.outputs.checksum }}"
+          fi
+          gh release upload "$TAG" LiveKitWebRTC.xcframework.zip --repo "$REPO"
           echo "Asset: https://github.com/$REPO/releases/download/$TAG/LiveKitWebRTC.xcframework.zip"

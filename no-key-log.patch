@@ -11,8 +11,8 @@ DerivePBKDF2KeyFromRawKey, :284):
 
 ("slat" is upstream's own typo of "salt".) Any app that turns WebRTC INFO
 logging on (iOS: RTCSetMinDebugLogLevel(.info); Android: logcat / Logging
-severity) writes the per-call E2EE frame key into its log capture; Q-Audion iOS
-uploads that capture to the server as W417 live-log blobs.
+severity) writes the per-call E2EE frame key into its log capture and into any
+diagnostics it uploads.
 
 This patch deletes both statements (no replacement log line, so there is
 nothing to redact). The helper to_uint8_list() stays (external linkage, unused

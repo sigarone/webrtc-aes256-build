@@ -22,11 +22,25 @@ on:
         description: "iOS arches (build_ios_libs.py format, space separated)"
         default: "device:arm64 simulator:arm64 simulator:x64"
       webrtc_ref:
-        description: "webrtc-sdk/webrtc branch/tag"
-        default: "m144_release"
+        description: "tag on sigarone/webrtc (an exact webrtc-sdk/webrtc commit; see the comment below)"
+        # PINNED 2026-09-24 to the exact upstream commit the shipped binary was
+        # built from. The old default was the ROLLING branch m144_release. The
+        # shipped webrtc-ios-aes256-m144-native-pli (run 32959215044, started
+        # 2026-08-26T10:37Z) synced m144_release when its tip was df1011beabae
+        # (2026-08-19, "Android: implement ADM SetMicrophoneMute...",
+        # m144.7559.14) - the branch had no push between 2026-08-19 and
+        # 2026-09-04T15:38Z (GitHub activity API). On 2026-09-04 upstream pushed
+        # 5145968ff388 (#284), 2a1ba3b111bb (#285), 276fcf95b917 (#286, AVAudioEngine
+        # playout-only) and 30d5e63ae91d (#288): a rebuild from the rolling branch
+        # would silently ship those and no longer be "the shipped binary minus
+        # the two key prints". The fork tag below is a lightweight tag on exactly
+        # df1011beabae993c555f7c11a7a4b8e8fa62480d (same commit as upstream).
+        # It must be a TAG/branch name, not a raw SHA: GitHub rejects a shallow
+        # fetch of a bare abbreviated SHA (see build-livekit-ios.yml).
+        default: "df1011beabae-livekit-aes256-7559.14"
       release_tag:
-        description: "GitHub release tag to host the xcframework zip"
-        default: "webrtc-ios-aes256-m144-native-pli"
+        description: "NEW GitHub release tag to host the xcframework zip (an existing tag is refused: it is a rollback asset)"
+        default: "webrtc-ios-aes256-m144-native-pli-nokeylog"
 
 permissions:
   contents: write
@@ -81,7 +95,7 @@ jobs:
           cat > .gclient <<EOF
           solutions = [{
             "name": "src",
-            "url": "https://github.com/webrtc-sdk/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "url": "https://github.com/sigarone/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
             "deps_file": "DEPS",
             "managed": False,
             "custom_deps": {},
@@ -208,9 +222,18 @@ jobs:
           # the target repo from cwd. Same latent bug already fixed in the
           # sibling build-livekit-ios.yml (see that workflow's publish-step
           # comment); pass --repo explicitly here too.
-          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$REPO" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
-              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + H265. checksum: ${{ steps.pkg.outputs.checksum }}"
+          # NEVER overwrite a published asset: earlier releases are the rollback
+          # binaries the app pins by checksum. Every build needs a NEW release_tag.
+          ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          if [ "$(printf '%s\n' "$ASSETS" | grep -cx 'WebRTC.xcframework.zip' || true)" != "0" ]; then
+            echo "::error::release $TAG already has WebRTC.xcframework.zip - refusing to overwrite it. Re-run with a NEW release_tag."
+            exit 1
           fi
-          gh release upload "$TAG" WebRTC.xcframework.zip --repo "$REPO" --clobber
+          # --target: tag the commit that was actually built (the dispatched ref),
+          # not the default branch tip.
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
+              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + no-key-log.patch (upstream key-material logging removed) + H265. Source: sigarone/webrtc@${{ github.event.inputs.webrtc_ref }}. checksum: ${{ steps.pkg.outputs.checksum }}"
+          fi
+          gh release upload "$TAG" WebRTC.xcframework.zip --repo "$REPO"
           echo "Asset: https://github.com/$REPO/releases/download/$TAG/WebRTC.xcframework.zip"

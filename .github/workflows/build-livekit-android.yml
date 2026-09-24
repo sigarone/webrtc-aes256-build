@@ -49,7 +49,13 @@ on:
         # not at a ref tip (confirmed live, run 29452649938: "couldn't find
         # remote ref"), so a lightweight tag was created via the Git Data API
         # on a fork instead, which IS shallow-fetchable like any real ref.
-        default: "770e5461892d-livekit-aes256"
+        # RE-PINNED 2026-09-24. The previous default (770e5461892d-livekit-aes256,
+        # 2026-03-30) is STALE: jni_prefix.patch's BUILD.gn hunk was rebased onto
+        # m144.7559.14 in a75140c5, so the patch no longer applies there
+        # ("patch failed: sdk/android/BUILD.gn:1603" when replayed against the
+        # real file at that tag). The shipped prefixed AAR (144.7559.14-pli1,
+        # run 32859985050) was built from this tag by overriding the input.
+        default: "df1011beabae-livekit-aes256-7559.14"
 
 permissions:
   contents: write
@@ -181,7 +187,7 @@ jobs:
           # Raw byte scan, see ci/assert-no-key-strings.sh.
           SCAN="$RUNNER_TEMP/aar-scan"
           rm -rf "$SCAN"; mkdir -p "$SCAN"
-          unzip -q -o "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" 'jni/*' -d "$SCAN"
+          unzip -q -o "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" -d "$SCAN"
           SOS=$(find "$SCAN/jni" -type f -name '*.so')
           echo "$SOS"
           sh "$GITHUB_WORKSPACE/ctrl/ci/assert-no-key-strings.sh" -m 5000000 -P 'Failed to derive HkdfSha256 key from secret' $SOS
@@ -262,7 +268,7 @@ jobs:
           # gets consumed, not the raw intermediate.
           SCAN="$RUNNER_TEMP/aar-final-scan"
           rm -rf "$SCAN"; mkdir -p "$SCAN"
-          unzip -q -o "$OUT" 'jni/*' -d "$SCAN"
+          unzip -q -o "$OUT" -d "$SCAN"
           SOS=$(find "$SCAN/jni" -type f -name '*.so')
           echo "$SOS"
           sh "$GITHUB_WORKSPACE/ctrl/ci/assert-no-key-strings.sh" -m 5000000 -P 'Failed to derive HkdfSha256 key from secret' $SOS
