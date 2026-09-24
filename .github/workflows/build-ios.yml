@@ -162,13 +162,15 @@ jobs:
           nm -gU out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "H265|HEVC" | head || echo "(no exported H265 symbol name match — VideoToolbox codec may be internal)"
           echo "=== AES-256 string probe ==="
           strings out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -iE "AES-256 GCM|aes_256_gcm" | head || true
-          # SECURITY gate: the shipped binary must not contain the upstream
-          # key-dump log format strings ("slat << " is upstream's own typo and
-          # is unique to those two statements).
-          echo "=== key-dump string probe (device arm64, must be 0) ==="
-          LEAK=$(strings out_ios_libs/WebRTC.xcframework/ios-arm64/WebRTC.framework/WebRTC 2>/dev/null | grep -cE 'slat << |^ derived_key ' || true)
-          echo "key-dump strings found: $LEAK"
-          test "$LEAK" = "0"
+          # SECURITY gate (binary level, EVERY slice: device + simulators): the
+          # shipped framework must not contain the upstream key-dump log format
+          # strings (derived_key / "slat << " / raw_key). Fails closed: no binary
+          # found, a binary under 5 MB, or an unreadable file => the step fails.
+          # Raw byte scan, see ci/assert-no-key-strings.sh.
+          echo "=== key-dump string gate (all slices, must be clean) ==="
+          SLICES=$(find out_ios_libs/WebRTC.xcframework -type f -path '*/WebRTC.framework/WebRTC')
+          echo "$SLICES"
+          sh "$GITHUB_WORKSPACE/ctrl/ci/assert-no-key-strings.sh" -m 5000000 -p 'Failed to derive HkdfSha256 key from secret' $SLICES
 
       - name: Package xcframework (preserve symlinks) + checksum
         working-directory: ${{ runner.temp }}/webrtc/src/out_ios_libs

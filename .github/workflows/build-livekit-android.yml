@@ -174,12 +174,18 @@ jobs:
             --arch ${{ github.event.inputs.arch }} \
             --extra-gn-args 'is_component_build=false rtc_include_tests=false is_debug=false rtc_libvpx_build_vp9=true rtc_enable_symbol_export=true rtc_build_examples=false rtc_use_h264=true use_rtti=true use_clang_modules=false is_java_debug=false'
           ls -lh "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar"
-          # SECURITY gate: the shipped native lib must not contain the upstream
-          # key-dump log format strings ("slat << " is upstream's own typo and
-          # is unique to those two statements).
-          LEAK=$(unzip -p "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" 'jni/*/libjingle_peerconnection_so.so' | grep -a -c -F 'slat << ' || true)
-          echo "key-dump strings found in libjingle_peerconnection_so.so: $LEAK"
-          test "$LEAK" = "0"
+          # SECURITY gate (binary level, EVERY ABI in the AAR): the shipped native
+          # lib must not contain the upstream key-dump log format strings
+          # (derived_key / "slat << " / raw_key). Fails closed: no .so found, a
+          # .so under 5 MB, or the positive control missing => the step fails.
+          # Raw byte scan, see ci/assert-no-key-strings.sh.
+          SCAN="$RUNNER_TEMP/aar-scan"
+          rm -rf "$SCAN"; mkdir -p "$SCAN"
+          unzip -q -o "$GITHUB_WORKSPACE/libwebrtc-aes256-livekit-raw.aar" 'jni/*' -d "$SCAN"
+          SOS=$(find "$SCAN/jni" -type f -name '*.so')
+          echo "$SOS"
+          sh "$GITHUB_WORKSPACE/ctrl/ci/assert-no-key-strings.sh" -m 5000000 -P 'Failed to derive HkdfSha256 key from secret' $SOS
+          rm -rf "$SCAN"
 
       - name: Unzip raw AAR
         run: |
@@ -252,6 +258,15 @@ jobs:
           ls -lh "$OUT"
           echo "=== final AAR contents ==="
           unzip -l "$OUT"
+          # SECURITY gate on the FINAL (renamed) AAR too - this is the file that
+          # gets consumed, not the raw intermediate.
+          SCAN="$RUNNER_TEMP/aar-final-scan"
+          rm -rf "$SCAN"; mkdir -p "$SCAN"
+          unzip -q -o "$OUT" 'jni/*' -d "$SCAN"
+          SOS=$(find "$SCAN/jni" -type f -name '*.so')
+          echo "$SOS"
+          sh "$GITHUB_WORKSPACE/ctrl/ci/assert-no-key-strings.sh" -m 5000000 -P 'Failed to derive HkdfSha256 key from secret' $SOS
+          rm -rf "$SCAN"
 
       - name: Upload raw AAR artifact (org.webrtc, diagnostic only)
         uses: actions/upload-artifact@v4
