@@ -163,6 +163,15 @@ jobs:
         working-directory: ${{ runner.temp }}/webrtc/src
         run: |
           set -euo pipefail
+          # depot_tools' `python3` wrapper (used by gn/ninja actions) needs
+          # python3_bin_reldir.txt, which only gclient's self-update writes and
+          # DEPOT_TOOLS_UPDATE=0 disables. depot_tools is cloned at HEAD (not
+          # pinned): the 2026-08-26 build worked without this, the 2026-09-24
+          # rebuild died at the first ninja action with "python3_bin_reldir.txt
+          # not found". Same fix as build-livekit-ios.yml (see its comment).
+          source "$HOME/depot_tools/bootstrap_python3"
+          bootstrap_python3
+          test -f "$HOME/depot_tools/python3_bin_reldir.txt"
           command -v ninja && ninja --version || true
           vpython3 tools_webrtc/ios/build_ios_libs.py \
             --build_config release \
