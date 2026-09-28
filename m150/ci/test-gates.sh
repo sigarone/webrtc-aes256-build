@@ -25,7 +25,7 @@ else
   # so a real invocation is required to pick a working interpreter, not just
   # a PATH check.
   PY=""
-  for cand in python3 python /c/Users/pisel/AppData/Local/Programs/Python/Python311/python; do
+  for cand in python3 python; do
     if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'pass' >/dev/null 2>&1; then PY=$(command -v "$cand"); break; fi
   done
   [ -n "$PY" ] || { echo "no working python3/python found and no zip binary either - cannot build test fixtures" >&2; exit 2; }
