@@ -39,6 +39,13 @@ expect "missing file fails closed"                 2 sh "$GATE" -m 100 "$T/does-
 expect "no arguments fails closed"                 2 sh "$GATE"
 expect "leak with a present control fails (1)"     1 sh "$GATE" -m 100 -P 'Failed to derive HkdfSha256 key from secret' "$T/leakyctl.bin"
 expect "leak with a missing control still fails"   2 sh "$GATE" -m 100 -P 'Failed to derive HkdfSha256 key from secret' "$T/hkdf.bin"
+{ pad; printf 'Failed to derive HkdfSha256 key from secret.\000 with bad M-I from \000, password_=\000'; pad; } > "$T/icepwd.bin"
+expect "extra -F literal is caught"                1 sh "$GATE" -m 100 -F 'password_=' "$T/icepwd.bin"
+expect "extra -F literal absent passes"            0 sh "$GATE" -m 100 -F 'password_=' "$T/clean.bin"
+expect "two -F literals, second one hits"          1 sh "$GATE" -m 100 -F 'nope-not-there' -F 'password_=' "$T/icepwd.bin"
+expect "-F with a glob char is literal, no hit"    0 sh "$GATE" -m 100 -F '*' "$T/clean.bin"
+expect "empty -F fails closed"                     2 sh "$GATE" -m 100 -F '' "$T/clean.bin"
+expect "non-numeric -m fails closed"               2 sh "$GATE" -m 5MB "$T/clean.bin"
 
 # never echo binary content: the output may contain names and counts only
 out=$(sh "$GATE" -m 100 "$T/hkdf.bin" 2>&1 || true)

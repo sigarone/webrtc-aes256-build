@@ -21,7 +21,12 @@
 #             proves the scan can see this code at all. Missing => exit 2.
 #   -p STR    same, but only a warning when missing.
 #   -m N      refuse (exit 2) files smaller than N bytes (default 1000000): an
-#             empty or truncated file must never pass as "clean".
+#             empty or truncated file must never pass as "clean". N must be a
+#             plain decimal number (anything else => exit 2).
+#   -F STR    one more forbidden literal (repeatable), counted like the three
+#             built-in ones and reported as x1, x2, ... (never echoed). m150
+#             builds pass -F 'password_=' (ICE password log removed by
+#             m150/patches/P3-no-key-log.patch); m144 rollback builds do not.
 # exit: 0 clean | 1 forbidden string found | 2 could not scan (fail closed)
 #
 # Raw byte scan (grep -a -F, LC_ALL=C), not `strings`: no dependence on the
@@ -35,14 +40,25 @@ export LC_ALL
 POS_STRICT=""
 POS_SOFT=""
 MIN_BYTES=1000000
-while getopts "P:p:m:" opt; do
+EXTRA=""
+NL='
+'
+while getopts "P:p:m:F:" opt; do
   case "$opt" in
     P) POS_STRICT="$OPTARG" ;;
     p) POS_SOFT="$OPTARG" ;;
     m) MIN_BYTES="$OPTARG" ;;
-    *) echo "usage: $0 [-P STR] [-p STR] [-m MIN_BYTES] FILE..." >&2; exit 2 ;;
+    F)
+      case "$OPTARG" in
+        ''|*"$NL"*) echo "::error::assert-no-key-strings: -F needs a non-empty single-line literal" >&2; exit 2 ;;
+      esac
+      EXTRA="${EXTRA}${EXTRA:+$NL}$OPTARG" ;;
+    *) echo "usage: $0 [-P STR] [-p STR] [-m MIN_BYTES] [-F STR]... FILE..." >&2; exit 2 ;;
   esac
 done
+case "$MIN_BYTES" in
+  ''|*[!0-9]*) echo "::error::assert-no-key-strings: -m must be a decimal byte count" >&2; exit 2 ;;
+esac
 shift $((OPTIND - 1))
 if [ "$#" -eq 0 ]; then
   echo "::error::assert-no-key-strings: no files given - nothing was scanned"
@@ -82,6 +98,25 @@ for f in "$@"; do
     line="$line $name=$n"
     hits=$((hits + n))
   done
+  if [ -n "$EXTRA" ]; then
+    i=0
+    set -f
+    oldifs=$IFS
+    IFS=$NL
+    for lit in $EXTRA; do
+      IFS=$oldifs
+      i=$((i + 1))
+      n=$(count "$lit" "$f")
+      if [ "$n" = "ERR" ]; then
+        echo "::error::assert-no-key-strings: grep failed on $f"
+        exit 2
+      fi
+      line="$line x$i=$n"
+      hits=$((hits + n))
+    done
+    IFS=$oldifs
+    set +f
+  fi
   if [ -n "$POS_STRICT" ] || [ -n "$POS_SOFT" ]; then
     ctl="${POS_STRICT:-$POS_SOFT}"
     c=$(count "$ctl" "$f")
