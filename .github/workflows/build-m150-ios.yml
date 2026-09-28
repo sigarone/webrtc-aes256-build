@@ -1,0 +1,261 @@
+name: build-webrtc-ios-m150-hardened
+
+# Builds BOTH iOS M150 variants (plain WebRTC.xcframework + LiveKitWebRTC.xcframework)
+# device:arm64 + simulator:arm64 ONLY (no x86_64 simulator slice - all
+# GitHub-hosted macOS runners are Apple Silicon now, see plan v2 §0). Same
+# job graph and reasoning as build-m150-android.yml (finding #16): precheck
+# (contents: read) -> build (contents: read, matrix plain/lk) -> publish
+# (contents: write + id-token: write + attestations: write, matrix plain/lk).
+#
+# Runner: macos-26 (= macOS 26 Tahoe, Apple Silicon - confirmed present in
+# actions/runner-images as of 2026-09-28, ships Xcode 26.0.1 through 26.6;
+# M150 needs the iOS 26.5 SDK, see webrtc-sdk/build@d2fe8a95
+# config/mac/mac_sdk.gni:51). The Xcode-select step below picks the highest
+# installed 26.x and then HARD-FAILS if its iOS SDK is below 26.5, instead of
+# silently building against whatever happens to be default.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_ref:
+        description: "tag on the fork (webrtc_fork_url)"
+        default: "ba469aa2093b-qaudion-m150"
+      webrtc_fork_url:
+        description: "fork to sync from (must already carry webrtc_ref at exactly ba469aa2093ba950066258ca0a59a6fbd1295582 - Appendix B of webrtc-plan.md)"
+        default: "https://github.com/sigarone/webrtc.git"
+      release_suffix:
+        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-ios[-lk]-m150-<this> - must not already exist)"
+        required: true
+
+env:
+  IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref }}
+  IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url }}
+  IN_SUFFIX: ${{ github.event.inputs.release_suffix }}
+  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+  MIN_IOS_SDK: "26.5"
+
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag_plain: ${{ steps.tags.outputs.tag_plain }}
+      tag_lk: ${{ steps.tags.outputs.tag_lk }}
+    steps:
+      - name: Validate dispatch inputs (charset allow-list, fail closed)
+        run: |
+          set -euo pipefail
+          case "$IN_WEBRTC_REF" in ''|*[!A-Za-z0-9._/-]*) echo "::error::webrtc_ref: only [A-Za-z0-9._/-] allowed"; exit 1 ;; esac
+          case "$IN_FORK_URL" in https://github.com/*.git) ;; *) echo "::error::webrtc_fork_url: must be an https://github.com/*.git URL"; exit 1 ;; esac
+          case "$IN_SUFFIX" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_suffix: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
+
+      - name: Compute tag names
+        id: tags
+        run: |
+          set -euo pipefail
+          echo "tag_plain=webrtc-ios-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "tag_lk=webrtc-ios-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if either release tag already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for t in "webrtc-ios-m150-${IN_SUFFIX}" "webrtc-ios-lk-m150-${IN_SUFFIX}"; do
+            if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::release tag '$t' already exists - use a new release_suffix"
+              exit 1
+            fi
+          done
+
+  build:
+    needs: precheck
+    runs-on: macos-26
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [plain, lk]
+    env:
+      DEPOT_TOOLS_UPDATE: "0"
+    steps:
+      - name: Checkout this repo (scripts, patches, gates)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Select Xcode 26.x and hard-check the iOS SDK version (>= ${{ env.MIN_IOS_SDK }})
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode_26*.app
+          XC="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          echo "Selecting $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iphoneos SDK: $SDK"
+          python3 - "$SDK" "$MIN_IOS_SDK" <<'PY'
+          import sys
+          got = tuple(int(x) for x in sys.argv[1].split('.'))
+          want = tuple(int(x) for x in sys.argv[2].split('.'))
+          sys.exit(0 if got >= want else 1)
+          PY
+          if [ $? -ne 0 ]; then
+            echo "::error::iphoneos SDK $SDK is below the required $MIN_IOS_SDK - M150 needs it (webrtc-sdk/build@d2fe8a95 config/mac/mac_sdk.gni:51)"
+            exit 1
+          fi
+
+      - name: Reclaim disk (best-effort)
+        run: bash ctrl/m150/ios/reclaim-disk.sh
+
+      - name: Sync M150 source (pinned depot_tools, hard-verified src/boringssl/opus pins)
+        env:
+          WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
+        run: bash ctrl/m150/ci/sync.sh "$RUNNER_TEMP/webrtc" "$IN_WEBRTC_REF" ios,mac
+
+      - name: Apply patch series (variant=ios${{ matrix.variant == 'lk' && '-lk' || '' }})
+        run: bash ctrl/m150/apply-series.sh "$RUNNER_TEMP/webrtc/src" "ios${{ matrix.variant == 'lk' && '-lk' || '' }}"
+
+      - name: Fetch Opus DNN weights (sha256-pinned)
+        run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$RUNNER_TEMP/webrtc/src/third_party/opus/src"
+
+      - name: Force real ninja (Siso's iOS dep-scan invents missing SDK modulemaps - same fix as build-ios.yml)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        run: |
+          set -euo pipefail
+          f=tools_webrtc/ios/build_ios_libs.py
+          if grep -q "gn_args.append('use_siso=true')" "$f"; then
+            sed -i '' "s/gn_args.append('use_siso=true')/gn_args.append('use_siso=false')/" "$f"
+            sed -i '' "/'third_party', 'siso', 'cipd', 'siso'/d" "$f"
+          fi
+
+      - name: Build (plain -> build_ios_libs.py, lk -> m150/lk/xcframework.sh)
+        working-directory: ${{ runner.temp }}/webrtc/src
+        env:
+          GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          source "$HOME/depot_tools/bootstrap_python3" 2>/dev/null || true
+          bootstrap_python3 2>/dev/null || true
+          GN_ARGS="use_clang_modules=false use_siso=false rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false symbol_level=1 rtc_qaudion_transport_strict=${GN_STRICT}"
+          echo "GN_ARGS=$GN_ARGS" >> "$GITHUB_ENV"
+          if [ "${{ matrix.variant }}" = "plain" ]; then
+            vpython3 tools_webrtc/ios/build_ios_libs.py \
+              --build_config release \
+              --arch device:arm64 simulator:arm64 \
+              --extra-gn-args "$GN_ARGS"
+            mkdir -p "$GITHUB_WORKSPACE/out"
+            cp -R out_ios_libs/WebRTC.xcframework "$GITHUB_WORKSPACE/out/"
+            [ -d out_ios_libs/WebRTC.xcframework.dSYMs ] && cp -R out_ios_libs/WebRTC.xcframework.dSYMs "$GITHUB_WORKSPACE/out/" || true
+          else
+            bash "$GITHUB_WORKSPACE/ctrl/m150/lk/xcframework.sh" release "$PWD" "$GITHUB_WORKSPACE/out" LiveKit
+          fi
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: dSYM UUID cross-check (best-effort - warns, does not fail, if no dSYMs were produced)
+        run: |
+          set -euo pipefail
+          XC=$(find "$GITHUB_WORKSPACE/out" -maxdepth 1 -name '*.xcframework')
+          DS=$(find "$GITHUB_WORKSPACE/out" -maxdepth 1 -iname '*dsym*')
+          if [ -n "$DS" ]; then
+            bash ctrl/m150/ios/check-dsym-uuids.sh "$XC" "$DS"
+          else
+            echo "::warning::no dSYM bundle produced for this build - skipping UUID cross-check"
+          fi
+
+      - name: Gate G1-G9
+        run: |
+          set -euo pipefail
+          XC=$(find "$GITHUB_WORKSPACE/out" -maxdepth 1 -name '*.xcframework')
+          bash ctrl/m150/gates.sh ios "${{ matrix.variant }}" "$XC" \
+            "$RUNNER_TEMP/webrtc/src/third_party/opus/src/dnn" \
+            "$RUNNER_TEMP/webrtc/src/third_party/boringssl/src/include/openssl/ssl.h"
+
+      - name: Package (ditto, preserve symlinks)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/out"
+          XC=$(find . -maxdepth 1 -name '*.xcframework')
+          ditto -c -k --sequesterRsrc --keepParent "$XC" "$GITHUB_WORKSPACE/pkg.zip"
+          mkdir -p "$GITHUB_WORKSPACE/pub"
+          mv "$GITHUB_WORKSPACE/pkg.zip" "$GITHUB_WORKSPACE/pub/${XC}.zip"
+          echo "SwiftPM checksum: $(shasum -a 256 "$GITHUB_WORKSPACE/pub/${XC}.zip" | awk '{print $1}')"
+
+      - name: BUILDINFO.json (BEFORE SHA256SUMS - finding #16)
+        env:
+          RUNNER_IMAGE: macos-26
+        run: |
+          set -euo pipefail
+          XCODE_VERSION=$(xcodebuild -version | head -1 | awk '{print $2}')
+          echo "XCODE_VERSION=$XCODE_VERSION" >> "$GITHUB_ENV"
+          XCODE_VERSION="$XCODE_VERSION" python3 ctrl/m150/buildinfo.py ios "${{ matrix.variant }}" > "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
+          cat "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
+
+      - name: SHA256SUMS
+        run: (cd "$GITHUB_WORKSPACE/pub" && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload build artifact (workflow-scoped only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-${{ matrix.variant }}
+          path: pub/*
+          if-no-files-found: error
+
+  publish:
+    needs: [precheck, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [plain, lk]
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ios-${{ matrix.variant }}
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "out/*.zip\nout/SHA256SUMS"
+
+      - name: Create release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "M150 iOS xcframework (${{ matrix.variant }}), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
+            out/*

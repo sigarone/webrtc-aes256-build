@@ -1,0 +1,242 @@
+name: build-webrtc-android-m150-hardened
+
+# Builds BOTH Android M150 variants (plain org.webrtc + LiveKit-prefixed) in
+# one dispatch, gates them (m150/gates.sh, G1-G9), then publishes each to its
+# OWN new release tag with sha256 + attestation.
+#
+# Job graph (finding #16 - a single job that both builds untrusted patched
+# C++ AND holds contents:write/id-token:write/attestations:write is a
+# privilege-escalation surface: a malicious patch or a supply-chain-
+# compromised build tool would run with release/attestation rights):
+#   precheck (contents: read)          - validate inputs, refuse if either
+#                                         release tag already exists
+#   build   (contents: read)  <- needs precheck
+#     matrix variant: [plain, lk]      - compiles, gates, uploads a workflow
+#                                         artifact only (no repo/release
+#                                         access at all in this job)
+#   publish (contents: write,
+#            id-token: write,
+#            attestations: write) <- needs [precheck, build]
+#     matrix variant: [plain, lk]      - downloads the build job's artifact,
+#                                         RE-VERIFIES sha256 against
+#                                         SHA256SUMS, re-checks the tag is
+#                                         still free (race with a concurrent
+#                                         dispatch across the ~3-4h build),
+#                                         attests, creates the release.
+#
+# All dispatch inputs reach the shell ONLY via env (never interpolated into
+# a run: block), and are charset-validated in `precheck` before anything
+# else runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_ref:
+        description: "tag on the fork (webrtc_fork_url) - see m150/ci/sync.sh for why a tag and not a raw SHA"
+        default: "ba469aa2093b-qaudion-m150"
+      webrtc_fork_url:
+        description: "fork to sync from (must already carry webrtc_ref at exactly ba469aa2093ba950066258ca0a59a6fbd1295582 - Appendix B of webrtc-plan.md)"
+        default: "https://github.com/sigarone/webrtc.git"
+      release_suffix:
+        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-android[-lk]-m150-<this> - must not already exist)"
+        required: true
+
+env:
+  IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref }}
+  IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url }}
+  IN_SUFFIX: ${{ github.event.inputs.release_suffix }}
+  # TODO: resolve once (git ls-remote chromium.googlesource.com/.../depot_tools
+  # HEAD, pin a commit contemporary with the m150 cut), then set this as a
+  # repo/org Actions variable. m150/ci/sync.sh fails closed if it is empty.
+  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag_plain: ${{ steps.tags.outputs.tag_plain }}
+      tag_lk: ${{ steps.tags.outputs.tag_lk }}
+    steps:
+      - name: Validate dispatch inputs (charset allow-list, fail closed)
+        run: |
+          set -euo pipefail
+          case "$IN_WEBRTC_REF" in ''|*[!A-Za-z0-9._/-]*) echo "::error::webrtc_ref: only [A-Za-z0-9._/-] allowed"; exit 1 ;; esac
+          case "$IN_FORK_URL" in https://github.com/*.git) ;; *) echo "::error::webrtc_fork_url: must be an https://github.com/*.git URL"; exit 1 ;; esac
+          case "$IN_SUFFIX" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_suffix: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
+
+      - name: Compute + reserve tag names
+        id: tags
+        run: |
+          set -euo pipefail
+          echo "tag_plain=webrtc-android-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "tag_lk=webrtc-android-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if either release tag already exists (never overwrite a shipped rollback asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for t in "webrtc-android-m150-${IN_SUFFIX}" "webrtc-android-lk-m150-${IN_SUFFIX}"; do
+            if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::release tag '$t' already exists - use a new release_suffix"
+              exit 1
+            fi
+          done
+
+  build:
+    needs: precheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [plain, lk]
+    env:
+      WORKDIR: /home/runner/webrtc
+      GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 12288
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: '/home/runner/webrtc'
+
+      - name: Checkout this repo (scripts, patches, gates)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync M150 source (pinned depot_tools, hard-verified src/boringssl/opus pins)
+        env:
+          WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "$IN_WEBRTC_REF" android,unix
+
+      - name: Apply patch series (variant=android${{ matrix.variant == 'lk' && '-lk' || '' }})
+        run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" "android${{ matrix.variant == 'lk' && '-lk' || '' }}"
+
+      - name: Fetch Opus DNN weights (sha256-pinned)
+        run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Build raw AAR (arm64-v8a)
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          GN_ARGS="is_component_build=false rtc_include_tests=false is_debug=false symbol_level=1 rtc_build_examples=false rtc_build_tools=false rtc_libvpx_build_vp9=true rtc_enable_symbol_export=true rtc_use_h264=true use_rtti=true use_clang_modules=false is_java_debug=false treat_warnings_as_errors=false rtc_qaudion_transport_strict=${GN_STRICT}"
+          echo "GN_ARGS=$GN_ARGS" >> "$GITHUB_ENV"
+          vpython3 tools_webrtc/android/build_aar.py \
+            --build-dir out/aar \
+            --arch arm64-v8a \
+            --output "$RUNNER_TEMP/raw.aar" \
+            --extra-gn-args "$GN_ARGS"
+          ls -lh "$RUNNER_TEMP/raw.aar"
+
+      - name: Set up Java + Gradle (lk packaging only, harmless no-op for plain)
+        if: matrix.variant == 'lk'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 7.6 (lk packaging only)
+        if: matrix.variant == 'lk'
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+        with:
+          gradle-version: '7.6'
+
+      - name: Package (plain passthrough / lk shadow-relocate+rename)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          bash ctrl/m150/ci/package-android.sh "${{ matrix.variant }}" "$RUNNER_TEMP/raw.aar" out/
+
+      - name: Gate G1-G9
+        run: |
+          set -euo pipefail
+          AAR=$(find out -maxdepth 1 -name '*.aar')
+          bash ctrl/m150/gates.sh android "${{ matrix.variant }}" "$AAR" \
+            "$WORKDIR/src/third_party/opus/src/dnn" \
+            "$WORKDIR/src/third_party/boringssl/src/include/openssl/ssl.h"
+
+      - name: BUILDINFO.json (BEFORE SHA256SUMS - finding #16)
+        env:
+          RUNNER_IMAGE: ${{ runner.name }}-ubuntu-latest
+        run: |
+          set -euo pipefail
+          python3 ctrl/m150/buildinfo.py android "${{ matrix.variant }}" > out/BUILDINFO.json
+          cat out/BUILDINFO.json
+
+      - name: SHA256SUMS (covers the AAR AND BUILDINFO.json)
+        run: (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload build artifact (workflow-scoped only - no repo/release access in this job)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-${{ matrix.variant }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [precheck, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [plain, lk]
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: android-${{ matrix.variant }}
+          path: out
+
+      - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "out/*.aar\nout/SHA256SUMS"
+
+      - name: Create release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "M150 Android AAR (${{ matrix.variant }}), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
+            out/*
