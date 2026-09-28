@@ -1,0 +1,122 @@
+FrameCryptor: AES-256-GCM only (strict), refuse short key material instead of
+silently falling back to AES-128.
+
+Q-Audion m150 hardening tightens the m144 aes256-framecryptor.patch: that one
+picked AES-256 when the shared key material was 32 bytes and otherwise quietly
+kept AES-128 (password.size() == 32 ? 256 : 128). For 1:1 and group-call
+E2EE we now want ONLY AES-256-GCM ever reachable through this path:
+- SetKeyFromMaterial() rejects material shorter than 32 bytes outright: the
+  key-ring slot is cleared (nullptr) instead of deriving a 128-bit key, so a
+  short/garbled key makes encryptFrame()/decryptFrame() hit kMissingKey and
+  DROP the frame (existing kMissingKey paths in the .cc) - never silently
+  use a weaker cipher.
+- GetAesGcmAlgorithmFromKeySize() and GetAesCbcAlgorithmFromKeySize() drop
+  the `case 16` (AES-128) branch entirely, so even a caller that bypasses
+  SetKeyFromMaterial() and hands a 16-byte key straight to the transformer
+  gets nullptr (AesEncryptDecrypt() then returns an error) instead of a live
+  AES-128 path.
+- The two receive-side ratchet loops (FrameCryptorTransformer::decryptFrame
+  and DataPacketCryptor::Decrypt) hardcoded DeriveKeys(..., 128). The sender
+  side (RatchetKey() -> SetKeyFromMaterial()) derives 256 bits, so upstream
+  receivers could never follow a ratchet, and with the case-16 AEAD removed
+  that 16-byte key has no cipher at all. They now derive 256 bits (same key as
+  the sender) and stop the loop instead of dereferencing a null KeySet when
+  the derivation fails (upstream null-deref).
+
+Compatible with LiveKit group calls: the SFU-relayed key material is always
+the raw 32-byte SK_0 (Android GroupSfuKeyProvider.kt, iOS
+LiveKitGroupCallRoom.swift both assert exactly 32 bytes before handing it
+here), and LiveKit's internal ratchet is dormant (ratchetWindowSize=0). A
+ratchet step outputs DoKeyDerivation(..., 256) = 32 bytes, so if the ratchet
+is ever turned on sender and receiver stay on the same AES-256 key. Material
+shorter than 32 bytes is dropped by design (fail-closed), not a bug.
+
+Order: first in the series (m150/apply-series.sh applies P1, P2, P3, P8, P4,
+P5, P6, P7). Same file as P2 (native-pli) and P3 (no-key-log); the hunks do
+not overlap and `git apply --check` passes for P1 -> P2 -> P3 in that order.
+
+Verified: `git apply --check` clean against api/crypto/frame_crypto_transformer.{h,cc}
+at webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582 (blobs
+1b4b4def08b5 / 6d016534e2b9; the .h blob is identical to the one the m144
+aes256-framecryptor.patch targeted).
+
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index 1b4b4de..6288d21 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -69,8 +69,6 @@ webrtc::H264PacketizationMode get_h264_packetization_mode(
+ 
+ const EVP_AEAD* GetAesGcmAlgorithmFromKeySize(size_t key_size_bytes) {
+   switch (key_size_bytes) {
+-    case 16:
+-      return EVP_aead_aes_128_gcm();
+     case 32:
+       return EVP_aead_aes_256_gcm();
+     default:
+@@ -80,8 +78,6 @@ const EVP_AEAD* GetAesGcmAlgorithmFromKeySize(size_t key_size_bytes) {
+ 
+ const EVP_CIPHER* GetAesCbcAlgorithmFromKeySize(size_t key_size_bytes) {
+   switch (key_size_bytes) {
+-    case 16:
+-      return EVP_aes_128_cbc();
+     case 32:
+       return EVP_aes_256_cbc();
+     default:
+@@ -735,8 +731,15 @@ void FrameCryptorTransformer::decryptFrame(
+                          << key_provider_->options().ratchet_window_size;
+ 
+         auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
++        // Q-Audion (strict): derive the SAME 256-bit key the sender installs
++        // via RatchetKey() -> SetKeyFromMaterial(). Upstream hardcoded 128
++        // here (an AES-128 key; with the case-16 AEAD removed it would never
++        // decrypt). A failed derivation must not be dereferenced.
+         ratcheted_key_set = key_handler->DeriveKeys(
+-            new_material, key_provider_->options().ratchet_salt, 128);
++            new_material, key_provider_->options().ratchet_salt, 256);
++        if (new_material.empty() || !ratcheted_key_set) {
++          break;
++        }
+ 
+         if (AesEncryptDecrypt(EncryptOrDecrypt::kDecrypt, algorithm_,
+                               ratcheted_key_set->encryption_key, iv,
+@@ -929,8 +932,15 @@ RTCErrorOr<std::vector<uint8_t>> DataPacketCryptor::Decrypt(
+                          << key_provider_->options().ratchet_window_size;
+ 
+         auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
++        // Q-Audion (strict): derive the SAME 256-bit key the sender installs
++        // via RatchetKey() -> SetKeyFromMaterial(). Upstream hardcoded 128
++        // here (an AES-128 key; with the case-16 AEAD removed it would never
++        // decrypt). A failed derivation must not be dereferenced.
+         ratcheted_key_set = key_handler->DeriveKeys(
+-            new_material, key_provider_->options().ratchet_salt, 128);
++            new_material, key_provider_->options().ratchet_salt, 256);
++        if (new_material.empty() || !ratcheted_key_set) {
++          break;
++        }
+ 
+         if (AesEncryptDecrypt(EncryptOrDecrypt::kDecrypt, algorithm_,
+                               ratcheted_key_set->encryption_key, iv,
+diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
+index 6d01653..90fe57a 100644
+--- a/api/crypto/frame_crypto_transformer.h
++++ b/api/crypto/frame_crypto_transformer.h
+@@ -203,8 +203,18 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+     if (key_index >= 0) {
+       current_key_index_ = key_index % crypto_key_ring_.size();
+     }
++    // Q-Audion (strict): AES-256-GCM only. Material shorter than 32 bytes is
++    // refused and the slot is emptied instead of deriving a weaker (128-bit)
++    // key - encryptFrame()/decryptFrame() then hit kMissingKey and DROP the
++    // frame, never send/accept it under a downgraded cipher.
++    if (password.size() < 32) {
++      RTC_LOG(LS_ERROR) << "FrameCryptor: key material shorter than 32 bytes "
++                            "refused (Q-Audion strict AES-256-only policy)";
++      crypto_key_ring_[current_key_index_] = nullptr;
++      return;
++    }
+     crypto_key_ring_[current_key_index_] =
+-        DeriveKeys(password, key_provider_->options().ratchet_salt, 128);
++        DeriveKeys(password, key_provider_->options().ratchet_salt, 256);
+   }
+ 
+   bool DecryptionFailure() {

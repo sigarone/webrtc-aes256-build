@@ -1,0 +1,93 @@
+No key material in logs (m150 rebase of no-key-log.patch) + no ICE password.
+
+1) FrameCryptor. Upstream webrtc-sdk/webrtc m150_release still prints, at
+RTC_LOG(LS_INFO), the input secret, the salt and the DERIVED AES key as
+decimal byte lists every time a frame-cryptor key is installed
+(DeriveHkdfSha256FromSecret, frame_crypto_transformer.cc:264;
+DerivePBKDF2KeyFromRawKey, :288). m150 changed the helper call to
+to_uint8_list(<vector>) (m144 was to_uint8_list(ptr, len)), so the m144
+no-key-log.patch no longer applies. Both statements are deleted with no
+replacement log line. to_uint8_list() stays (external linkage, now unused ->
+no -Wunused-function). The positive control of the binary gate
+("Failed to derive HkdfSha256 key from secret.", :260) is untouched.
+
+2) ICE. p2p/base/port.cc (Port::GetStunMessage, :519 and :586) prints the
+local ICE password (password_) at LS_ERROR whenever a STUN request with a bad
+MESSAGE-INTEGRITY arrives - an unauthenticated remote packet can therefore
+make every default log capture record the ICE credential. Only the
+", password_=" field is removed; the rest of the error line stays.
+
+Binary gate: ci/assert-no-key-strings.sh (derived_key / "slat << " / raw_key)
+must find 0 hits; m150 builds also pass -F 'password_=' (see that script).
+
+Order: after P1 and P2 (m150/apply-series.sh: P1, P2, P3, ...). Hunks do not
+overlap with P1/P2. Verified: `git apply --check` clean alone and after
+P1 + P2 against webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+(frame_crypto_transformer.cc blob 1b4b4def08b5, port.cc blob 641d1e32348e).
+
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index 1b4b4de..a7fb722 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -261,12 +261,11 @@ int DeriveHkdfSha256FromSecret(const std::vector<uint8_t>& secret,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "secret " << to_uint8_list(secret)
+-                   << " len " << secret.size() << " slat << "
+-                   << to_uint8_list(salt) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key)
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material. Upstream printed the input secret, the
++  // salt and the derived key here as decimal byte lists at LS_INFO; apps that
++  // enable INFO logging (RTCSetMinDebugLogLevel(.info), logcat, ...) then leak
++  // the E2EE frame key into their log capture and any uploaded diagnostics.
++  // Removed; keep it removed when rebasing on upstream.
+ 
+   return Success;
+ }
+@@ -285,13 +284,8 @@ int DerivePBKDF2KeyFromRawKey(const std::vector<uint8_t> raw_key,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "raw_key "
+-                   << to_uint8_list(raw_key) << " len "
+-                   << raw_key.size() << " slat << "
+-                   << to_uint8_list(salt) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key)
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material (raw key, salt, derived key). See the
++  // note in DeriveHkdfSha256FromSecret().
+ 
+   return Success;
+ }
+diff --git a/p2p/base/port.cc b/p2p/base/port.cc
+index 641d1e3..718bc9b 100644
+--- a/p2p/base/port.cc
++++ b/p2p/base/port.cc
+@@ -518,8 +518,9 @@ bool Port::GetStunMessage(std::span<const uint8_t> data,
+         StunMessage::IntegrityStatus::kIntegrityOk) {
+       RTC_LOG(LS_ERROR) << ToString() << ": Received "
+                         << StunMethodToString(stun_msg->type())
+-                        << " with bad M-I from " << addr.ToSensitiveString()
+-                        << ", password_=" << password_;
++                        << " with bad M-I from " << addr.ToSensitiveString();
++      // Q-Audion: upstream also printed the local ICE password here (at
++      // LS_ERROR, i.e. in every default log capture). Removed.
+       SendBindingErrorResponse(stun_msg.get(), addr, STUN_ERROR_UNAUTHORIZED,
+                                STUN_ERROR_REASON_UNAUTHORIZED);
+       return true;
+@@ -585,8 +586,9 @@ bool Port::GetStunMessage(std::span<const uint8_t> data,
+         StunMessage::IntegrityStatus::kIntegrityOk) {
+       RTC_LOG(LS_ERROR) << ToString() << ": Received "
+                         << StunMethodToString(stun_msg->type())
+-                        << " with bad M-I from " << addr.ToSensitiveString()
+-                        << ", password_=" << password_;
++                        << " with bad M-I from " << addr.ToSensitiveString();
++      // Q-Audion: upstream also printed the local ICE password here (at
++      // LS_ERROR, i.e. in every default log capture). Removed.
+       SendBindingErrorResponse(stun_msg.get(), addr, STUN_ERROR_UNAUTHORIZED,
+                                STUN_ERROR_REASON_UNAUTHORIZED);
+       return true;
