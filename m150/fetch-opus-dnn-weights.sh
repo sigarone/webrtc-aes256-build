@@ -35,7 +35,7 @@ OPUS_SRC=$(CDPATH= cd -- "$OPUS_SRC" && pwd)
 # cross-check below) - resolved 2026-09-28 from
 # https://raw.githubusercontent.com/xiph/opus/55513e81d8f606bd75d0ff773d2144e5f2a732f5/autogen.sh
 # ("dnn/download_model.sh 160753e98319...") and verified live by downloading
-# the tarball once into E:/DEVKIT/workspace/_scratch/opus-weights-m150/ and
+# the tarball once into a local scratch directory and
 # running sha256sum on it (exact match).
 MODEL_SHA256=160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58
 MODEL_URL="https://media.xiph.org/opus/models/opus_data-${MODEL_SHA256}.tar.gz"

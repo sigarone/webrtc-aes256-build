@@ -45,7 +45,7 @@ source author ever moves `webrtc_ref`)
 | `third_party/boringssl/src` | `f91f1447397c6719f9774dfb8e67329378e1f3d3` |
 | `third_party/opus/src` | `55513e81d8f606bd75d0ff773d2144e5f2a732f5` |
 | Opus DNN weights tarball | `https://media.xiph.org/opus/models/opus_data-160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58.tar.gz` |
-| Opus DNN weights sha256 | `160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58` (verified live 2026-09-28 by downloading the tarball into `E:/DEVKIT/workspace/_scratch/opus-weights-m150/` and running `sha256sum` - exact match; the hash is also the tarball's own file-name suffix, i.e. self-describing per upstream `dnn/download_model.sh`) |
+| Opus DNN weights sha256 | `160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58` (verified live 2026-09-28 by downloading the tarball into a local scratch directory and running `sha256sum` - exact match; the hash is also the tarball's own file-name suffix, i.e. self-describing per upstream `dnn/download_model.sh`) |
 | `webrtc-sdk/webrtc-build` (for `m150/lk/*`) | `66ed9c7` (as given by the plan; vendored files match) |
 | depot_tools | **NOT YET PINNED** - see "Open items" |
 
