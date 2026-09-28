@@ -1,0 +1,259 @@
+Opus decoder: codec PLC on by default, runtime per-call decoder complexity
+(finding #15), self-verification log line.
+
+- `audio_decoder_opus.cc`: `generate_plc_` (WebRTC's own jitter-buffer-side
+  concealment, independent of libopus's internal deep PLC) switches from
+  opt-in (`WebRTC-Audio-OpusGeneratePlc/Enabled/`) to on-by-default; the
+  same trial stays as the emergency kill switch (`/Disabled/` now turns it
+  off, matching P4b/P5's convention of keeping only the two upstream
+  trials the plan allows - WebRTC-EnableDtlsPqc and
+  WebRTC-Audio-OpusGeneratePlc - as emergency-off switches, no new trial of
+  our own). Also emits one "Q-AUDION opus-dec" self-verification log line
+  per process (not per decoder instance, since renegotiation can recreate
+  one), reporting `deep_plc_compiled`/`osce_compiled` (read from P4a's
+  QAUDION_OPUS_DEEP_PLC/QAUDION_OPUS_OSCE self-report defines, propagated
+  through third_party/opus's own public_configs), `codec_plc`, and the
+  decoder's actual libopus complexity.
+- `opus_interface.{h,cc}` (finding #15 - the actual runtime API): a new
+  file-local `ApplyQaudionDecoderComplexity()` reads
+  `webrtc::qaudion::OpusDecoderComplexity()` (P8; -1 = use
+  kQaudionDefaultDecoderComplexity = 7) and calls
+  `opus_decoder_ctl(state->decoder, OPUS_SET_COMPLEXITY(...))`. Called from
+  three places: `WebRtcOpus_DecoderCreate` and `WebRtcOpus_DecoderInit`
+  (`OPUS_RESET_STATE` drops libopus's own complexity tracking back to its
+  internal default, so it has to be re-applied right after), and - the
+  actual "mid-call" case finding #15 asks for - right before the
+  `opus_decode()` call in `DecodeNative()`, the single choke point every
+  decode path in this file goes through (`WebRtcOpus_Decode`, `DecodePlc`
+  via an empty payload, and `WebRtcOpus_DecodeFec`). New accessor
+  `WebRtcOpus_DecoderComplexity()` (OPUS_GET_COMPLEXITY) backs the
+  self-verification log above.
+
+  "on the decoder thread, ... never concurrently": DecodeNative() is only
+  ever called from the thread that owns a given `OpusDecInst` (WebRTC's
+  NetEQ decode call path owns one decoder instance exclusively), so calling
+  `ApplyQaudionDecoderComplexity()` unconditionally right before every
+  opus_decode() - rather than caching a "last applied generation" the way
+  P5 does for the encoder - is both simpler and already race-free: there is
+  nothing else that could be issuing a concurrent opus_decoder_ctl() on the
+  same `state->decoder`. I chose not to add a generation-cache field to
+  OpusDecInst for this because I do not have that struct's real definition
+  (opus_inst.h) to safely add a field to; calling the CTL unconditionally
+  on every decode instead is a few branches and an atomic load per frame
+  (at 60 ms framing, ~16.7/s), not something worth risking a blind struct
+  edit for.
+
+  "No RTC_CHECK reachable from input": `OpusDecoderComplexity()` only ever
+  returns -1 or a value webrtc::qaudion::SetOpusDecoderComplexity() already
+  validated into 0..10 (P8); `kQaudionDefaultDecoderComplexity` is a
+  compile-time constant. opus_decoder_ctl(OPUS_SET_COMPLEXITY(...)) never
+  RTC_CHECKs on its argument (it is a plain libopus CTL that would return
+  OPUS_BAD_ARG for something out of range, which this code never passes it
+  anyway) - grepped opus_interface.cc for RTC_CHECK, none of them are on
+  this path.
+
+Order: 6th in the series (m150/series), right after P8 and P4a (whose
+QAUDION_OPUS_DEEP_PLC/QAUDION_OPUS_OSCE defines and dnn/ sources this
+patch's log line and default-PLC behavior assume are compiled in) and
+before P5.
+
+Touches (dir "."): modules/audio_coding/codecs/opus/opus_interface.h,
+modules/audio_coding/codecs/opus/opus_interface.cc,
+modules/audio_coding/codecs/opus/audio_decoder_opus.cc.
+
+Verified: `git apply --check` and a real apply are clean against the
+pinned webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+checkout, on top of P1 + P2 + P3(partial - port.cc not in this partial
+checkout, not mine) + P8 already applied, in series order. Every symbol
+this patch calls (opus_decoder_ctl, OPUS_SET_COMPLEXITY, OPUS_GET_COMPLEXITY,
+WebRtcOpus_DecoderCreate/Init, DecodeNative's exact structure,
+generate_plc_'s exact constructor position) was read from that same pinned
+checkout, not assumed; `opus_int32` (used in the new
+WebRtcOpus_DecoderComplexity) is already used elsewhere in the same file
+(DecodeNative's `static_cast<opus_int32>(encoded_bytes)`). Grepped the
+resulting tree for RTC_LOG of key/secret/salt/password (none in the
+touched files) and for new RTC_CHECK (none added).
+
+Not verified: `clang -fsyntax-only` (see the M150 brief's note that the
+local machine has no toolchain; setting up enough of the WebRTC header
+graph - abseil, jni_zero, the rest of modules/audio_coding - on the
+Helsinki VPS to syntax-check a single .cc file would need close to a full
+gclient sync of the source tree, which is not "cheap" and risks its disk
+budget, so I did not attempt it).
+
+diff --git a/modules/audio_coding/codecs/opus/audio_decoder_opus.cc b/modules/audio_coding/codecs/opus/audio_decoder_opus.cc
+index 203969f..d671a3e 100644
+--- a/modules/audio_coding/codecs/opus/audio_decoder_opus.cc
++++ b/modules/audio_coding/codecs/opus/audio_decoder_opus.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "modules/audio_coding/codecs/opus/audio_decoder_opus.h"
+ 
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
+@@ -23,6 +24,7 @@
+ #include "modules/audio_coding/codecs/opus/opus_interface.h"
+ #include "rtc_base/buffer.h"
+ #include "rtc_base/checks.h"
++#include "rtc_base/logging.h"
+ 
+ namespace webrtc {
+ 
+@@ -31,13 +33,42 @@ AudioDecoderOpusImpl::AudioDecoderOpusImpl(const FieldTrialsView& field_trials,
+                                            int sample_rate_hz)
+     : channels_(num_channels),
+       sample_rate_hz_(sample_rate_hz),
+-      generate_plc_(field_trials.IsEnabled("WebRTC-Audio-OpusGeneratePlc")) {
++      // Q-Audion (M150 hardening, P4b): codec PLC on by default (previously
++      // opt-in via WebRTC-Audio-OpusGeneratePlc/Enabled/). The same trial
++      // stays available as an emergency kill switch: /Disabled/ now turns
++      // it back off; any other value, or the trial being unset, leaves it
++      // on.
++      generate_plc_(!field_trials.IsDisabled("WebRTC-Audio-OpusGeneratePlc")) {
+   RTC_DCHECK(num_channels == 1 || num_channels == 2);
+   RTC_DCHECK(sample_rate_hz == 16000 || sample_rate_hz == 48000);
+   const int error =
+       WebRtcOpus_DecoderCreate(&dec_state_, channels_, sample_rate_hz_);
+   RTC_DCHECK(error == 0);
+   WebRtcOpus_DecoderInit(dec_state_);
++
++  // Q-Audion: one self-verification log line per process, not per decoder
++  // instance (a single call can recreate this decoder, e.g. on codec
++  // renegotiation) - the M150 build gate only checks that the line exists.
++  // Ids and small integers only, never any audio or key material.
++  static std::atomic<bool> reported{false};
++  if (!reported.exchange(true)) {
++#if defined(QAUDION_OPUS_DEEP_PLC)
++    constexpr int kDeepPlcCompiledIn = 1;
++#else
++    constexpr int kDeepPlcCompiledIn = 0;
++#endif
++#if defined(QAUDION_OPUS_OSCE)
++    constexpr int kOsceCompiledIn = 1;
++#else
++    constexpr int kOsceCompiledIn = 0;
++#endif
++    RTC_LOG(LS_WARNING) << "Q-AUDION opus-dec deep_plc_compiled="
++                        << kDeepPlcCompiledIn
++                        << " osce_compiled=" << kOsceCompiledIn
++                        << " codec_plc=" << (generate_plc_ ? 1 : 0)
++                        << " complexity="
++                        << WebRtcOpus_DecoderComplexity(dec_state_);
++  }
+ }
+ 
+ AudioDecoderOpusImpl::~AudioDecoderOpusImpl() {
+diff --git a/modules/audio_coding/codecs/opus/opus_interface.cc b/modules/audio_coding/codecs/opus/opus_interface.cc
+index cbf29b8..72b73f0 100644
+--- a/modules/audio_coding/codecs/opus/opus_interface.cc
++++ b/modules/audio_coding/codecs/opus/opus_interface.cc
+@@ -14,6 +14,34 @@
+ #include <cstdlib>
+ 
+ #include "rtc_base/checks.h"
++#include "rtc_base/qaudion_tuning.h"
++
++namespace {
++// Q-Audion (M150 hardening, P4b / finding #15): applies the current runtime
++// decoder-complexity override - or kQaudionDefaultDecoderComplexity when the
++// app has not set one - to a single-stream decoder. `complexity` is always
++// already range-checked by webrtc::qaudion::SetOpusDecoderComplexity() (or
++// is the compile-time default), so this can never hand libopus a value that
++// makes it fail; nothing here is reachable from unvalidated input.
++//
++// Called from decoder creation, decoder reset, and - the case finding #15
++// actually asks for - right before every opus_decode() in DecodeNative()
++// below, so a mid-call change from the app takes effect on the very next
++// frame. All three call sites run on the thread that owns `state` (WebRTC's
++// NetEQ decode call path owns a given OpusDecInst exclusively), so this is
++// never invoked concurrently with another opus_decoder_ctl() on the same
++// instance.
++void ApplyQaudionDecoderComplexity(OpusDecInst* state) {
++  if (!state->decoder) {
++    return;
++  }
++  int complexity = webrtc::qaudion::OpusDecoderComplexity();
++  if (complexity < 0) {
++    complexity = webrtc::qaudion::kQaudionDefaultDecoderComplexity;
++  }
++  opus_decoder_ctl(state->decoder, OPUS_SET_COMPLEXITY(complexity));
++}
++}  // namespace
+ 
+ enum {
+ #if WEBRTC_OPUS_SUPPORT_120MS_PTIME
+@@ -396,6 +424,7 @@ int16_t WebRtcOpus_DecoderCreate(OpusDecInst** inst,
+       state->sample_rate_hz = sample_rate_hz;
+       state->in_dtx_mode = 0;
+       state->last_packet_num_channels = channels;
++      ApplyQaudionDecoderComplexity(state);
+       *inst = state;
+       return 0;
+     }
+@@ -466,12 +495,26 @@ size_t WebRtcOpus_DecoderChannels(OpusDecInst* inst) {
+ void WebRtcOpus_DecoderInit(OpusDecInst* inst) {
+   if (inst->decoder) {
+     opus_decoder_ctl(inst->decoder, OPUS_RESET_STATE);
++    // Q-Audion: OPUS_RESET_STATE drops the complexity libopus was tracking
++    // back to its own internal default, so it must be re-applied after.
++    ApplyQaudionDecoderComplexity(inst);
+   } else {
+     opus_multistream_decoder_ctl(inst->multistream_decoder, OPUS_RESET_STATE);
+   }
+   inst->in_dtx_mode = 0;
+ }
+ 
++// Q-Audion (M150 hardening): reads back the decoder's current libopus
++// complexity, for the P4b self-verification log line. -1 if `inst` has no
++// single-stream `decoder` (e.g. multistream) or the CTL call fails.
++int WebRtcOpus_DecoderComplexity(OpusDecInst* inst) {
++  opus_int32 complexity = -1;
++  if (inst->decoder) {
++    opus_decoder_ctl(inst->decoder, OPUS_GET_COMPLEXITY(&complexity));
++  }
++  return complexity;
++}
++
+ /* For decoder to determine if it is to output speech or comfort noise. */
+ static int16_t DetermineAudioType(OpusDecInst* inst, size_t encoded_bytes) {
+   // Audio type becomes comfort noise if `encoded_byte` is 1 and keeps
+@@ -514,6 +557,11 @@ static int DecodeNative(OpusDecInst* inst,
+       RTC_DCHECK(inst->last_packet_num_channels == 1 ||
+                  inst->last_packet_num_channels == 2);
+     }
++    // Q-Audion (M150 hardening, finding #15): pick up a mid-call complexity
++    // change right before the opus_decode() it governs - see
++    // ApplyQaudionDecoderComplexity()'s doc comment above for why this is
++    // safe to call unconditionally on every frame.
++    ApplyQaudionDecoderComplexity(inst);
+     decoded_samples_per_channel = opus_decode(
+         inst->decoder, encoded, static_cast<opus_int32>(encoded_bytes),
+         reinterpret_cast<opus_int16*>(decoded), frame_size, decode_fec);
+diff --git a/modules/audio_coding/codecs/opus/opus_interface.h b/modules/audio_coding/codecs/opus/opus_interface.h
+index 4fb1dff..ae0f02a 100644
+--- a/modules/audio_coding/codecs/opus/opus_interface.h
++++ b/modules/audio_coding/codecs/opus/opus_interface.h
+@@ -408,6 +408,21 @@ size_t WebRtcOpus_DecoderChannels(OpusDecInst* inst);
+  */
+ void WebRtcOpus_DecoderInit(OpusDecInst* inst);
+ 
++/****************************************************************************
++ * WebRtcOpus_DecoderComplexity(...)
++ *
++ * Q-Audion (M150 hardening): returns the decoder's current libopus
++ * complexity (OPUS_GET_COMPLEXITY), for self-verification logging.
++ *
++ * Input:
++ *      - inst               : Decoder context
++ *
++ * Return value              : 0-10 - the current complexity
++ *                             -1 - `inst` has no single-stream decoder, or
++ *                                  the query failed
++ */
++int WebRtcOpus_DecoderComplexity(OpusDecInst* inst);
++
+ /****************************************************************************
+  * WebRtcOpus_Decode(...)
+  *
