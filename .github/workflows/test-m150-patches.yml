@@ -1,0 +1,106 @@
+name: test-webrtc-m150-patches
+
+# Free, fast CI: builds the M150 patch series for host x64 Linux
+# (rtc_include_tests=true) in the two configurations that matter
+# (rtc_qaudion_transport_strict=true/false) and runs the T1-T6 unit tests
+# from webrtc-plan.md v2 §6.1. Does NOT build any shippable artifact (no
+# Android/iOS toolchain here) - see build-m150-android.yml / build-m150-ios.yml
+# for that. Meant to run on every patch-series PR, well before a 3-5h mobile
+# build is worth dispatching.
+#
+# TODO (SOURCE-PATCH author, not this workflow's owner - see m150/series /
+# m150/patches/* ownership in webrtc-plan.md's "SHARED CONTRACT"): T1-T6 are
+# listed in the plan by BEHAVIOR, not yet by gtest target/filter, because the
+# tests land as part of P4-P8 (still being written in parallel with this
+# workflow). Fill in T1_FILTER..T6_FILTER below once those tests exist; until
+# then this job builds + applies the series (which already proves the patches
+# apply cleanly against a fresh checkout) and runs whatever filter is set,
+# skipping cleanly (not failing) when a filter is still the TODO placeholder.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'm150/**'
+      - '.github/workflows/test-m150-patches.yml'
+
+permissions:
+  contents: read
+
+env:
+  WEBRTC_REF: ba469aa2093b-qaudion-m150
+  WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
+  # TODO: resolve once, see m150/ci/sync.sh's own comment on this var.
+  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+  WORKDIR: /home/runner/webrtc
+  DEPOT_TOOLS_UPDATE: "0"
+  # TODO (source-patch author): gtest filters for T1-T6, e.g.
+  #   T1_FILTER: "SrtpTest.*AeadAes256*"
+  # Left empty = skipped (not failed) by the run step below.
+  T1_FILTER: ""
+  T2_FILTER: ""
+  T3_FILTER: ""
+  T4_FILTER: ""
+  T5_FILTER: ""
+  T6_FILTER: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [strict, switchable]
+    steps:
+      - name: Checkout this repo (patches + scripts)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync M150 source (pinned, hard-verified)
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/ci/sync.sh "$WORKDIR" "$WEBRTC_REF" unix
+
+      - name: Apply patch series (plain series only - variant-agnostic, no LK patch here)
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/apply-series.sh "$WORKDIR/src" android
+
+      - name: Fetch Opus DNN weights
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Build host x64 test binaries (${{ matrix.config }})
+        working-directory: /home/runner/webrtc/src
+        env:
+          STRICT: ${{ matrix.config == 'strict' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          gn gen "out/test-${{ matrix.config }}" --args="is_debug=false rtc_include_tests=true symbol_level=1 treat_warnings_as_errors=false rtc_build_tools=false rtc_qaudion_transport_strict=$STRICT"
+          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests
+
+      - name: Run T1-T6 (${{ matrix.config }})
+        working-directory: /home/runner/webrtc/src
+        run: |
+          set -euo pipefail
+          BIN="out/test-${{ matrix.config }}/rtc_unittests"
+          any=0
+          for spec in "T1:$T1_FILTER" "T2:$T2_FILTER" "T3:$T3_FILTER" "T4:$T4_FILTER" "T5:$T5_FILTER" "T6:$T6_FILTER"; do
+            name=${spec%%:*}
+            filt=${spec#*:}
+            if [ -z "$filt" ]; then
+              echo "::warning::$name: no gtest filter set yet (TODO, source-patch author) - skipped"
+              continue
+            fi
+            echo "::group::$name ($filt)"
+            "$BIN" "--gtest_filter=$filt"
+            echo "::endgroup::"
+            any=$((any + 1))
+          done
+          if [ "$any" -eq 0 ]; then
+            echo "::warning::no T1-T6 filters configured yet - series-apply + build-only smoke passed, no tests ran"
+          fi
