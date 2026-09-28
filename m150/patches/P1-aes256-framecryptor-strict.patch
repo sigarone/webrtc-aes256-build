@@ -22,6 +22,17 @@ E2EE we now want ONLY AES-256-GCM ever reachable through this path:
   that 16-byte key has no cipher at all. They now derive 256 bits (same key as
   the sender) and stop the loop instead of dereferencing a null KeySet when
   the derivation fails (upstream null-deref).
+- Bounds checks on received frames (upstream memory-safety bug): decryptFrame()
+  indexed data_in[size - 2], data_in[i < unencrypted_bytes] and
+  data_in[size - 2 - ivLength + i] and computed size - unencrypted_bytes /
+  size - ivLength - 2 without any length check, so a tiny or truncated frame
+  from the peer - or, in group calls, from the SFU - read out of bounds and
+  underflowed size_t into a multi-GB allocation (abort): a remote crash.
+  Frames shorter than header + 12-byte IV + 2-byte trailer + 16-byte GCM tag
+  are now dropped as kDecryptionFailed before any indexing, and the length is
+  re-checked after RBSP unescaping. encryptFrame() gets the same guard for an
+  encoder frame shorter than its clear header. Valid frames are never shorter
+  than these bounds, so nothing that decrypts today is affected.
 
 Compatible with LiveKit group calls: the SFU-relayed key material is always
 the raw 32-byte SK_0 (Android GroupSfuKeyProvider.kt, iOS
@@ -41,7 +52,7 @@ at webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582 (blobs
 aes256-framecryptor.patch targeted).
 
 diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
-index 1b4b4de..6288d21 100644
+index 1b4b4de..d9293b9 100644
 --- a/api/crypto/frame_crypto_transformer.cc
 +++ b/api/crypto/frame_crypto_transformer.cc
 @@ -69,8 +69,6 @@ webrtc::H264PacketizationMode get_h264_packetization_mode(
@@ -62,7 +73,63 @@ index 1b4b4de..6288d21 100644
      case 32:
        return EVP_aes_256_cbc();
      default:
-@@ -735,8 +731,15 @@ void FrameCryptorTransformer::decryptFrame(
+@@ -505,6 +501,14 @@ void FrameCryptorTransformer::encryptFrame(
+ 
+   auto key_set = key_handler->GetKeySet(key_index_);
+   uint8_t unencrypted_bytes = get_unencrypted_bytes(frame.get(), type_);
++  // Q-Audion: never index past the frame or underflow the payload size.
++  if (data_in.size() < unencrypted_bytes) {
++    if (last_enc_error_ != FrameCryptionState::kEncryptionFailed) {
++      last_enc_error_ = FrameCryptionState::kEncryptionFailed;
++      onFrameCryptionStateChanged(last_enc_error_);
++    }
++    return;
++  }
+ 
+   webrtc::Buffer frame_header =
+       webrtc::Buffer::CreateUninitializedWithSize(unencrypted_bytes);
+@@ -636,6 +640,23 @@ void FrameCryptorTransformer::decryptFrame(
+ 
+   uint8_t unencrypted_bytes = get_unencrypted_bytes(frame.get(), type_);
+ 
++  // Q-Audion: every length below comes from the received frame. Refuse a
++  // frame too short for header + GCM tag + IV + 2-byte trailer BEFORE any
++  // indexing: upstream read data_in[size - 2] and data_in[i < header] out of
++  // bounds and underflowed size_t (multi-GB allocation -> abort) on tiny or
++  // truncated frames - a remote crash for any peer or for the SFU.
++  constexpr size_t kGcmTagBytes = 16;
++  if (data_in.size() < static_cast<size_t>(unencrypted_bytes) + getIvSize() +
++                           2 + kGcmTagBytes) {
++    RTC_LOG(LS_WARNING) << "FrameCryptorTransformer::decryptFrame() frame too "
++                           "short";
++    if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
++      last_dec_error_ = FrameCryptionState::kDecryptionFailed;
++      onFrameCryptionStateChanged(last_dec_error_);
++    }
++    return;
++  }
++
+   webrtc::Buffer frame_header =
+       webrtc::Buffer::CreateUninitializedWithSize(unencrypted_bytes);
+   for (size_t i = 0; i < unencrypted_bytes; i++) {
+@@ -707,6 +728,16 @@ void FrameCryptorTransformer::decryptFrame(
+ #endif // RTC_ENABLE_H265
+   }
+ 
++  // Q-Audion: RBSP unescaping shrinks the buffer; re-check before subtracting.
++  if (encrypted_buffer.size() <
++      static_cast<size_t>(ivLength) + 2 + kGcmTagBytes) {
++    if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
++      last_dec_error_ = FrameCryptionState::kDecryptionFailed;
++      onFrameCryptionStateChanged(last_dec_error_);
++    }
++    return;
++  }
++
+   webrtc::Buffer encrypted_payload =
+       webrtc::Buffer::CreateUninitializedWithSize(encrypted_buffer.size() - ivLength - 2);
+   for (size_t i = 0; i < encrypted_payload.size(); i++) {
+@@ -735,8 +766,15 @@ void FrameCryptorTransformer::decryptFrame(
                           << key_provider_->options().ratchet_window_size;
  
          auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
@@ -79,7 +146,7 @@ index 1b4b4de..6288d21 100644
  
          if (AesEncryptDecrypt(EncryptOrDecrypt::kDecrypt, algorithm_,
                                ratcheted_key_set->encryption_key, iv,
-@@ -929,8 +932,15 @@ RTCErrorOr<std::vector<uint8_t>> DataPacketCryptor::Decrypt(
+@@ -929,8 +967,15 @@ RTCErrorOr<std::vector<uint8_t>> DataPacketCryptor::Decrypt(
                           << key_provider_->options().ratchet_window_size;
  
          auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
