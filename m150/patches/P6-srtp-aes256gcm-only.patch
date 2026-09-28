@@ -1,0 +1,171 @@
+SRTP: AEAD_AES_256_GCM only (no AES_CM_128/SHA1 fallback anywhere), cryptex
+negotiated by default, and close the disableEncryption plaintext-RTP escape
+hatch (finding #12).
+
+Q-Audion 1:1 calls must never fall back to a non-AEAD or 128-bit SRTP cipher,
+however CryptoOptions happens to be constructed by a caller:
+- CryptoOptions::GetSupportedDtlsSrtpCryptoSuites() (api/crypto/crypto_options.cc)
+  returns exactly {kSrtpAeadAes256Gcm} in strict (rtc_qaudion_transport_strict=true,
+  QAUDION_TRANSPORT_STRICT=1) builds, ignoring every srtp.* toggle
+  (enable_aes128_sha1_32/80_crypto_cipher, prefer_gcm_crypto_suites, ...): AES_CM_128_HMAC_SHA1_32/80
+  and AEAD_AES_128_GCM are compiled out of the offer entirely, not merely
+  de-preferred. Every peer we call is our own M150 build with GCM enabled by
+  default (since M144), so the intersection with the remote offer is never
+  empty (RTC_CHECK(!crypto_suites.empty()) in the untouched upstream body
+  below, which strict builds never reach).
+  In switchable (LiveKit) builds the upstream body is untouched at transport
+  level < 1; at level >= 1 (raised at runtime via the tighten-only
+  qaudion::RaiseTransportLevel(), P8, once the room's SFU is confirmed to
+  relay AEAD_AES_256_GCM) it also collapses to {kSrtpAeadAes256Gcm}.
+- CryptoOptions::Srtp::cryptex_policy (api/crypto/crypto_options.h) defaults
+  to kNegotiate in strict builds instead of upstream's kDisabled (still a
+  TODO upstream: bugs.webrtc.org/455813732). Every peer is our own M150
+  build, so cryptex is always successfully negotiated; this does not by
+  itself require AES-256 (GetSupportedDtlsSrtpCryptoSuites() and P7 already
+  do that) - it only stops RTP header extensions from being the one part of
+  the packet cryptex would otherwise leave in the clear. Switchable builds
+  keep the upstream default unchanged.
+
+Finding #12 (disableEncryption, MEDIUM): `PeerConnectionFactory.Options().
+disableEncryption` (Android/iOS) sets JsepTransportController::Config::
+disable_encryption, which CreateRtpTransport() (pc/jsep_transport_controller.cc)
+used unconditionally to build a CreateUnencryptedRtpTransport() instead of a
+DtlsSrtpTransport() - i.e. it skips DTLS-SRTP altogether and hands raw,
+plaintext RTP/RTCP to the network. Every other AES-256 guarantee in this
+series (P1 FrameCryptor, this patch's SRTP cipher list, P7's DTLS policy) is
+moot if that single flag is left reachable, since it removes SRTP entirely
+rather than downgrading its cipher.
+  Fix: the local `disable_encryption` actually consumed by CreateRtpTransport()
+  is forced to `false` in strict builds regardless of what the app passed in
+  Options(). In switchable (LiveKit) builds it is honored only below
+  transport level 1 - i.e. it stops working the moment the app raises the
+  level (tighten-only), matching "force it false when the app has raised the
+  transport level" from the review.
+
+Depends on Q-Audion's own runtime API (rtc_base/qaudion_tuning.h, written by
+P8, applied earlier in the series - see m150/series) for:
+- qaudion::TransportLevel() - already named in the P8 sketch (plan section
+  2.3);
+- the QAUDION_TRANSPORT_STRICT build-wide #define (also P8, webrtc.gni +
+  root BUILD.gn's common_inherited_config).
+No new qaudion:: names are introduced by this patch.
+
+Order: sixth in the series (P1, P2, P3, P8, P4a, P4b, P5, P6, P7 - see
+m150/series, owned by the audio/API author). Depends on P8 for the
+qaudion_tuning.h header and the QAUDION_TRANSPORT_STRICT define; applied
+after P4/P5 (neither of which touches these files) per the fixed patch order.
+
+Verified: `git apply --check` and a real `git apply` are clean, in a
+clean-room tree, against the exact pinned blobs of api/crypto/crypto_options.{h,cc}
+and pc/jsep_transport_controller.cc at webrtc-sdk/webrtc @
+ba469aa2093ba950066258ca0a59a6fbd1295582 (fetched directly from
+raw.githubusercontent.com at that commit, not the local partial scan tree,
+which was found to differ from the pinned blobs for pc/jsep_transport_controller.{cc,h}
+and p2p/base/port.cc). Every symbol used (kSrtpAeadAes256Gcm,
+CryptexPolicy::kNegotiate, JsepTransportController::Config::disable_encryption)
+already exists, unchanged, in the pinned tree; only qaudion::TransportLevel()
+and QAUDION_TRANSPORT_STRICT are new, and both are P8's contract, not this
+patch's.
+
+diff --git a/api/crypto/crypto_options.cc b/api/crypto/crypto_options.cc
+index 1549e69..08a7bad 100644
+--- a/api/crypto/crypto_options.cc
++++ b/api/crypto/crypto_options.cc
+@@ -20,6 +20,7 @@
+ #include "absl/algorithm/container.h"
+ #include "api/field_trials_view.h"
+ #include "rtc_base/checks.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/ssl_stream_adapter.h"
+
+ namespace webrtc {
+@@ -42,6 +43,22 @@ CryptoOptions CryptoOptions::PreferGcm() {
+ }
+
+ std::vector<int> CryptoOptions::GetSupportedDtlsSrtpCryptoSuites() const {
++#if QAUDION_TRANSPORT_STRICT
++  // Q-Audion 1:1 builds: AEAD_AES_256_GCM or nothing. The srtp.* toggles
++  // above (enable_aes128_*, prefer_gcm_crypto_suites, ...) are ignored on
++  // purpose - a 1:1 call must never negotiate AES-128 or a non-AEAD SRTP
++  // cipher, however CryptoOptions was constructed. Every libwebrtc peer we
++  // call is our own M150 build (enable_gcm_crypto_suites is on by default
++  // since M144), so the intersection with the remote offer is never empty.
++  return {kSrtpAeadAes256Gcm};
++#else
++  // Q-Audion (LiveKit/switchable): once the app has raised the transport
++  // level (tighten-only, see rtc_base/qaudion_tuning.h / P8) - e.g. once the
++  // room's SFU is confirmed to relay AEAD_AES_256_GCM - only that cipher is
++  // offered. Below level 1 this is byte-for-byte the original upstream body.
++  if (qaudion::TransportLevel() >= 1) {
++    return {kSrtpAeadAes256Gcm};
++  }
+   std::vector<int> crypto_suites;
+   // When prefer_gcm_crypto_suites is set, GCM is listed first so it is
+   // selected whenever both peers support it, despite the slight packet-size
+@@ -72,6 +89,7 @@ std::vector<int> CryptoOptions::GetSupportedDtlsSrtpCryptoSuites() const {
+   }
+   RTC_CHECK(!crypto_suites.empty());
+   return crypto_suites;
++#endif
+ }
+
+ bool CryptoOptions::operator==(const CryptoOptions& other) const {
+diff --git a/api/crypto/crypto_options.h b/api/crypto/crypto_options.h
+index 5c0c15f..4f1d270 100644
+--- a/api/crypto/crypto_options.h
++++ b/api/crypto/crypto_options.h
+@@ -74,8 +74,17 @@ struct RTC_EXPORT CryptoOptions {
+     // https://www.rfc-editor.org/rfc/rfc9335.html
+     // Supported as of libsrtp v2.8.0.
+     enum class CryptexPolicy { kDisabled, kNegotiate, kRequire };
++#if QAUDION_TRANSPORT_STRICT
++    // Q-Audion 1:1 builds: negotiate cryptex whenever the peer offers it (it
++    // is the peer's own M150 build, so it always does). This does not by
++    // itself require AES-256 - P6's GetSupportedDtlsSrtpCryptoSuites() below
++    // and P7 already do that - it only stops RTP header extensions from
++    // being the one part of the packet cryptex would otherwise leave clear.
++    CryptexPolicy cryptex_policy = CryptexPolicy::kNegotiate;
++#else
+     // TODO: bugs.webrtc.org/455813732 - the default should be `negotiate`.
+     CryptexPolicy cryptex_policy = CryptexPolicy::kDisabled;
++#endif
+   } srtp;
+
+   // Options to be used when the FrameEncryptor / FrameDecryptor APIs are used.
+diff --git a/pc/jsep_transport_controller.cc b/pc/jsep_transport_controller.cc
+index 2ec3050..a1e95d3 100644
+--- a/pc/jsep_transport_controller.cc
++++ b/pc/jsep_transport_controller.cc
+@@ -64,6 +64,7 @@
+ #include "rtc_base/containers/flat_map.h"
+ #include "rtc_base/copy_on_write_buffer.h"
+ #include "rtc_base/logging.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/rtc_certificate.h"
+ #include "rtc_base/ssl_certificate.h"
+ #include "rtc_base/ssl_stream_adapter.h"
+@@ -620,7 +621,23 @@ std::unique_ptr<RtpTransport> JsepTransportController::CreateRtpTransport(
+     std::unique_ptr<DtlsTransportInternal> rtp_dtls_transport,
+     std::unique_ptr<DtlsTransportInternal> rtcp_dtls_transport) {
+   std::unique_ptr<RtpTransport> rtp_transport;
+-  if (config_.disable_encryption) {
++  // Q-Audion (finding #12): `disable_encryption` is
++  // PeerConnectionFactory.Options().disableEncryption (Android/iOS), a
++  // single app-level knob that skips DTLS-SRTP altogether and hands raw,
++  // plaintext RTP/RTCP to CreateUnencryptedRtpTransport() below. AES-256
++  // everywhere else in the stack (P1/P6/P7) is moot if this switch is left
++  // reachable, since it removes SRTP entirely rather than downgrading its
++  // cipher. Plain 1:1 builds never honor it, whatever the app passed in.
++  // LiveKit/switchable builds honor it only until the app has raised the
++  // transport level (tighten-only, see rtc_base/qaudion_tuning.h / P8) -
++  // i.e. once the SFU is confirmed to require encrypted media.
++#if QAUDION_TRANSPORT_STRICT
++  const bool disable_encryption = false;
++#else
++  const bool disable_encryption =
++      config_.disable_encryption && qaudion::TransportLevel() < 1;
++#endif
++  if (disable_encryption) {
+     RTC_LOG(LS_INFO)
+         << "Creating UnencryptedRtpTransport, because encryption is disabled.";
+     rtp_transport = CreateUnencryptedRtpTransport(

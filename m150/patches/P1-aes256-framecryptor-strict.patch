@@ -1,5 +1,6 @@
 FrameCryptor: AES-256-GCM only (strict), refuse short key material instead of
-silently falling back to AES-128.
+silently falling back to AES-128. Amended for finding #13: the "magic bytes"
+unauthenticated-frame bypass is now gated by the Q-Audion transport policy.
 
 Q-Audion m150 hardening tightens the m144 aes256-framecryptor.patch: that one
 picked AES-256 when the shared key material was 32 bytes and otherwise quietly
@@ -33,6 +34,21 @@ E2EE we now want ONLY AES-256-GCM ever reachable through this path:
   re-checked after RBSP unescaping. encryptFrame() gets the same guard for an
   encoder frame shorter than its clear header. Valid frames are never shorter
   than these bounds, so nothing that decrypts today is affected.
+- Finding #13 (second security review): `uncrypted_magic_bytes` is a fixed,
+  app-configured trailer that told decryptFrame() to treat any frame ending
+  in it as "intentionally unencrypted" and deliver the rest as-is - NOT a
+  decryption bypass for content we produced, but an unauthenticated-frame
+  ACCEPTANCE path reachable by anyone on the media path (the remote peer, or
+  in a group call the SFU), since the magic bytes are a fixed value, not a
+  secret or a MAC. That let a malicious SFU or peer inject arbitrary
+  "unencrypted" media/data by simply appending the known trailer. The branch
+  is now gated by qaudion::MagicBytesBypassAllowed() (rtc_base/qaudion_tuning.h,
+  P8 - not written by this patch): hard-wired false in strict 1:1 builds, and
+  true in switchable (LiveKit) builds only until the app calls the
+  tighten-only qaudion::DisableMagicBytesBypass(). Both names are invented by
+  this patch (not yet in the P8 sketch) and are reported to the integrator/P8
+  author for reconciliation; qaudion_tuning.h itself does not ship in this
+  patch (P8's own file, applied later in the series).
 
 Compatible with LiveKit group calls: the SFU-relayed key material is always
 the raw 32-byte SK_0 (Android GroupSfuKeyProvider.kt, iOS
@@ -44,19 +60,38 @@ shorter than 32 bytes is dropped by design (fail-closed), not a bug.
 
 Order: first in the series (m150/apply-series.sh applies P1, P2, P3, P8, P4,
 P5, P6, P7). Same file as P2 (native-pli) and P3 (no-key-log); the hunks do
-not overlap and `git apply --check` passes for P1 -> P2 -> P3 in that order.
+not overlap and `git apply --check` passes for P1 -> P2 -> P3 in that order
+(re-verified after this amendment, clean-room against the exact pinned blobs;
+see the crypto author's stage-1 report for the full apply log). Note: this
+patch's new #include "rtc_base/qaudion_tuning.h" and its qaudion:: calls are
+only *declared* by P8, which is applied later in the series - by design
+(P1 must stay first so P2/P3's line numbers keep matching); the tree only
+becomes buildable once the full series, including P8, is applied.
 
 Verified: `git apply --check` clean against api/crypto/frame_crypto_transformer.{h,cc}
 at webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582 (blobs
 1b4b4def08b5 / 6d016534e2b9; the .h blob is identical to the one the m144
-aes256-framecryptor.patch targeted).
+aes256-framecryptor.patch targeted). P2 and P3 both still apply cleanly, byte
+for byte, on top of this amended P1 (checked against the exact pinned blobs
+of frame_crypto_transformer.{h,cc} and p2p/base/port.cc, fetched directly
+from raw.githubusercontent.com at the pinned commit - not the local partial
+scan tree, which was found to differ from the pinned blobs for several files
+including port.cc and pc/jsep_transport_controller.{cc,h}).
 
 diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
-index 1b4b4de..d9293b9 100644
+index 1b4b4de..bc1038a 100644
 --- a/api/crypto/frame_crypto_transformer.cc
 +++ b/api/crypto/frame_crypto_transformer.cc
-@@ -69,8 +69,6 @@ webrtc::H264PacketizationMode get_h264_packetization_mode(
- 
+@@ -41,6 +41,7 @@
+ #include "rtc_base/byte_buffer.h"
+ #include "rtc_base/crypto_random.h"
+ #include "rtc_base/logging.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/time_utils.h"
+
+ enum class EncryptOrDecrypt { kEncrypt = 0, kDecrypt };
+@@ -69,8 +70,6 @@ webrtc::H264PacketizationMode get_h264_packetization_mode(
+
  const EVP_AEAD* GetAesGcmAlgorithmFromKeySize(size_t key_size_bytes) {
    switch (key_size_bytes) {
 -    case 16:
@@ -64,8 +99,8 @@ index 1b4b4de..d9293b9 100644
      case 32:
        return EVP_aead_aes_256_gcm();
      default:
-@@ -80,8 +78,6 @@ const EVP_AEAD* GetAesGcmAlgorithmFromKeySize(size_t key_size_bytes) {
- 
+@@ -80,8 +79,6 @@ const EVP_AEAD* GetAesGcmAlgorithmFromKeySize(size_t key_size_bytes) {
+
  const EVP_CIPHER* GetAesCbcAlgorithmFromKeySize(size_t key_size_bytes) {
    switch (key_size_bytes) {
 -    case 16:
@@ -73,8 +108,8 @@ index 1b4b4de..d9293b9 100644
      case 32:
        return EVP_aes_256_cbc();
      default:
-@@ -505,6 +501,14 @@ void FrameCryptorTransformer::encryptFrame(
- 
+@@ -505,6 +502,14 @@ void FrameCryptorTransformer::encryptFrame(
+
    auto key_set = key_handler->GetKeySet(key_index_);
    uint8_t unencrypted_bytes = get_unencrypted_bytes(frame.get(), type_);
 +  // Q-Audion: never index past the frame or underflow the payload size.
@@ -85,13 +120,34 @@ index 1b4b4de..d9293b9 100644
 +    }
 +    return;
 +  }
- 
+
    webrtc::Buffer frame_header =
        webrtc::Buffer::CreateUninitializedWithSize(unencrypted_bytes);
-@@ -636,6 +640,23 @@ void FrameCryptorTransformer::decryptFrame(
- 
+@@ -611,7 +616,19 @@ void FrameCryptorTransformer::decryptFrame(
+   }
+
+   auto uncrypted_magic_bytes = key_provider_->options().uncrypted_magic_bytes;
+-  if (uncrypted_magic_bytes.size() > 0 &&
++  // Q-Audion (finding #13): as written, this trailer check let ANY sender on
++  // the media path - the remote peer or, in a group call, the SFU - forge an
++  // "intentionally unencrypted" frame just by appending the (fixed,
++  // app-configured) magic bytes, and decryptFrame() would strip them and
++  // deliver the rest completely unauthenticated: unencrypted media/data
++  // injection, not a decryption bypass for legitimate content. Plain 1:1
++  // builds never take this branch (qaudion::MagicBytesBypassAllowed() is
++  // hard-wired false there, see rtc_base/qaudion_tuning.h / P8). LiveKit
++  // builds keep upstream behaviour until the app calls the tighten-only
++  // qaudion::DisableMagicBytesBypass() (e.g. once the room/SFU is confirmed
++  // to speak our AES-256-only transport); after that call this branch is
++  // dead for the remaining lifetime of the process.
++  if (qaudion::MagicBytesBypassAllowed() && uncrypted_magic_bytes.size() > 0 &&
+       data_in.size() >= uncrypted_magic_bytes.size()) {
+     auto tmp = data_in.subspan(data_in.size() - (uncrypted_magic_bytes.size()),
+                                uncrypted_magic_bytes.size());
+@@ -636,6 +653,23 @@ void FrameCryptorTransformer::decryptFrame(
+
    uint8_t unencrypted_bytes = get_unencrypted_bytes(frame.get(), type_);
- 
+
 +  // Q-Audion: every length below comes from the received frame. Refuse a
 +  // frame too short for header + GCM tag + IV + 2-byte trailer BEFORE any
 +  // indexing: upstream read data_in[size - 2] and data_in[i < header] out of
@@ -112,10 +168,10 @@ index 1b4b4de..d9293b9 100644
    webrtc::Buffer frame_header =
        webrtc::Buffer::CreateUninitializedWithSize(unencrypted_bytes);
    for (size_t i = 0; i < unencrypted_bytes; i++) {
-@@ -707,6 +728,16 @@ void FrameCryptorTransformer::decryptFrame(
+@@ -707,6 +741,16 @@ void FrameCryptorTransformer::decryptFrame(
  #endif // RTC_ENABLE_H265
    }
- 
+
 +  // Q-Audion: RBSP unescaping shrinks the buffer; re-check before subtracting.
 +  if (encrypted_buffer.size() <
 +      static_cast<size_t>(ivLength) + 2 + kGcmTagBytes) {
@@ -129,9 +185,9 @@ index 1b4b4de..d9293b9 100644
    webrtc::Buffer encrypted_payload =
        webrtc::Buffer::CreateUninitializedWithSize(encrypted_buffer.size() - ivLength - 2);
    for (size_t i = 0; i < encrypted_payload.size(); i++) {
-@@ -735,8 +766,15 @@ void FrameCryptorTransformer::decryptFrame(
+@@ -735,8 +779,15 @@ void FrameCryptorTransformer::decryptFrame(
                           << key_provider_->options().ratchet_window_size;
- 
+
          auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
 +        // Q-Audion (strict): derive the SAME 256-bit key the sender installs
 +        // via RatchetKey() -> SetKeyFromMaterial(). Upstream hardcoded 128
@@ -143,12 +199,12 @@ index 1b4b4de..d9293b9 100644
 +        if (new_material.empty() || !ratcheted_key_set) {
 +          break;
 +        }
- 
+
          if (AesEncryptDecrypt(EncryptOrDecrypt::kDecrypt, algorithm_,
                                ratcheted_key_set->encryption_key, iv,
-@@ -929,8 +967,15 @@ RTCErrorOr<std::vector<uint8_t>> DataPacketCryptor::Decrypt(
+@@ -929,8 +980,15 @@ RTCErrorOr<std::vector<uint8_t>> DataPacketCryptor::Decrypt(
                           << key_provider_->options().ratchet_window_size;
- 
+
          auto new_material = key_handler->RatchetKeyMaterial(currentKeyMaterial);
 +        // Q-Audion (strict): derive the SAME 256-bit key the sender installs
 +        // via RatchetKey() -> SetKeyFromMaterial(). Upstream hardcoded 128
@@ -160,7 +216,7 @@ index 1b4b4de..d9293b9 100644
 +        if (new_material.empty() || !ratcheted_key_set) {
 +          break;
 +        }
- 
+
          if (AesEncryptDecrypt(EncryptOrDecrypt::kDecrypt, algorithm_,
                                ratcheted_key_set->encryption_key, iv,
 diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
@@ -185,5 +241,5 @@ index 6d01653..90fe57a 100644
 -        DeriveKeys(password, key_provider_->options().ratchet_salt, 128);
 +        DeriveKeys(password, key_provider_->options().ratchet_salt, 256);
    }
- 
+
    bool DecryptionFailure() {
