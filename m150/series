@@ -1,0 +1,24 @@
+# M150 hardening (AES-256 mandatory, DTLS 1.3 + PQC, deep PLC/OSCE, FEC 10%).
+# Apply order matters: P8 exposes rtc_base/qaudion_tuning.h, which P4b, P5,
+# P6 and P7 all call into, so it must land before any of them.
+# Format: "<dir relative to src> <patch file>". "." = the webrtc src repo;
+# "third_party" = the separate src/third_party repo (Chromium's monorepo of
+# vendored libraries, where third_party/opus lives).
+#
+# Crypto author: P1, P2, P3, P6, P7.
+. P1-aes256-framecryptor-strict.patch
+. P2-native-pli.patch
+. P3-no-key-log.patch
+#
+# Audio/API author: P8 (runtime tuning API + GN/JNI/ObjC wiring), P4a
+# (Opus deep-PLC/OSCE build), P4b (deep PLC + decoder complexity), P5
+# (FEC floor + encoder complexity). P8 first: P4b, P5, P6 and P7 all use it.
+. P8-qaudion-runtime-api.patch
+third_party P4a-opus-dnn-osce-build.patch
+. P4b-opus-deep-plc-osce.patch
+. P5-opus-fec-floor-complexity.patch
+#
+# Crypto author again: transport hardening, applied last because it is the
+# most likely to need a rebase if anything upstream shifts.
+. P6-srtp-aes256gcm-only.patch
+. P7-dtls13-aes256-pqc.patch
