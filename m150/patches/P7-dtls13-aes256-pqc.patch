@@ -1,0 +1,529 @@
+DTLS 1.3 only, TLS_AES_256_GCM_SHA384/AES-256-GCM-only, X25519MLKEM768
+preferred by default, a working PQC emergency kill switch, and a fail-closed
+post-handshake policy check (findings #8, #9, #10, #11).
+
+Purpose. Strict (1:1) builds must negotiate DTLS 1.3 with AES-256-GCM only,
+prefer the PQC hybrid group X25519MLKEM768 from the first ClientHello with no
+field trial needed, and refuse (not silently accept) a handshake that somehow
+still lands on something weaker. Switchable (LiveKit) builds keep upstream
+behaviour by default and can only be tightened at runtime, one level at a
+time, through Q-Audion's own API (rtc_base/qaudion_tuning.h, P8 - not written
+by this patch). Every fact below about BoringSSL was checked against the
+actual pinned sources, not just plan notes.
+
+Per-file changes:
+
+- rtc_base/openssl_stream_adapter.cc / .h (SetupSSLContext, ContinueSSL,
+  Error, the constructor, the DTLS retransmission timer, new
+  QaudionHandshakeMeetsPolicy()):
+
+  * DTLS 1.3 as the floor. SetupSSLContext()'s min_version becomes
+    DTLS1_3_VERSION once qaudion::TransportLevel() >= 3 (strict builds are
+    always at level 3); TLS mode (OpenSSLAdapter's TURN-TLS, a different
+    class) is untouched. A peer limited to DTLS 1.2 fails the handshake
+    outright instead of negotiating down - the app then falls back to the
+    sealed relay path (see webrtc-plan.md section 3.1), it does not retry
+    ICE.
+    Added a build-time guard, #ifndef DTLS1_3_VERSION #error ..., since the
+    whole patch is unconditionally written in terms of that macro (even the
+    switchable variant's fail-closed path needs to name DTLS 1.3
+    explicitly). Verified present at this exact pin: BoringSSL f91f1447,
+    include/openssl/ssl.h:553 (#define DTLS1_3_VERSION 0xfefc), and this
+    file already branches on #ifdef DTLS1_3_VERSION for
+    MAX_SSL_PROTOCOL_DTLS/GetMaxVersion() today, so the ifdef is
+    unconditionally true in this codebase already - the #error just makes
+    that assumption explicit and loud if it ever stops being true.
+
+  * Finding #8 (HIGH): fixed the LiveKit cipher-list bug from the first
+    review. BoringSSL's ssl_cipher.cc kCipherAliases table (checked at this
+    pin) does NOT define "NULL", "aNULL", "SHA256", "SHA384" or "aECDH" as
+    cipher-list rule words - only e.g. "aPSK", "3DES", "AESGCM", "AES256",
+    "SHA1"/"SHA", "DEFAULT" survive from that style of list.
+    SSL_CTX_set_cipher_list() "tolerates garbage inputs, unless an empty
+    cipher list results" (ssl.h doc comment), so upstream's existing list -
+    "DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK:!3DES"
+    - has always silently no-op'd those five unknown words; it was never
+    meant to be run through the *strict* validator.
+    SSL_CTX_set_strict_cipher_list() by contrast "returns error if str
+    contains anything meaningless" - so passing the upstream list to it, as
+    an earlier draft of this patch did, made SetupSSLContext() fail (and
+    every DTLS handshake at levels 0-1 with it) before the connection even
+    started. Fix: keep the upstream list on the tolerant
+    SSL_CTX_set_cipher_list() unconditionally (it is exactly upstream's
+    byte-for-byte behaviour at level < 2); use
+    SSL_CTX_set_strict_cipher_list() only for our own hand-picked AES-256
+    list, "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384" - both
+    names verified present in tls1.h (TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    / TLS1_TXT_ECDHE_RSA_WITH_AES_256_GCM_SHA384) - at level >= 2 (strict
+    builds: always). Also calls SSL_CTX_set_compliance_policy(ctx,
+    ssl_compliance_policy_cnsa_202407) at that same level, which puts
+    AES-256-GCM first in our ClientHello and makes us select it as server
+    (BoringSSL ssl_lib.cc's cnsa_202407 Configure() step); this alone does
+    NOT forbid AES-128/ChaCha20 on a TLS 1.3 connection (cipher lists do not
+    apply to TLS 1.3 at all - "TLS 1.3 ciphers do not participate in this
+    mechanism", ssl.h) or against a peer with its own stale cipher list -
+    QaudionHandshakeMeetsPolicy() below is the actual fail-closed backstop.
+
+  * Finding #10 (LOW), two parts:
+    1. A new check in ContinueSSL()'s SSL_ERROR_NONE case, right after the
+       existing RTC_DCHECK(peer_cert_chain_ || ...) and before state_ is
+       ever set to SSL_CONNECTED or SE_OPEN is fired: if
+       (ssl_mode_ == SSL_MODE_DTLS && !QaudionHandshakeMeetsPolicy()),
+       report SSLHandshakeError::INCOMPATIBLE_CIPHERSUITE via
+       handshake_error_ (same enum value the existing SSL_R_NO_SHARED_CIPHER
+       branch below already uses), send a fatal alert 71
+       (insufficient_security, SSL_AD_INSUFFICIENT_SECURITY - verified
+       TLS1_AD_INSUFFICIENT_SECURITY == 71 in tls1.h) via
+       Error("Q-AUDION dtls-policy", -1, SSL_AD_INSUFFICIENT_SECURITY,
+       /*signal=*/true), and return -1 so the caller treats this exactly
+       like the pre-existing handshake-failure branch (no ICE restart; the
+       app falls back to the sealed relay path).
+    2. The DTLS retransmission timer's lambda (SetTimeout()) used to call
+       ContinueSSL() and drop its return value entirely - unlike BeginSSL()
+       and OnEvent(), which both do
+       `if (int error = ContinueSSL()) { Error(...); return; }`. A
+       handshake or policy failure that happened to surface on exactly a
+       retransmission timeout (not a socket read) never reached Error() at
+       all, leaving the stream stuck in SSL_CONNECTING. Fixed to match the
+       other two call sites.
+    Because Error() can now legitimately be invoked twice for the same
+    failure (once from inside ContinueSSL()'s new policy check, once again
+    from whichever of the three call sites above also sees ContinueSSL()'s
+    nonzero return and calls Error() itself), Error() itself gained a small
+    idempotency guard: if state_ is already SSL_ERROR or SSL_CLOSED, return
+    immediately. Cleanup() already tolerated re-entry (ssl_/ssl_ctx_ become
+    null after the first call and are checked before use), but without this
+    guard a second call would still re-fire SE_CLOSE and double-notify
+    observers.
+
+  * Finding #11 (LOW): the constructor's disable_ssl_group_ids_ no longer
+    reads the "WebRTC-DisableSslGroupIds" field trial in strict builds - it
+    is hard-wired false. That trial is upstream's kill switch for calling
+    SSL_set1_group_ids() at all; left honored in a strict build it would
+    fall the group preference back to BoringSSL's own default order, which
+    neither includes X25519MLKEM768 nor excludes groups that don't pair with
+    AES-256-GCM. Switchable builds are unchanged (still trial-controlled).
+
+  * New OpenSSLStreamAdapter::QaudionHandshakeMeetsPolicy() (BoringSSL only,
+    #ifdef OPENSSL_IS_BORINGSSL - this file already forks on that macro for
+    every BoringSSL-specific API it uses, and the call site is guarded the
+    same way): reads SSL_get_current_cipher()/SSL_CIPHER_get_protocol_id(),
+    SSL_get_selected_srtp_profile()->id, SSL_get_group_id() and
+    SSL_version() off the just-completed handshake's live SSL*, and checks
+    them against the current qaudion::TransportLevel() (srtp cipher at
+    level >= 1, DTLS cipher at level >= 2, DTLS version at level >= 3) plus
+    qaudion::RequireDtlsPqc() (independent of level, tighten-only)
+    unconditionally. Every numeric constant used was verified against the
+    pinned BoringSSL headers: TLS_AES_256_GCM_SHA384 = 0x1302
+    (TLS1_3_CK_AES_256_GCM_SHA384 = 0x03001302, tls1.h),
+    ECDHE-ECDSA-AES256-GCM-SHA384 = 0xC02C and ECDHE-RSA-AES256-GCM-SHA384 =
+    0xC030 (TLS1_CK_..._WITH_AES_256_GCM_SHA384 = 0x0300C02C / 0x0300C030),
+    SRTP_AEAD_AES_256_GCM = 0x0008 and SSL_GROUP_X25519_MLKEM768 = 0x11ec
+    (both in ssl.h). Logs exactly one ids-only self-report line per
+    handshake ("Q-AUDION dtls v=... cipher=... srtp=... group=... level=...
+    pqc_req=... ok=..." via absl::StrFormat, already included by this file)
+    - numeric protocol/cipher/group ids only, never key material - which is
+    both the G3 gate's target string and the operator-facing signal used by
+    the app's own DTLS-failure detection (webrtc-plan.md section 3.1: PC
+    state FAILED while ICE is CONNECTED/COMPLETED, or this line with
+    ok=0).
+
+- rtc_base/ssl_stream_adapter.cc
+  (SSLStreamAdapter::GetDefaultEphemeralKeyExchangeCipherGroups):
+  in strict builds, X25519MLKEM768 is now the default whenever the
+  "WebRTC-EnableDtlsPqc" trial is NOT explicitly "Disabled/" (i.e. on by
+  default, no trial needed - both peers are always our own M150 build);
+  ".../Disabled/" remains the emergency kill switch. Switchable builds are
+  byte-for-byte the original upstream logic (opt-in only via
+  ".../Enabled/"). This function alone only controls the *default* list a
+  fresh CryptoOptions starts from - see the next file for the other half of
+  finding #9.
+
+- api/crypto/crypto_options.cc
+  (CryptoOptions::EphemeralKeyExchangeCipherGroups::Update):
+  Finding #9 (MEDIUM) root cause, confirmed by reading the real function
+  (not just the plan's sketch): Update() computes `default_groups` from
+  GetDefaultEphemeralKeyExchangeCipherGroups(field_trials), but then only
+  ever ADDS entries from `default_groups` into `enabled_` and re-adds
+  everything already in `enabled_` - it never removes anything already
+  there. Once X25519MLKEM768 is in `enabled_` (e.g. from the
+  EphemeralKeyExchangeCipherGroups default constructor's own call to
+  GetDefaultEphemeralKeyExchangeCipherGroups(nullptr), made before any real
+  FieldTrialsView exists to check the switch against - the very first
+  strict-build change above puts it there unconditionally), calling
+  Update() with "WebRTC-EnableDtlsPqc/Disabled/" changed what
+  `default_groups` would be, but never touched the group already sitting in
+  `enabled_`: the kill switch had no effect, exactly as the review found.
+  Fix: an explicit `if (field_trials && field_trials->IsDisabled(
+  "WebRTC-EnableDtlsPqc")) { std::erase(enabled_, kX25519_MLKEM768); }`
+  right before the add-back loop, using std::erase() (already used the same
+  way by this same class's AddFirst(), two functions above) and
+  kX25519_MLKEM768 (the class's own portable constant, 0x11ec,
+  crypto_options.h:102 - deliberately not the BoringSSL macro, since this
+  .cc file does not otherwise depend on BoringSSL's ssl.h being visible).
+  This runs regardless of QAUDION_TRANSPORT_STRICT: it is a pure
+  correctness fix for the trial's own stated behaviour, gated only by the
+  trial value it already reads for `default_groups`.
+
+Depends on Q-Audion's own runtime API (rtc_base/qaudion_tuning.h, written by
+P8, applied earlier in the series - see m150/series) for:
+- qaudion::TransportLevel() and qaudion::RequireDtlsPqc() - both already
+  named in the P8 sketch (plan section 2.3);
+- the QAUDION_TRANSPORT_STRICT build-wide #define (also P8).
+No new qaudion:: names are introduced by this patch (compare P1's amendment,
+which does invent two).
+
+Order: seventh (last) in the series (P1, P2, P3, P8, P4a, P4b, P5, P6, P7 -
+see m150/series, owned by the audio/API author). Applied after P6, which
+also touches api/crypto/crypto_options.cc (GetSupportedDtlsSrtpCryptoSuites()
+and the Srtp::cryptex_policy default) - verified below that this patch's own
+crypto_options.cc hunk (against EphemeralKeyExchangeCipherGroups::Update(),
+lines 140-172 in the pristine file, well past P6's edits) applies cleanly on
+top of P6, unchanged, with no hunk overlap or offset conflict.
+
+Verified: `git apply --check` and a real `git apply` are clean, in a
+clean-room tree, against the exact pinned blobs of
+rtc_base/{openssl_stream_adapter.{h,cc},ssl_stream_adapter.cc} and
+api/crypto/crypto_options.cc at webrtc-sdk/webrtc @
+ba469aa2093ba950066258ca0a59a6fbd1295582 (fetched directly from
+raw.githubusercontent.com at that commit), applied directly on top of this
+same patch set's P6 body. Also verified the full clean-room sequence P1
+(amended) -> P2 -> P3 -> P6 -> P7 on a fresh checkout, all `git apply
+--check` and real `git apply` clean. Every BoringSSL symbol and numeric
+constant this patch names was checked against the actual pinned BoringSSL
+f91f1447 headers/sources (include/openssl/{ssl.h,tls1.h},
+ssl/{ssl_cipher.cc,ssl_lib.cc}), not just the plan's notes; see the per-file
+notes above for the exact values and source locations. qaudion::
+TransportLevel(), qaudion::RequireDtlsPqc() and QAUDION_TRANSPORT_STRICT are
+P8's contract and are not part of this patch; a full syntax/compile check of
+this patch is therefore only possible once P8 is integrated (no toolchain
+was available locally for even a partial clang -fsyntax-only check - see the
+stage-1 report).
+
+diff --git a/api/crypto/crypto_options.cc b/api/crypto/crypto_options.cc
+index 08a7bad..4dc3bac 100644
+--- a/api/crypto/crypto_options.cc
++++ b/api/crypto/crypto_options.cc
+@@ -173,6 +173,23 @@ void CryptoOptions::EphemeralKeyExchangeCipherGroups::Update(
+     });
+   }
+
++  // Q-Audion (finding #9): "WebRTC-EnableDtlsPqc/Disabled/" is the emergency
++  // kill switch for the PQC hybrid group that P7's strict-build
++  // GetDefaultEphemeralKeyExchangeCipherGroups() prefers by default (no
++  // trial needed to turn it ON - see ssl_stream_adapter.cc). Below, this
++  // function only ever ADDS groups from `default_groups` into `enabled_`
++  // and keeps everything already there - so once the group is in
++  // `enabled_` (e.g. from the constructor's own call to
++  // GetDefaultEphemeralKeyExchangeCipherGroups(nullptr), made before any
++  // real FieldTrialsView existed to check the switch against), the switch
++  // had no way to take it back out again: it disabled the *default*, not
++  // the *already-enabled* value. Purge it explicitly whenever the same
++  // trial we just consulted for `default_groups` says Disabled, so the
++  // emergency PQC-off path actually removes the group either way.
++  if (field_trials && field_trials->IsDisabled("WebRTC-EnableDtlsPqc")) {
++    std::erase(enabled_, kX25519_MLKEM768);
++  }
++
+   // Add those enabled by field-trials first.
+   std::vector<uint16_t> current = std::move(enabled_);
+   enabled_.clear();
+diff --git a/rtc_base/openssl_stream_adapter.cc b/rtc_base/openssl_stream_adapter.cc
+index a40c4ec..b194630 100644
+--- a/rtc_base/openssl_stream_adapter.cc
++++ b/rtc_base/openssl_stream_adapter.cc
+@@ -44,6 +44,7 @@
+ #include "rtc_base/openssl_adapter.h"
+ #include "rtc_base/openssl_digest.h"
+ #include "rtc_base/openssl_utility.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/span_helpers.h"
+ #include "rtc_base/ssl_certificate.h"
+ #include "rtc_base/ssl_identity.h"
+@@ -71,6 +72,14 @@
+ #error "webrtc requires at least OpenSSL version 1.1.0, to support DTLS-SRTP"
+ #endif
+
++// Q-Audion (P7): every build variant (strict and switchable) shares the code
++// below, and the switchable variant's fail-closed path still needs to name
++// DTLS 1.3 explicitly once the app raises the transport level - so this is
++// unconditional, not just for QAUDION_TRANSPORT_STRICT builds.
++#ifndef DTLS1_3_VERSION
++#error "Q-Audion hardening requires a BoringSSL build with DTLS 1.3 support"
++#endif
++
+ namespace {
+ // Value specified in RFC 5764.
+ constexpr absl::string_view kDtlsSrtpExporterLabel = "EXTRACTOR-dtls_srtp";
+@@ -308,9 +317,20 @@ OpenSSLStreamAdapter::OpenSSLStreamAdapter(
+       ssl_ctx_(nullptr),
+       ssl_mode_(SSL_MODE_DTLS),
+       ssl_max_version_(MAX_SSL_PROTOCOL_DTLS),
++      // Q-Audion (P7, finding #11): "WebRTC-DisableSslGroupIds" is upstream's
++      // kill switch for calling SSL_set1_group_ids() at all - it was never
++      // meant to (and must not be allowed to) fall a strict 1:1 build back
++      // to BoringSSL's own default group preference, which does not include
++      // X25519MLKEM768 and does include groups AES-256-GCM does not require.
++      // Switchable (LiveKit) builds keep the upstream, trial-controlled
++      // behaviour unchanged.
+       disable_ssl_group_ids_(
++#if QAUDION_TRANSPORT_STRICT
++          false) {
++#else
+           env_.has_value() &&
+           env_->field_trials().IsEnabled("WebRTC-DisableSslGroupIds")) {
++#endif
+   stream_->SetEventCallback(
+       [this](int events, int err) { OnEvent(events, err); });
+ }
+@@ -909,8 +929,17 @@ void OpenSSLStreamAdapter::SetTimeout(int delay_ms) {
+           // We check the timer even after SSL_CONNECTED,
+           // but ContinueSSL() is only needed when SSL_CONNECTING
+           if (state_ == SSL_CONNECTING) {
+-            // Note: timeout is set inside ContinueSSL()
+-            ContinueSSL();
++            // Note: timeout is set inside ContinueSSL(). Q-Audion (P7,
++            // finding #10): unlike BeginSSL() and OnEvent(), this call site
++            // used to drop ContinueSSL()'s result - a handshake failure (or
++            // a Q-Audion policy failure below) that surfaced on exactly a
++            // retransmission timeout never reached Error(), leaving the
++            // stream stuck in SSL_CONNECTING. Match the other two call
++            // sites.
++            if (int error = ContinueSSL()) {
++              Error("ContinueSSL", error, 0, true);
++              return TimeDelta::PlusInfinity();
++            }
+           } else if (state_ == SSL_CONNECTED) {
+             MaybeSetTimeout();
+           } else {
+@@ -997,6 +1026,30 @@ int OpenSSLStreamAdapter::ContinueSSL() {
+       // out if one was missing.
+       RTC_DCHECK(peer_cert_chain_ || !GetClientAuthEnabled());
+
++      // Q-Audion (P7, finding #10): BoringSSL can complete a DTLS handshake
++      // under a cipher/version/group SetupSSLContext() could not forbid
++      // outright (e.g. a TLS 1.3 peer choosing AES-128-GCM - TLS 1.3 cipher
++      // lists are fixed by ssl.h and ignore SSL_CTX_set_*cipher_list(); see
++      // SetupSSLContext() above) and still not meet the qaudion transport
++      // level's policy. Check before ever flipping to SSL_CONNECTED or
++      // firing SE_OPEN, and fail CLOSED: send a fatal insufficient_security
++      // alert (RFC 8446 6.2) instead of silently accepting a weaker
++      // connection. The caller (BeginSSL()/OnEvent()/the DTLS retransmission
++      // timer, see below) sees the same negative return this function's own
++      // SSL_R_NO_SHARED_CIPHER handshake-failure branch already uses, so
++      // DtlsTransport treats this exactly like a failed handshake: no ICE
++      // restart, the app falls back to the sealed relay path.
++#ifdef OPENSSL_IS_BORINGSSL
++      if (ssl_mode_ == SSL_MODE_DTLS && !QaudionHandshakeMeetsPolicy()) {
++        if (handshake_error_) {
++          handshake_error_(SSLHandshakeError::INCOMPATIBLE_CIPHERSUITE);
++        }
++        Error("Q-AUDION dtls-policy", -1, SSL_AD_INSUFFICIENT_SECURITY,
++              /*signal=*/true);
++        return -1;
++      }
++#endif  // OPENSSL_IS_BORINGSSL
++
+       state_ = SSL_CONNECTED;
+       if (!WaitingToVerifyPeerCertificate()) {
+         // We have everything we need to start the connection, so signal
+@@ -1052,6 +1105,17 @@ void OpenSSLStreamAdapter::Error(absl::string_view context,
+                                  uint8_t alert,
+                                  bool signal) {
+   RTC_DCHECK_RUN_ON(&callback_sequence_);
++  // Q-Audion (P7, finding #10): the stream may already be SSL_ERROR/
++  // SSL_CLOSED here - e.g. QaudionHandshakeMeetsPolicy() already failed
++  // ContinueSSL() closed with its own alert (see below), and the caller
++  // that invoked ContinueSSL() (BeginSSL(), OnEvent(), or the DTLS
++  // retransmission timer) then also calls Error() itself for the same
++  // nonzero return. Cleanup() already tolerates being re-entered (ssl_/
++  // ssl_ctx_ become null after the first call), but re-firing SE_CLOSE
++  // would double-notify observers, so bail out once already terminal.
++  if (state_ == SSL_ERROR || state_ == SSL_CLOSED) {
++    return;
++  }
+   RTC_LOG(LS_WARNING) << "OpenSSLStreamAdapter::Error(" << context << ", "
+                       << err << ", " << static_cast<int>(alert) << ")";
+ #ifdef OPENSSL_IS_BORINGSSL
+@@ -1154,8 +1218,18 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
+     return nullptr;
+   }
+
+-  auto min_version =
+-      ssl_mode_ == SSL_MODE_DTLS ? DTLS1_2_VERSION : TLS1_2_VERSION;
++  // Q-Audion (P7): in strict 1:1 builds, and in switchable builds once the
++  // app has raised the transport level to 3 (tighten-only; see
++  // rtc_base/qaudion_tuning.h / P8), DTLS itself must be 1.3 - the peer
++  // cannot negotiate down to 1.2, it fails the handshake outright (the app
++  // then falls back to the sealed relay path instead of retrying ICE). TLS
++  // mode (used by OpenSSLAdapter for TURN-TLS, a different class) is
++  // untouched.
++  const int qaudion_level = qaudion::TransportLevel();  // strict: always 3
++  auto min_version = ssl_mode_ == SSL_MODE_DTLS
++                          ? (qaudion_level >= 3 ? DTLS1_3_VERSION
++                                                : DTLS1_2_VERSION)
++                          : TLS1_2_VERSION;
+   auto max_version = GetMaxVersion(ssl_mode_, ssl_max_version_);
+
+   SSL_CTX_set_min_proto_version(ctx, min_version);
+@@ -1199,13 +1273,54 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
+   SSL_CTX_set_cert_verify_callback(ctx, SSLVerifyCallback, nullptr);
+ #endif
+
+-  // Select list of available ciphers. Note that !SHA256 and !SHA384 only
+-  // remove HMAC-SHA256 and HMAC-SHA384 cipher suites, not GCM cipher suites
+-  // with SHA256 or SHA384 as the handshake hash.
+-  // This matches the list of SSLClientSocketImpl in Chromium.
+-  SSL_CTX_set_cipher_list(
+-      ctx,
+-      "DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK:!3DES");
++  // Select list of available ciphers (TLS <= 1.2 only: TLS 1.3 has a fixed
++  // preference order in ssl.h and ignores cipher-list functions entirely).
++  // Note that !SHA256 and !SHA384 only remove HMAC-SHA256 and HMAC-SHA384
++  // cipher suites, not GCM cipher suites with SHA256 or SHA384 as the
++  // handshake hash. This matches the list of SSLClientSocketImpl in
++  // Chromium.
++  //
++  // Q-Audion (P7, finding #8): at level >= 2 (strict builds are always at
++  // level 3) only the two AES-256-GCM TLS 1.2 suites are offered, set via
++  // SSL_CTX_set_strict_cipher_list() so a future BoringSSL alias removal or
++  // a typo here fails the build's own handshake tests loudly instead of
++  // silently widening the cipher list. Crucially, the upstream list above
++  // cannot be switched to the strict setter as-is: BoringSSL's
++  // ssl_cipher.cc kCipherAliases table (verified at this pin) does not
++  // define "NULL", "aNULL", "SHA256", "SHA384" or "aECDH" as rule words -
++  // SSL_CTX_set_cipher_list() "tolerates garbage inputs, unless an empty
++  // cipher list results" (ssl.h), so those unknown words are silent no-ops
++  // there, but SSL_CTX_set_strict_cipher_list() "returns error if str
++  // contains anything meaningless" and would fail every DTLS handshake at
++  // levels 0-1 before it starts. So the upstream default list keeps using
++  // the tolerant setter, and strict validation is reserved for our own,
++  // hand-picked AES-256-only list.
++  const bool aes256_only = qaudion_level >= 2;
++  if (aes256_only) {
++    if (!SSL_CTX_set_strict_cipher_list(
++            ctx,
++            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")) {
++      SSL_CTX_free(ctx);
++      return nullptr;
++    }
++    // Q-Audion: prefer AES-256-GCM in our own ClientHello and select it
++    // when we are the server (BoringSSL's cnsa_202407 compliance-policy
++    // configure step touches exactly these two things - see ssl_lib.cc at
++    // this pin). This does NOT by itself forbid AES-128/ChaCha20 on a TLS
++    // 1.3 connection (cipher lists don't apply there) or on a peer with a
++    // stale/misconfigured cipher list of its own;
++    // QaudionHandshakeMeetsPolicy() below is the actual fail-closed check,
++    // run once the handshake completes.
++    if (!SSL_CTX_set_compliance_policy(ctx,
++                                       ssl_compliance_policy_cnsa_202407)) {
++      SSL_CTX_free(ctx);
++      return nullptr;
++    }
++  } else {
++    SSL_CTX_set_cipher_list(
++        ctx,
++        "DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK:!3DES");
++  }
+
+   if (!srtp_ciphers_.empty()) {
+     if (SSL_CTX_set_tlsext_use_srtp(ctx, srtp_ciphers_.c_str())) {
+@@ -1455,4 +1570,49 @@ bool OpenSSLStreamAdapter::SetSslGroupIds(const std::vector<uint16_t>& groups) {
+   return true;
+ }
+
++#ifdef OPENSSL_IS_BORINGSSL
++bool OpenSSLStreamAdapter::QaudionHandshakeMeetsPolicy() {
++  const int level = qaudion::TransportLevel();  // strict builds: always 3
++  const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_);
++  const uint16_t cipher_id =
++      cipher ? SSL_CIPHER_get_protocol_id(cipher) : uint16_t{0};
++  const SRTP_PROTECTION_PROFILE* srtp_profile =
++      SSL_get_selected_srtp_profile(ssl_);
++  const unsigned srtp_id =
++      srtp_profile ? static_cast<unsigned>(srtp_profile->id) : 0u;
++  const uint16_t group_id = SSL_get_group_id(ssl_);
++  const int version = SSL_version(ssl_);
++  const bool is_dtls13 = version == DTLS1_3_VERSION;
++
++  // TLS_AES_256_GCM_SHA384 (DTLS 1.3; the only cipher that suite negotiates
++  // to under our ClientHello/ServerHello - see SetupSSLContext()'s
++  // ssl_compliance_policy_cnsa_202407 call), or either AES-256-GCM DTLS 1.2
++  // suite SetupSSLContext() allowed in via SSL_CTX_set_strict_cipher_list().
++  constexpr uint16_t kTlsAes256GcmSha384 = 0x1302;
++  constexpr uint16_t kEcdheEcdsaAes256GcmSha384 = 0xC02C;
++  constexpr uint16_t kEcdheRsaAes256GcmSha384 = 0xC030;
++  const bool cipher_ok =
++      cipher_id == kTlsAes256GcmSha384 ||
++      (!is_dtls13 && (cipher_id == kEcdheEcdsaAes256GcmSha384 ||
++                      cipher_id == kEcdheRsaAes256GcmSha384));
++  // srtp_ciphers_ empty means DTLS-SRTP keying was never requested for this
++  // stream at all (e.g. a data-channel-only connection) - nothing to check.
++  const bool srtp_ok =
++      srtp_ciphers_.empty() || srtp_id == SRTP_AEAD_AES_256_GCM;
++  const bool pqc_ok = !qaudion::RequireDtlsPqc() ||
++                      group_id == SSL_GROUP_X25519_MLKEM768;
++  const bool ok = (level < 1 || srtp_ok) && (level < 2 || cipher_ok) &&
++                  (level < 3 || is_dtls13) && pqc_ok;
++
++  // Ids only, never key material: safe to always log (G3 gate greps the
++  // binary for exactly this line's prefix).
++  RTC_LOG(LS_WARNING) << absl::StrFormat(
++      "Q-AUDION dtls v=%04x cipher=%04x srtp=%04x group=%04x level=%d "
++      "pqc_req=%d ok=%d",
++      static_cast<unsigned>(version), cipher_id, srtp_id, group_id, level,
++      qaudion::RequireDtlsPqc() ? 1 : 0, ok ? 1 : 0);
++  return ok;
++}
++#endif  // OPENSSL_IS_BORINGSSL
++
+ }  // namespace webrtc
+diff --git a/rtc_base/openssl_stream_adapter.h b/rtc_base/openssl_stream_adapter.h
+index 46335a7..4a287cd 100644
+--- a/rtc_base/openssl_stream_adapter.h
++++ b/rtc_base/openssl_stream_adapter.h
+@@ -196,6 +196,16 @@ class OpenSSLStreamAdapter final : public SSLStreamAdapter {
+   // Verify the peer certificate matches the signaled digest.
+   bool VerifyPeerCertificate();
+
++#ifdef OPENSSL_IS_BORINGSSL
++  // Q-Audion (P7): checked once, right after a DTLS handshake completes
++  // (SSL_ERROR_NONE), before the stream is allowed to reach SSL_CONNECTED.
++  // Re-derives the qaudion transport level's requirements (SRTP cipher,
++  // DTLS cipher/version, PQC group) from the live SSL* and logs an
++  // ids-only self-report line ("Q-AUDION dtls ..."); never touches key
++  // material. Returns false to fail the handshake closed.
++  bool QaudionHandshakeMeetsPolicy();
++#endif
++
+ #ifdef OPENSSL_IS_BORINGSSL
+   // SSL certificate verification callback. See SSL_CTX_set_custom_verify.
+   static enum ssl_verify_result_t SSLVerifyCallback(SSL* ssl,
+diff --git a/rtc_base/ssl_stream_adapter.cc b/rtc_base/ssl_stream_adapter.cc
+index 8b6004a..2791713 100644
+--- a/rtc_base/ssl_stream_adapter.cc
++++ b/rtc_base/ssl_stream_adapter.cc
+@@ -152,7 +152,23 @@ SSLStreamAdapter::GetDefaultEphemeralKeyExchangeCipherGroups(
+     const FieldTrialsView* field_trials) {
+   // It would be nice if BoringSSL had a function like this!
+   // from boringssl/src/ssl/extensions.cc kDefaultGroups.
++  //
++  // Q-Audion (P7): in strict 1:1 builds X25519MLKEM768 is preferred by
++  // default - no trial needed, since both peers are always our own M150
++  // build - and "WebRTC-EnableDtlsPqc/Disabled/" remains the emergency kill
++  // switch. That switch's actual enforcement against an *already enabled*
++  // group lives in
++  // CryptoOptions::EphemeralKeyExchangeCipherGroups::Update() (finding #9;
++  // see crypto_options.cc), because this function alone only ever affects
++  // the *default* list a fresh CryptoOptions starts from, not one already
++  // carrying the group in its `enabled_` list. Switchable (LiveKit) builds
++  // are byte-for-byte upstream: PQC stays opt-in via
++  // "WebRTC-EnableDtlsPqc/Enabled/", matching the SFU's own capabilities.
++#if QAUDION_TRANSPORT_STRICT
++  if (!field_trials || !field_trials->IsDisabled("WebRTC-EnableDtlsPqc")) {
++#else
+   if (field_trials && field_trials->IsEnabled("WebRTC-EnableDtlsPqc")) {
++#endif
+     return {
+ #ifdef SSL_GROUP_X25519_MLKEM768
+         SSL_GROUP_X25519_MLKEM768,
