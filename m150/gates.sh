@@ -1,5 +1,5 @@
 #!/bin/sh
-# gates.sh - binary gates G1-G9 for the four M150 build variants (plan
+# gates.sh - binary gates G1-G10 for the four M150 build variants (plan
 # webrtc-plan.md v2 §2.5). Stops at the FIRST failing gate (fail closed,
 # same convention as ci/assert-no-key-strings.sh: an inconclusive check is a
 # failure, never a pass-by-default).
@@ -299,6 +299,46 @@ else
 fi
 echo "::endgroup::"
 gate_ok G8
+
+# ---------------------------------------------------------------------------
+# G10 - Android only: every .class file in classes.jar must be Java 17 or
+# older (class-file major version <= 61 - JVMS 4.1, bytes 6-7, big-endian
+# u16). The app compiles Java/Kotlin with target 17 and its JVM unit tests
+# run on JDK 17 only (VPS and the self-hosted CI have no other JDK
+# installed); the M150 build/ repo used to hard-code javac's --release to
+# 21 (major version 65) until P10, which this gate is the backstop for -
+# a future upstream/build-repo change that reintroduces --release 21 (or
+# higher) must fail the build here, not surface later as 122 JVM unit test
+# UnsupportedClassVersionError failures. iOS ships no classes.jar, so this
+# gate only runs for platform=android. Fails CLOSED: zero .class files
+# found is itself a failure, never a silent pass.
+# ---------------------------------------------------------------------------
+if [ "$PLATFORM" = android ]; then
+  echo "::group::G10: classes.jar bytecode <= Java 17 (major version 61)"
+  CJ10="$AAR_SCAN/classes.jar"
+  [ -f "$CJ10" ] || gate_fail "G10 (no classes.jar in AAR)"
+  CJ10_SCAN="$WORK/classes-g10"
+  mkdir -p "$CJ10_SCAN"
+  unzip -q -o "$CJ10" -d "$CJ10_SCAN"
+  CLASS_FILES=$(find "$CJ10_SCAN" -type f -name '*.class')
+  [ -n "$CLASS_FILES" ] || gate_fail "G10 (no .class files found in classes.jar)"
+  N_CLASSES=0
+  BAD=0
+  for cf in $CLASS_FILES; do
+    N_CLASSES=$((N_CLASSES + 1))
+    B6=$(od -An -tu1 -j 6 -N 1 "$cf" | tr -d '[:space:]')
+    B7=$(od -An -tu1 -j 7 -N 1 "$cf" | tr -d '[:space:]')
+    MAJOR=$((B6 * 256 + B7))
+    if [ "$MAJOR" -gt 61 ]; then
+      BAD=$((BAD + 1))
+      echo "::error::G10: $cf has class-file major version $MAJOR (> 61 / Java 17)"
+    fi
+  done
+  echo "G10: checked $N_CLASSES .class file(s), major version <= 61"
+  [ "$BAD" -eq 0 ] || gate_fail "G10 ($BAD .class file(s) exceed major version 61 / Java 17)"
+  echo "::endgroup::"
+  gate_ok G10
+fi
 
 # ---------------------------------------------------------------------------
 # G9 - informational only: print which SSL_GROUP_*MLKEM1024* defines the

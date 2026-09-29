@@ -14,6 +14,9 @@
 #   'third_party'  -> apply inside <src>/third_party (the split DEPS repo)
 #   'third_party/opus/src' or 'third_party/boringssl/src' -> those repos,
 #     if a patch ever needs to touch vendored Opus/BoringSSL directly.
+#   'build'        -> apply inside <src>/build (the separate depot_tools
+#     'build' repo, DEPS 'src/build' - e.g. P10, which pins javac's
+#     --release level for the Android AAR's classes.jar).
 # Blank lines and lines starting with '#' are ignored. Patch files live in
 # m150/patches/, resolved relative to this script's own directory (not cwd),
 # so apply-series.sh can be invoked from anywhere.
@@ -71,6 +74,7 @@ resolve_dir() {
     third_party) printf '%s\n' "$SRC/third_party" ;;
     third_party/opus/src) printf '%s\n' "$SRC/third_party/opus/src" ;;
     third_party/boringssl/src) printf '%s\n' "$SRC/third_party/boringssl/src" ;;
+    build) printf '%s\n' "$SRC/build" ;;
     *) return 1 ;;
   esac
 }
@@ -103,7 +107,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   d=$1
   p=$2
   if ! ROOT=$(resolve_dir "$d"); then
-    echo "::error::apply-series: series line has an unknown dir '$d' (want '.', 'third_party', 'third_party/opus/src' or 'third_party/boringssl/src')" >&2
+    echo "::error::apply-series: series line has an unknown dir '$d' (want '.', 'third_party', 'third_party/opus/src', 'third_party/boringssl/src' or 'build')" >&2
     exit 2
   fi
   if ! safe_name "$p"; then

@@ -22,3 +22,10 @@ third_party P4a-opus-dnn-osce-build.patch
 # most likely to need a rebase if anything upstream shifts.
 . P6-srtp-aes256gcm-only.patch
 . P7-dtls13-aes256-pqc.patch
+#
+# Build-tooling author: P10 touches the separate 'build' repo (DEPS
+# 'src/build'), not the webrtc src tree or third_party, so it has no hunk
+# overlap with P1-P8/P4a and its position in this file does not matter.
+# Pins javac's --release from 21 to 17 (Android classes.jar was shipping
+# Java 21 class files, breaking JVM unit tests on the app's JDK 17).
+build P10-java-release-17.patch

@@ -1,0 +1,77 @@
+Pin javac's --release to 17 (was hard-coded 21) so the M150 Android AAR's
+classes.jar ships Java 17 class files (major version 61), matching M144 and
+the app's own toolchain (target 17, JVM unit tests run on JDK 17 on the VPS
+and the self-hosted CI - only JDK 17 is installed there).
+
+Root cause: there is no GN arg for this. build/android/gyp/compile_java.py
+hard-codes javac's -release flag:
+
+  javac_args = [
+      ...
+      '--release',
+      # Keep consistent with javac_cmd in //build/android/gyp/turbine.py.
+      '21',
+      ...
+
+(compile_java.py:607-609), and build/android/gyp/turbine.py duplicates the
+same literal for header-jar generation:
+
+  javac_cmd = ['--release', '21']
+
+(turbine.py:94, comment cross-references compile_java.py and
+//build/android/gradle/android.jinja - the .jinja is Gradle-project-
+generation only, not used by build_aar.py, so it is untouched here).
+build/android/gyp/compile_kt.py already passes "-jvm-target" "11" to kotlinc
+(compile_kt.py:150-151) - Kotlin output was never the problem, only javac's
+--release 21 output was.
+
+This is the `build` repo, a separate git checkout nested inside the webrtc
+src tree at <src>/build (DEPS: 'src/build':
+'https://github.com/webrtc-sdk/build@d2fe8a958bfecec159f7a478ba487e41dd635a13',
+itself a GitHub mirror/fork of chromium/src/build - chromium.googlesource.com
+does not carry this exact fork commit). apply-series.sh's resolve_dir() must
+learn the 'build' -> "$SRC/build" mapping for this patch's series line to
+resolve (companion change, not in this patch: m150/apply-series.sh).
+
+Both hunks verified with `git apply --check -v` against a fresh sparse
+shallow clone of https://github.com/webrtc-sdk/build.git @
+d2fe8a958bfecec159f7a478ba487e41dd635a13 (the exact pin above).
+
+Java-version safety: `--release 17` only lowers the class file's target/API
+level; the JDK actually invoked to run javac/turbine is still whatever
+third_party/jdk/current resolves to (DEPS pins a CIPD JDK 21 package for
+linux-amd64), so no toolchain swap is needed - `javac --release 17` from a
+JDK 21 javac is a normal, supported cross-compilation mode. Checked
+sdk/android at webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+(235 .java/.kt files) for anything --release 17 would reject: no switch
+pattern matching (`case Type v ->`/`case Type v:`), no record patterns, no
+`record` class declarations, no `sealed`/`permits` keywords. Text blocks
+(Java 15) and records (Java 16) would have been fine under 17 anyway; none
+were found either.
+
+diff --git a/android/gyp/compile_java.py b/android/gyp/compile_java.py
+index 9892395..a65ad66 100644
+--- a/android/gyp/compile_java.py
++++ b/android/gyp/compile_java.py
+@@ -606,7 +606,7 @@ def main(argv,
+       # Jacoco does not currently support a higher value.
+       '--release',
+       # Keep consistent with javac_cmd in //build/android/gyp/turbine.py.
+-      '21',
++      '17',
+       # Chromium only allows UTF8 source files.  Being explicit avoids
+       # javac pulling a default encoding from the user's environment.
+       '-encoding',
+diff --git a/android/gyp/turbine.py b/android/gyp/turbine.py
+index d719897..dab4517 100644
+--- a/android/gyp/turbine.py
++++ b/android/gyp/turbine.py
+@@ -91,7 +91,7 @@ def main(argv):
+   # Keep consistent with javac_args release flag in
+   # //build/android/gyp/compile_java.py and
+   # compileOptions in //build/android/gradle/android.jinja
+-  javac_cmd = ['--release', '21']
++  javac_cmd = ['--release', '17']
+
+   # Turbine reads lists from command line args by consuming args until one
+   # starts with double dash (--). Thus command line args should be grouped
