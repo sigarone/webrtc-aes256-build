@@ -1,0 +1,769 @@
+Q-Audion runtime tuning API (rtc_base/qaudion_tuning.{h,cc}) plus the GN,
+Android JNI and ObjC wiring that exposes it.
+
+New process-wide, lock-free API that P4b, P5 (this author) and P6, P7 (the
+crypto author) all call into:
+- SetOpusEncoderComplexity/OpusEncoderComplexity: 0..10 or -1 (build
+  default), mid-call changes allowed.
+- SetOpusDecoderComplexity/OpusDecoderComplexity (finding #15): 0..10 or -1
+  (kQaudionDefaultDecoderComplexity = 7 for now; only 5/6/7 currently change
+  libopus behavior - deep PLC / OSCE LACE / OSCE NoLACE).
+- SetOpusMinPacketLossPercent/OpusMinPacketLossPercent: FEC floor, default
+  10, clamped 0..20.
+- SetRequireDtlsPqc/RequireDtlsPqc: tighten-only for the life of the
+  process.
+- RaiseTransportLevel/TransportLevel: 0..3, raise-only, no-op (always 3) in
+  QAUDION_TRANSPORT_STRICT builds.
+- DisableMagicBytesBypass/MagicBytesBypassAllowed (finding #13, name not in
+  the plan - picked to match the existing tighten-only naming; reconciled by
+  the integrator against the crypto author's P1 amendment, which calls
+  qaudion::MagicBytesBypassAllowed() directly): tighten-only, always false in
+  QAUDION_TRANSPORT_STRICT builds. [Integrator, stage 2: this patch's own
+  first draft named the getter MagicBytesBypassDisabled(); P1 was written
+  independently against MagicBytesBypassAllowed(). Renamed here (and
+  inverted the boolean) to the one name both patches now use, since P1 must
+  stay untouched (its line numbers are shared with P2/P3, applied earlier in
+  the series). DisableMagicBytesBypass() itself was already spelled
+  identically in both patches and needed no change.]
+- TuningGeneration: bumped once per setter call that actually changed a
+  stored value; P4b/P5 poll it instead of taking a lock or a callback.
+- BuildInfo: ids/booleans/small integers only, safe for telemetry.
+
+Safety: every stored value lives in its own std::atomic<>; every setter
+range-checks (and, where -1 is not a valid sentinel, clamps) its input
+before storing, so no argument - including one the app derived from a
+remote flag or SDP attribute - can reach an RTC_CHECK, an out-of-range
+libopus CTL, or a BoringSSL call. No RTC_CHECK anywhere in this file
+(grepped). The four "tighten-only" knobs (PQC requirement, transport level,
+magic-bytes bypass) have no path back to a looser state short of a process
+restart, and QAUDION_TRANSPORT_STRICT builds hard-wire the tightest setting
+regardless of whether the setter was ever called.
+
+QAUDION_TRANSPORT_STRICT is a single macro propagated through //:common_config
+(root BUILD.gn) from one new GN arg, rtc_qaudion_transport_strict
+(webrtc.gni; default true = plain/strict). common_config is one of
+rtc_add_configs, applied by webrtc.gni's set_defaults() to every
+rtc_library/rtc_source_set/rtc_static_library/rtc_executable/rtc_shared_library/
+rtc_test target's own `configs` - not just to dependents via public_configs,
+so every translation unit built by these templates gets the define directly,
+with no dependency-graph gap possible. [Integrator, stage 2: this paragraph
+originally said "//:common_inherited_config"; the diff below actually edits
+`config("common_config")`, confirmed against the pinned root BUILD.gn (the
+"rtc_use_perfetto" context the hunk below is anchored to sits inside that
+config, not common_inherited_config). Corrected the prose to match the code;
+no behavior changes; common_config's reach turned out to be a superset of
+what common_inherited_config would have given here, since it does not rely
+on any target remembering to depend on qaudion_tuning to inherit the define -
+see the integrator's dep-wiring notes for why several targets needed an
+explicit qaudion_tuning dep for the *symbols*, which is a separate, narrower
+requirement than seeing the macro.] qaudion_tuning.h #errors out at compile
+time if a target somehow still didn't see the define, instead of silently
+linking in a stale per-file default. New rtc_base
+target `qaudion_tuning` (rtc_base/BUILD.gn) is added to the deps of
+modules/audio_coding:webrtc_opus, the sdk/android peerconnection_jni target
+and sdk:peerconnection_objc; api/crypto:options and the ssl_adapter target
+are the crypto author's to wire (P6/P7 call into this API too, per the plan,
+but I did not touch api/crypto/BUILD.gn or the ssl_adapter deps list -
+report to the integrator if `git apply --check` for P6/P7 complains about a
+missing qaudion_tuning dep there).
+
+Android surface: five setters, a raise, a disable, and a getter added to
+the existing org.webrtc.PeerConnectionFactory class (no new files - the
+LiveKit build's package-prefixing pipeline (build/patches/jni_prefix.patch)
+therefore applies to this the same as every other method already there).
+JNI bridges follow the exact naming/pattern of the neighboring
+JNI_PeerConnectionFactory_InitializeFieldTrials (jni_zero-generated; this
+M150 revision still uses the legacy JNI_ClassName_MethodName convention for
+the C++ side even though parameters are jni_zero types).
+
+ObjC surface: the same seven as class methods on
+RTC_OBJC_TYPE(RTCPeerConnectionFactory), so the LiveKit build's
+apple_prefix.patch turns them into LKRTCPeerConnectionFactory automatically,
+same as every other selector on that interface.
+
+Finding #14 (partial - the ObjC half; RecreateEncoderInstance's
+generation-read-ordering half is fixed in P5): NSInteger is 64-bit on
+arm64, so every value crossing into the 32-bit `int` the C++ API takes is
+explicitly clamped in the .mm (QaudionClampNSInteger), not just narrowed -
+an out-of-range NSInteger would otherwise truncate instead of hitting
+qaudion_tuning's own range check. The clamp range for the two complexity
+setters is [-1, 10], not [0, 10], because -1 ("build default") is part of
+their valid domain.
+
+Order: 4th in the series (m150/series), right after P1/P2/P3 and before
+P4a/P4b/P5/P6/P7 - all five of the latter depend on this API or its GN
+target.
+
+Touches (all in dir "."): webrtc.gni, BUILD.gn, rtc_base/BUILD.gn,
+modules/audio_coding/BUILD.gn, sdk/android/BUILD.gn, sdk/BUILD.gn,
+sdk/android/api/org/webrtc/PeerConnectionFactory.java,
+sdk/android/src/jni/pc/peer_connection_factory.cc,
+sdk/objc/api/peerconnection/RTCPeerConnectionFactory.{h,mm}; new files
+rtc_base/qaudion_tuning.{h,cc}.
+
+Verified: `git apply --check` and a real apply are clean against the
+pinned, partial webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+checkout, on top of P1 + P2 + P3 already applied, in series order. All
+touched symbols (JNI_PeerConnectionFactory_InitializeFieldTrials's exact
+signature and jni_zero calling convention, NSString+StdString's
+`+stringForStdString:`, the webrtc_opus/peerconnection_jni/peerconnection_objc
+target names and their existing rtc_base: deps, common_inherited_config's
+location in the root BUILD.gn) were read from that same pinned checkout,
+not assumed.
+
+Security review, stage 3: (1) the qaudion_tuning.h hunk declared 118 new
+lines but carried 119, so `git apply` stopped one line early and silently
+skipped the final "#endif  // RTC_BASE_QAUDION_TUNING_H_" as inter-hunk
+garbage (exit 0, only a "new blank line at EOF" warning): every translation
+unit including the header would have failed with an unterminated #ifndef.
+Regenerated with correct counts. (2) BuildInfo() used to build its
+transport marker from two separate string literals ("...transport=" +
+"strict"), so the contiguous "transport=strict" / "transport=switchable"
+that the binary gate G2 (m150/gates.sh) greps for never existed in any
+shipped binary and G2 would have failed every variant; it is now one
+literal per variant; g_transport_level is compiled only into switchable
+builds (strict builds never touch it, and clang -Werror,-Wunused-variable
+rejected it - found by a real clang compile of every changed object on the
+pinned tree, both GN configs). (3) Fixed the stale "common_inherited_config" wording
+in the #error text and in the root BUILD.gn comment (the define lives in
+//:common_config) and dropped a trailing blank line at EOF of
+qaudion_tuning.cc.
+
+diff --git a/BUILD.gn b/BUILD.gn
+index b484f5b..9c04469 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -499,6 +499,18 @@ config("common_config") {
+   if (rtc_use_perfetto) {
+     defines += [ "RTC_USE_PERFETTO" ]
+   }
++
++  # Q-Audion (M150 hardening, P8): a single global macro, propagated through
++  # this public_configs-shared config to every translation unit in the
++  # binary. rtc_base/qaudion_tuning.h #errors out if it ever sees a build
++  # that didn't go through here, so a target that is not built with
++  # common_config fails to compile instead of silently compiling a
++  # different (ODR-violating) default.
++  if (rtc_qaudion_transport_strict) {
++    defines += [ "QAUDION_TRANSPORT_STRICT=1" ]
++  } else {
++    defines += [ "QAUDION_TRANSPORT_STRICT=0" ]
++  }
+ }
+ 
+ config("common_objc") {
+diff --git a/modules/audio_coding/BUILD.gn b/modules/audio_coding/BUILD.gn
+index afe7378..c09e5ea 100644
+--- a/modules/audio_coding/BUILD.gn
++++ b/modules/audio_coding/BUILD.gn
+@@ -274,6 +274,7 @@ rtc_library("webrtc_opus") {
+     "../../rtc_base:checks",
+     "../../rtc_base:logging",
+     "../../rtc_base:protobuf_utils",
++    "../../rtc_base:qaudion_tuning",
+     "../../rtc_base:rtc_numerics",
+     "../../rtc_base:safe_conversions",
+     "../../rtc_base:safe_minmax",
+diff --git a/rtc_base/BUILD.gn b/rtc_base/BUILD.gn
+index f07e615..8dc42f5 100644
+--- a/rtc_base/BUILD.gn
++++ b/rtc_base/BUILD.gn
+@@ -605,6 +605,21 @@ rtc_library("checks") {
+   }
+ }
+ 
++rtc_library("qaudion_tuning") {
++  # Q-Audion (M150 hardening, P8): process-wide runtime knobs (Opus
++  # encoder/decoder complexity, FEC floor, DTLS-PQC/transport-level/
++  # magic-bytes-bypass tightening). Deliberately depends on nothing but the
++  # standard library, so every consumer (api/crypto:options, the
++  # ssl_adapter target below, modules/audio_coding:webrtc_opus, the
++  # Android JNI peerconnection_jni target and sdk:peerconnection_objc) can
++  # take it without pulling anything else in.
++  visibility = [ "*" ]
++  sources = [
++    "qaudion_tuning.cc",
++    "qaudion_tuning.h",
++  ]
++}
++
+ rtc_library("rate_limiter") {
+   sources = [
+     "rate_limiter.cc",
+diff --git a/rtc_base/qaudion_tuning.cc b/rtc_base/qaudion_tuning.cc
+new file mode 100644
+index 0000000..2016019
+--- /dev/null
++++ b/rtc_base/qaudion_tuning.cc
+@@ -0,0 +1,157 @@
++/*
++ *  Q-Audion runtime tuning API (M150 hardening, patch P8). See the header
++ *  for the contract; this file is the whole implementation.
++ */
++#include "rtc_base/qaudion_tuning.h"
++
++#include <atomic>
++#include <cstdint>
++#include <string>
++
++namespace webrtc::qaudion {
++
++namespace {
++
++// -1 = no override (encoder) / use kQaudionDefaultDecoderComplexity
++// (decoder). Deliberately not zero-initialized to a real complexity value,
++// so "nobody called the setter yet" is never confused with "the app asked
++// for complexity 0".
++std::atomic<int> g_enc_complexity{-1};
++std::atomic<int> g_dec_complexity{-1};
++std::atomic<int> g_min_loss_percent{10};
++#if !QAUDION_TRANSPORT_STRICT
++// Strict builds hard-wire level 3 and never read or write this.
++std::atomic<int> g_transport_level{0};
++#endif
++std::atomic<bool> g_require_pqc{false};
++std::atomic<bool> g_magic_bypass_disabled{false};
++std::atomic<uint32_t> g_generation{0};
++
++void Bump() {
++  g_generation.fetch_add(1, std::memory_order_release);
++}
++
++}  // namespace
++
++void SetOpusEncoderComplexity(int complexity) {
++  if (complexity < -1 || complexity > 10) {
++    return;
++  }
++  if (g_enc_complexity.exchange(complexity, std::memory_order_acq_rel) !=
++      complexity) {
++    Bump();
++  }
++}
++
++int OpusEncoderComplexity() {
++  return g_enc_complexity.load(std::memory_order_acquire);
++}
++
++void SetOpusDecoderComplexity(int complexity) {
++  if (complexity < -1 || complexity > 10) {
++    return;
++  }
++  if (g_dec_complexity.exchange(complexity, std::memory_order_acq_rel) !=
++      complexity) {
++    Bump();
++  }
++}
++
++int OpusDecoderComplexity() {
++  return g_dec_complexity.load(std::memory_order_acquire);
++}
++
++void SetOpusMinPacketLossPercent(int percent) {
++  if (percent < 0 || percent > 20) {
++    return;
++  }
++  if (g_min_loss_percent.exchange(percent, std::memory_order_acq_rel) !=
++      percent) {
++    Bump();
++  }
++}
++
++int OpusMinPacketLossPercent() {
++  return g_min_loss_percent.load(std::memory_order_acquire);
++}
++
++void SetRequireDtlsPqc() {
++  if (!g_require_pqc.exchange(true, std::memory_order_acq_rel)) {
++    Bump();
++  }
++}
++
++bool RequireDtlsPqc() {
++  return g_require_pqc.load(std::memory_order_acquire);
++}
++
++void RaiseTransportLevel(int level) {
++#if !QAUDION_TRANSPORT_STRICT
++  if (level < 0 || level > 3) {
++    return;
++  }
++  int current = g_transport_level.load(std::memory_order_acquire);
++  while (level > current) {
++    if (g_transport_level.compare_exchange_weak(
++            current, level, std::memory_order_acq_rel,
++            std::memory_order_acquire)) {
++      Bump();
++      return;
++    }
++    // compare_exchange_weak refreshed `current` on failure; loop re-checks
++    // `level > current` in case another thread already raised it past us.
++  }
++#else
++  // Strict (1:1) builds are always at the maximum level; nothing to raise.
++  (void)level;
++#endif
++}
++
++int TransportLevel() {
++#if QAUDION_TRANSPORT_STRICT
++  return 3;
++#else
++  return g_transport_level.load(std::memory_order_acquire);
++#endif
++}
++
++void DisableMagicBytesBypass() {
++  if (!g_magic_bypass_disabled.exchange(true, std::memory_order_acq_rel)) {
++    Bump();
++  }
++}
++
++bool MagicBytesBypassAllowed() {
++#if QAUDION_TRANSPORT_STRICT
++  return false;
++#else
++  return !g_magic_bypass_disabled.load(std::memory_order_acquire);
++#endif
++}
++
++uint32_t TuningGeneration() {
++  return g_generation.load(std::memory_order_acquire);
++}
++
++std::string BuildInfo() {
++  // One contiguous literal per variant: the M150 binary gate G2
++  // (m150/gates.sh) greps the shipped .so / Mach-O slices for exactly
++  // "transport=strict" (plain) or "transport=switchable" (LiveKit), so the
++  // marker must never be split across two string literals.
++#if QAUDION_TRANSPORT_STRICT
++  std::string info = "Q-AUDION build m150 transport=strict";
++#else
++  std::string info = "Q-AUDION build m150 transport=switchable";
++#endif
++  info += " level=" + std::to_string(TransportLevel());
++  info += " pqc_required=" + std::string(RequireDtlsPqc() ? "1" : "0");
++  info +=
++      " magic_bypass_disabled=" +
++      std::string(MagicBytesBypassAllowed() ? "0" : "1");
++  info += " enc_cx=" + std::to_string(OpusEncoderComplexity());
++  info += " dec_cx=" + std::to_string(OpusDecoderComplexity());
++  info += " min_loss_pct=" + std::to_string(OpusMinPacketLossPercent());
++  return info;
++}
++
++}  // namespace webrtc::qaudion
+diff --git a/rtc_base/qaudion_tuning.h b/rtc_base/qaudion_tuning.h
+new file mode 100644
+index 0000000..72f0d94
+--- /dev/null
++++ b/rtc_base/qaudion_tuning.h
+@@ -0,0 +1,119 @@
++/*
++ *  Q-Audion runtime tuning API (M150 hardening, patch P8).
++ *
++ *  Process-wide knobs the app can adjust per call, without a rebuild and
++ *  without registering any custom field trial. Every setter here validates
++ *  and (where the valid domain is a plain range) clamps its input before
++ *  storing it, so no value coming from the app - or from anything the app
++ *  itself derived from the network, such as a remote flag or an SDP
++ *  attribute - can reach an RTC_CHECK or an out-of-range libopus/BoringSSL
++ *  call. All state is a small set of std::atomic<> variables: every
++ *  function here is lock-free and safe to call from any thread, including
++ *  concurrently with itself.
++ *
++ *  QAUDION_TRANSPORT_STRICT (from webrtc.gni's rtc_qaudion_transport_strict,
++ *  wired into //:common_config - one of every rtc_library/rtc_source_set/
++ *  etc. target's own default configs, see BUILD.gn - so every translation
++ *  unit in the binary agrees on the same value) tells the "fixed" plain
++ *  builds (1:1 calls, org.webrtc / RTCPeerConnectionFactory) from the
++ *  "switchable" LiveKit-prefixed builds (group calls, an SFU in the
++ *  middle):
++ *    - QAUDION_TRANSPORT_STRICT=1 (plain): TransportLevel() is pinned to 3
++ *      and MagicBytesBypassAllowed() is pinned to false. RaiseTransportLevel
++ *      is a no-op. The app cannot loosen anything.
++ *    - QAUDION_TRANSPORT_STRICT=0 (LiveKit): everything starts at today's
++ *      upstream behavior (level 0, bypass allowed) and the app can only
++ *      tighten it at runtime via the setters below, for the life of the
++ *      process. There is no setter that lowers a level or re-enables the
++ *      bypass once disabled.
++ */
++#ifndef RTC_BASE_QAUDION_TUNING_H_
++#define RTC_BASE_QAUDION_TUNING_H_
++
++#if !defined(QAUDION_TRANSPORT_STRICT)
++#error \
++    "QAUDION_TRANSPORT_STRICT must come from //:common_config (see rtc_qaudion_transport_strict in webrtc.gni and BUILD.gn)"
++#endif
++
++#include <cstdint>
++#include <string>
++
++namespace webrtc::qaudion {
++
++// Effective decoder complexity used whenever the app has not called
++// SetOpusDecoderComplexity() (i.e. it is still -1). 7 is >= 5 (deep PLC,
++// opus_decoder.c) and >= 7 (OSCE NoLACE, when P4a compiles OSCE in); the
++// integrator may retune this constant from the OSCE quality measurement
++// mentioned in the M150 plan.
++inline constexpr int kQaudionDefaultDecoderComplexity = 7;
++
++// ---------------------------------------------------------------------------
++// Opus encoder complexity: per call, mid-call changes allowed.
++// -1 (the default) means "no override, use the caller's own bitrate-based
++// table"; 0..10 is a direct override. Any other value is ignored (the
++// previous value, valid or -1, is kept) - never RTC_CHECKed.
++void SetOpusEncoderComplexity(int complexity);
++int OpusEncoderComplexity();
++
++// ---------------------------------------------------------------------------
++// Opus decoder complexity (finding #15): per call, clamped 0..10; only 5, 6
++// and 7 currently change behavior at this Opus revision (deep PLC / OSCE
++// LACE / OSCE NoLACE - see opus_decoder.c's OPUS_SET_COMPLEXITY handling).
++// -1 (the default) means "use kQaudionDefaultDecoderComplexity". The value
++// is read and applied from the decode call path only (see P4b's
++// WebRtcOpus_Decode), so it is never applied concurrently with the
++// opus_decode() call it precedes for the same decoder instance.
++void SetOpusDecoderComplexity(int complexity);
++int OpusDecoderComplexity();
++
++// ---------------------------------------------------------------------------
++// FEC / packet-loss floor, percent, clamped 0..20. Default 10 (see finding
++// requiring FEC floor parity with the plan's D8/D9 decision). This is the
++// runtime equivalent of a WebRTC-Audio-OpusMinPacketLossRate trial value,
++// expressed as a plain setter so it can also change mid-call.
++void SetOpusMinPacketLossPercent(int percent);
++int OpusMinPacketLossPercent();
++
++// ---------------------------------------------------------------------------
++// Require the DTLS handshake to have negotiated the X25519MLKEM768 hybrid
++// group (checked by the crypto author's P7). Tighten-only for the life of
++// the process: there is no way to turn this back off short of restarting.
++void SetRequireDtlsPqc();
++bool RequireDtlsPqc();
++
++// ---------------------------------------------------------------------------
++// Transport hardening level, 0..3 (see the M150 plan's P7 table). Raise-only
++// and a no-op in QAUDION_TRANSPORT_STRICT builds, where TransportLevel()
++// always reads back 3 regardless of what is passed here. Used by the
++// LiveKit-prefixed ("switchable") variants only.
++void RaiseTransportLevel(int level);
++int TransportLevel();
++
++// ---------------------------------------------------------------------------
++// Finding #13: FrameCryptor's `uncrypted_magic_bytes` bypass lets a frame
++// that merely *ends* with a configured magic value through unauthenticated,
++// which would let an SFU inject media. Once DisableMagicBytesBypass() is
++// called, MagicBytesBypassAllowed() stays false for the life of the process
++// (tighten-only). In QAUDION_TRANSPORT_STRICT builds the bypass is always
++// reported not-allowed, independent of whether this setter was ever called.
++void DisableMagicBytesBypass();
++bool MagicBytesBypassAllowed();
++
++// ---------------------------------------------------------------------------
++// Bumped once for every setter call above that actually changed a stored
++// value (a call that is out of range, or that repeats the current value, or
++// that tries to loosen a tighten-only knob, does not bump it). Consumers
++// that must react to a change - the Opus encoder/decoder complexity and FEC
++// floor - poll this once per call/frame instead of taking a lock or being
++// pushed a callback.
++uint32_t TuningGeneration();
++
++// Ids and small integers only - never a key, secret, salt, password, host,
++// IP or any call/device/user identifier (see the M150 hard rule on the
++// public repo and on RTC_LOG of key material). Safe to log or place in
++// telemetry as-is.
++std::string BuildInfo();
++
++}  // namespace webrtc::qaudion
++
++#endif  // RTC_BASE_QAUDION_TUNING_H_
+diff --git a/sdk/BUILD.gn b/sdk/BUILD.gn
+index fa34e12..840e7ef 100644
+--- a/sdk/BUILD.gn
++++ b/sdk/BUILD.gn
+@@ -1296,6 +1296,7 @@ if (is_ios || is_mac) {
+         "../rtc_base:event_tracer",
+         "../rtc_base:logging",
+         "../rtc_base:network_constants",
++        "../rtc_base:qaudion_tuning",
+         "../rtc_base:rtc_certificate_generator",
+         "../rtc_base:safe_conversions",
+         "../rtc_base:ssl",
+diff --git a/sdk/android/BUILD.gn b/sdk/android/BUILD.gn
+index 05210e6..64d098f 100644
+--- a/sdk/android/BUILD.gn
++++ b/sdk/android/BUILD.gn
+@@ -928,6 +928,7 @@ if (current_os == "linux" || is_android) {
+       "../../rtc_base:log_sinks",
+       "../../rtc_base:logging",
+       "../../rtc_base:network_constants",
++      "../../rtc_base:qaudion_tuning",
+       "../../rtc_base:refcount",
+       "../../rtc_base:rtc_certificate_generator",
+       "../../rtc_base:safe_conversions",
+diff --git a/sdk/android/api/org/webrtc/PeerConnectionFactory.java b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+index 8cfa52b..5092bb2 100644
+--- a/sdk/android/api/org/webrtc/PeerConnectionFactory.java
++++ b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+@@ -671,4 +671,63 @@ public class PeerConnectionFactory {
+       long factory, MediaStreamTrack.MediaType mediaType);
+   private static native RtpCapabilities nativeGetRtpReceiverCapabilities(
+       long factory, MediaStreamTrack.MediaType mediaType);
++
++  // Q-Audion (M150 hardening, P8): process-wide runtime tuning. These apply to every live and
++  // future PeerConnection of this process; call them before creating a call's PeerConnection
++  // (and, for the two complexity setters, again mid-call if conditions change - e.g. a thermal
++  // throttling callback). None of them can fail: an out-of-range value is ignored and the
++  // previous value (or the build default) stays in effect.
++
++  /** Opus encoder complexity for every send stream, 0..10, or -1 for the build default. */
++  public static void setQaudionOpusEncoderComplexity(int complexity) {
++    nativeSetQaudionOpusEncoderComplexity(complexity);
++  }
++
++  /**
++   * Opus decoder complexity for every receive stream, 0..10, or -1 for the build default
++   * (kQaudionDefaultDecoderComplexity). Only 5 (deep PLC), 6 (OSCE LACE) and 7 (OSCE NoLACE)
++   * currently change behavior.
++   */
++  public static void setQaudionOpusDecoderComplexity(int complexity) {
++    nativeSetQaudionOpusDecoderComplexity(complexity);
++  }
++
++  /** Floor (0..20%) of the loss hint given to Opus, i.e. minimum in-band FEC. Build default 10. */
++  public static void setQaudionOpusMinPacketLossPercent(int percent) {
++    nativeSetQaudionOpusMinPacketLossPercent(percent);
++  }
++
++  /** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
++  public static void setQaudionRequireDtlsPqc() {
++    nativeSetQaudionRequireDtlsPqc();
++  }
++
++  /**
++   * Transport hardening level, 0..3 (switchable/LiveKit builds only; strict/plain builds are
++   * always at 3). Raise-only: a level lower than the current one is ignored.
++   */
++  public static void raiseQaudionTransportLevel(int level) {
++    nativeRaiseQaudionTransportLevel(level);
++  }
++
++  /**
++   * From now on, reject FrameCryptor's unauthenticated `uncrypted_magic_bytes` bypass (finding
++   * #13). Tighten-only; a no-op (always already disabled) on strict/plain builds.
++   */
++  public static void setQaudionDisableMagicBytesBypass() {
++    nativeSetQaudionDisableMagicBytesBypass();
++  }
++
++  /** Ids-only build description (no keys/secrets/hosts/user data) for telemetry. */
++  public static String getQaudionBuildInfo() {
++    return nativeGetQaudionBuildInfo();
++  }
++
++  private static native void nativeSetQaudionOpusEncoderComplexity(int complexity);
++  private static native void nativeSetQaudionOpusDecoderComplexity(int complexity);
++  private static native void nativeSetQaudionOpusMinPacketLossPercent(int percent);
++  private static native void nativeSetQaudionRequireDtlsPqc();
++  private static native void nativeRaiseQaudionTransportLevel(int level);
++  private static native void nativeSetQaudionDisableMagicBytesBypass();
++  private static native String nativeGetQaudionBuildInfo();
+ }
+diff --git a/sdk/android/src/jni/pc/peer_connection_factory.cc b/sdk/android/src/jni/pc/peer_connection_factory.cc
+index 13256cf..2c279f6 100644
+--- a/sdk/android/src/jni/pc/peer_connection_factory.cc
++++ b/sdk/android/src/jni/pc/peer_connection_factory.cc
+@@ -48,6 +48,7 @@
+ #include "rtc_base/event_tracer.h"
+ #include "rtc_base/logging.h"
+ #include "rtc_base/physical_socket_server.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/rtc_certificate.h"
+ #include "rtc_base/rtc_certificate_generator.h"
+ #include "rtc_base/socket_factory.h"
+@@ -225,6 +226,52 @@ static void JNI_PeerConnectionFactory_InitializeFieldTrials(
+   DeprecatedGlobalFieldTrials::Set(field_trials_init_string->c_str());
+ }
+ 
++// Q-Audion (M150 hardening, P8): thin bridges into rtc_base/qaudion_tuning.h.
++// Every one of these is a process-wide, lock-free, side-effect-only call
++// that cannot throw and cannot fail: an out-of-range `jint` is silently
++// ignored by the webrtc::qaudion setter, never RTC_CHECKed. Also compiled,
++// with the same symbol names, into the LiveKit-prefixed variant (the JNI
++// class-name prefixing the build pipeline applies afterwards renames the
++// generated `Java_..._PeerConnectionFactory_*` entry points, not these
++// `JNI_PeerConnectionFactory_*` definitions).
++static void JNI_PeerConnectionFactory_SetQaudionOpusEncoderComplexity(
++    JNIEnv* jni,
++    jint complexity) {
++  qaudion::SetOpusEncoderComplexity(complexity);
++}
++
++static void JNI_PeerConnectionFactory_SetQaudionOpusDecoderComplexity(
++    JNIEnv* jni,
++    jint complexity) {
++  qaudion::SetOpusDecoderComplexity(complexity);
++}
++
++static void JNI_PeerConnectionFactory_SetQaudionOpusMinPacketLossPercent(
++    JNIEnv* jni,
++    jint percent) {
++  qaudion::SetOpusMinPacketLossPercent(percent);
++}
++
++static void JNI_PeerConnectionFactory_SetQaudionRequireDtlsPqc(JNIEnv* jni) {
++  qaudion::SetRequireDtlsPqc();
++}
++
++static void JNI_PeerConnectionFactory_RaiseQaudionTransportLevel(
++    JNIEnv* jni,
++    jint level) {
++  qaudion::RaiseTransportLevel(level);
++}
++
++static void JNI_PeerConnectionFactory_SetQaudionDisableMagicBytesBypass(
++    JNIEnv* jni) {
++  qaudion::DisableMagicBytesBypass();
++}
++
++static jni_zero::ScopedJavaLocalRef<jstring>
++JNI_PeerConnectionFactory_GetQaudionBuildInfo(JNIEnv* jni) {
++  return NativeToJavaString(jni, qaudion::BuildInfo());
++}
++
+ static void JNI_PeerConnectionFactory_InitializeInternalTracer(JNIEnv* jni) {
+   Environment env = CreateEnvironment();
+   tracing::SetupInternalTracer(env);
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+index 8deef17..ab9cccf 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+@@ -154,6 +154,44 @@ RTC_OBJC_EXPORT
+ /* Stop an active AecDump recording */
+ - (void)stopAecDump;
+ 
++// Q-Audion (M150 hardening, P8): process-wide runtime tuning, in effect for every live and
++// future RTCPeerConnection of this process. Call the two complexity setters again mid-call if
++// conditions change (e.g. ProcessInfo.thermalStateDidChangeNotification). None of these can
++// fail: an out-of-range value is ignored and the previous value (or the build default) stays in
++// effect. In the LiveKitWebRTC variant this whole interface is exposed as `LKRTCPeerConnectionFactory`
++// via RTC_OBJC_TYPE, unchanged.
++
++/** Opus encoder complexity for every send stream, 0..10, or -1 for the build default. */
+++ (void)setQaudionOpusEncoderComplexity:(NSInteger)complexity;
++
++/**
++ * Opus decoder complexity for every receive stream, 0..10, or -1 for the build default
++ * (kQaudionDefaultDecoderComplexity). Only 5 (deep PLC), 6 (OSCE LACE) and 7 (OSCE NoLACE)
++ * currently change behavior.
++ */
+++ (void)setQaudionOpusDecoderComplexity:(NSInteger)complexity;
++
++/** Floor (0..20%) of the loss hint given to Opus, i.e. minimum in-band FEC. Build default 10. */
+++ (void)setQaudionOpusMinPacketLossPercent:(NSInteger)percent;
++
++/** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
+++ (void)setQaudionRequireDtlsPqc;
++
++/**
++ * Transport hardening level, 0..3 (switchable/LiveKit builds only; strict/plain builds are
++ * always at 3). Raise-only: a level lower than the current one is ignored.
++ */
+++ (void)raiseQaudionTransportLevel:(NSInteger)level;
++
++/**
++ * From now on, reject FrameCryptor's unauthenticated `uncrypted_magic_bytes` bypass (finding
++ * #13). Tighten-only; a no-op (always already disabled) on strict/plain builds.
++ */
+++ (void)setQaudionDisableMagicBytesBypass;
++
++/** Ids-only build description (no keys/secrets/hosts/user data) for telemetry. */
+++ (NSString *)qaudionBuildInfo;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+index 3a737ba..251418d 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+@@ -35,6 +35,7 @@
+ #import "base/RTCVideoEncoderFactory.h"
+ #import "helpers/NSString+StdString.h"
+ #include "rtc_base/checks.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "sdk/objc/native/api/network_monitor_factory.h"
+ #include "sdk/objc/native/api/ssl_certificate_verifier.h"
+ 
+@@ -547,6 +548,50 @@ static webrtc::Environment CreateDefaultEnvironment() {
+   gFieldTrials = [fieldTrials copy];
+ }
+ 
++// Q-Audion (M150 hardening, P8): thin bridges into rtc_base/qaudion_tuning.h. NSInteger is a
++// 64-bit `long` on arm64, so every value crossing into the 32-bit `int` the C++ API takes is
++// clamped here first (finding #14) - narrowing an out-of-range NSInteger without clamping would
++// truncate instead of falling into webrtc::qaudion's own range check. The -1 "build default"
++// sentinel is part of the encoder/decoder complexity setters' valid domain, so the clamp range
++// for those two is [-1, 10], not [0, 10].
++static int QaudionClampNSInteger(NSInteger value, NSInteger lo, NSInteger hi) {
++  if (value < lo) {
++    return static_cast<int>(lo);
++  }
++  if (value > hi) {
++    return static_cast<int>(hi);
++  }
++  return static_cast<int>(value);
++}
++
+++ (void)setQaudionOpusEncoderComplexity:(NSInteger)complexity {
++  webrtc::qaudion::SetOpusEncoderComplexity(QaudionClampNSInteger(complexity, -1, 10));
++}
++
+++ (void)setQaudionOpusDecoderComplexity:(NSInteger)complexity {
++  webrtc::qaudion::SetOpusDecoderComplexity(QaudionClampNSInteger(complexity, -1, 10));
++}
++
+++ (void)setQaudionOpusMinPacketLossPercent:(NSInteger)percent {
++  webrtc::qaudion::SetOpusMinPacketLossPercent(QaudionClampNSInteger(percent, 0, 20));
++}
++
+++ (void)setQaudionRequireDtlsPqc {
++  webrtc::qaudion::SetRequireDtlsPqc();
++}
++
+++ (void)raiseQaudionTransportLevel:(NSInteger)level {
++  webrtc::qaudion::RaiseTransportLevel(QaudionClampNSInteger(level, 0, 3));
++}
++
+++ (void)setQaudionDisableMagicBytesBypass {
++  webrtc::qaudion::DisableMagicBytesBypass();
++}
++
+++ (NSString *)qaudionBuildInfo {
++  return [NSString stringForStdString:webrtc::qaudion::BuildInfo()];
++}
++
+ - (webrtc::Thread *)signalingThread {
+   return _signalingThread.get();
+ }
+diff --git a/webrtc.gni b/webrtc.gni
+index 0d2db4d..bf539b2 100644
+--- a/webrtc.gni
++++ b/webrtc.gni
+@@ -315,6 +315,15 @@ declare_args() {
+ 
+   # Enables PSNR calculation for video getStats.
+   rtc_video_psnr = true
++
++  # Q-Audion (M150 hardening, P8): true builds the "plain" 1:1-call variant,
++  # where P6 (SRTP) and P7 (DTLS) are fixed to AES-256-only/PQC/DTLS-1.3 and
++  # cannot be loosened at runtime. false builds the LiveKit-prefixed variant:
++  # the same P6/P7 code is compiled in but starts at today's upstream
++  # behavior and the app can only tighten it at runtime through
++  # rtc_base/qaudion_tuning.h. The default is the safe (fixed) one, so a
++  # build that forgets to set this explicitly comes out strict, not loose.
++  rtc_qaudion_transport_strict = true
+ }
+ 
+ declare_args() {

@@ -1,0 +1,77 @@
+Report every video decrypt failure to the observer, rate-limited, independent
+of failure_tolerance.
+
+FrameCryptorTransformer::decryptFrame() only ever notifies the observer of a
+decryption failure through ParticipantKeyHandler::DecryptionFailure(), which
+is a hard no-op (returns false unconditionally, notifying nothing) whenever
+KeyProviderOptions.failure_tolerance is left at its default of -1. Raising
+failure_tolerance app-side is not a fix: past the threshold the handler marks
+itself invalid and freezes the receiver until a full rekey, which is worse
+than today's silence. The practical effect on the Android E2EE video path:
+a plain AES-GCM tag mismatch (the common case after a storm-induced epoch
+skew, or a frame decoded against a just-retired key slot) produced ZERO
+signal - no observer callback, nothing an app-level keyframe-request policy
+could react to - until a generic multi-second wire-level watchdog eventually
+noticed frames had stopped rendering.
+
+This adds a second, unconditional notification path at the same call site:
+a decrypt failure now always posts FrameCryptionState::kDecryptionFailed to
+the observer, rate-limited to at most once per 250ms per transformer via a
+lock-free atomic timestamp CAS (decryptFrame() does not hold the transformer
+mutex_ at this call site, and a relaxed compare_exchange is exactly the
+"try to become the one notifier this window" pattern this needs - losing the
+race just means a concurrent decrypt already claimed the window). It never
+reads or writes has_valid_key_/decryption_failure_count_, so every existing
+failure_tolerance/ratchet-freeze semantics for callers that DO set a positive
+tolerance are byte-for-byte unchanged; the two notification paths below now
+simply coexist, and observers already dedupe on their own (e.g.
+CallController's WIRE_SPEC keyframe-request path rate-limits to 1/s
+independent of this).
+
+diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
+index 6d01653..a1e5c40 100644
+--- a/api/crypto/frame_crypto_transformer.h
++++ b/api/crypto/frame_crypto_transformer.h
+@@ -17,6 +17,7 @@
+ #ifndef WEBRTC_FRAME_CRYPTOR_TRANSFORMER_H_
+ #define WEBRTC_FRAME_CRYPTOR_TRANSFORMER_H_
+ 
++#include <atomic>
+ #include <unordered_map>
+ 
+ #include "api/frame_transformer_interface.h"
+@@ -490,6 +491,11 @@
+   webrtc::scoped_refptr<FrameCryptorTransformerObserver> observer_;
+   FrameCryptionState last_enc_error_ = FrameCryptionState::kNew;
+   FrameCryptionState last_dec_error_ = FrameCryptionState::kNew;
++  // W-NATIVEPLI (2026-08-25): last time an UNCONDITIONAL decrypt-failure
++  // notification fired (see decryptFrame()'s doc in the .cc). Deliberately
++  // separate from last_dec_error_ above, which the pre-existing
++  // failure_tolerance-gated path still owns unchanged.
++  std::atomic<int64_t> last_decrypt_fail_notify_ms_{0};
+ };
+ 
+ class RTC_EXPORT EncryptedPacket : public webrtc::RefCountInterface {
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index 1111111..2222222 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -767,6 +767,18 @@
+   }
+ 
+   if (!decryption_success) {
++    // W-NATIVEPLI (2026-08-25) -- see this patch's top-level doc. Fires
++    // regardless of failure_tolerance/DecryptionFailure() below; never
++    // touches has_valid_key_/decryption_failure_count_.
++    constexpr int64_t kDecryptFailNotifyMinIntervalMs = 250;
++    int64_t now_ms = webrtc::TimeMillis();
++    int64_t last =
++        last_decrypt_fail_notify_ms_.load(std::memory_order_relaxed);
++    if (now_ms - last >= kDecryptFailNotifyMinIntervalMs &&
++        last_decrypt_fail_notify_ms_.compare_exchange_strong(
++            last, now_ms, std::memory_order_relaxed)) {
++      onFrameCryptionStateChanged(FrameCryptionState::kDecryptionFailed);
++    }
+     if (key_handler->DecryptionFailure()) {
+       if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
+         last_dec_error_ = FrameCryptionState::kDecryptionFailed;

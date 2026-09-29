@@ -1,0 +1,233 @@
+third_party/opus/BUILD.gn: compile in deep PLC (FARGAN/LPCNet-lite) and
+OSCE (LACE/NoLACE, no BWE), arm64 only.
+
+Chromium's `src/third_party/opus` already vendors every .c/.h file this
+needs (verified against the real, exact revision webrtc's own DEPS pins for
+src/third_party - see "Verified" below); it just never compiles them,
+because Chromium's own use of libopus never asked for deep PLC or SILK
+enhancement. This patch only adds `sources` entries, `include_dirs` and
+`defines`; it does not touch, remove or reorder anything already there.
+
+- `config("opus_config")`: arm64-only self-report defines
+  (QAUDION_OPUS_DEEP_PLC=1, QAUDION_OPUS_OSCE=1) so
+  modules/audio_coding/codecs/opus/audio_decoder_opus.cc (P4b, a different
+  GN target) can log what a given binary actually has compiled in, without
+  duplicating the current_cpu check. This works because opus_config is
+  already `public_configs` on the `opus` target (BUILD.gn:379 at this
+  revision), so its defines propagate to every dependent, including
+  modules/audio_coding:webrtc_opus.
+- `config("opus_private_config")`: adds "src/dnn" to include_dirs (needed
+  by every file below), and - nested inside the *existing* arm64-only
+  `if (current_cpu == "arm64")` block, not a new one, since that is already
+  exactly the scope the owner wants this limited to - `ENABLE_DEEP_PLC` and
+  `ENABLE_OSCE`. Macro names are xiph/opus's own
+  (configure.ac --enable-deep-plc/--enable-osce; CMakeLists.txt's OPUS_OSCE
+  option), stable across releases, not repinned for 55513e81 specifically
+  because that would need re-verifying configure.ac at the exact commit,
+  which I could not fetch (see "Verified").
+- `static_library("opus")`: after the existing arm sources block, adds (all
+  arm64-only):
+  - Deep PLC, xiph/opus's own DEEP_PLC_SOURCES (dnn/burg.c, freq.c,
+    fargan.c, fargan_data.c, lpcnet_enc.c, lpcnet_plc.c, lpcnet_tables.c,
+    nnet.c, nnet_default.c, plc_data.c, parse_lpcnet_weights.c, pitchdnn.c,
+    pitchdnn_data.c) plus dnn/arm/nnet_neon.c (NEON kernels; no runtime
+    dotprod dispatch - single ABI, arm64 only, per the owner's decision).
+  - OSCE, xiph/opus's own OSCE_SOURCES (dnn/osce.c, osce_features.c,
+    nndsp.c, lace_data.c, nolace_data.c) MINUS dnn/bbwenet_data.c: I
+    grepped the actual vendored osce.c/osce_features.c/nndsp.c/
+    osce_config.h/osce_structs.h at this exact revision for "bbwe" and got
+    zero hits - OSCE-BWE (blind bandwidth extension) does not exist yet at
+    opus upstream 55513e81, so there is no bbwenet_* symbol to link and no
+    reason to fetch its weights. This also matches the pinned model tarball
+    (opus-dnn-weights-160753e9, sha256
+    160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58),
+    which I listed directly: it contains fargan/lace/nolace/pitchdnn/plc
+    _data.[ch] and nothing named bbwenet. OSCE-BWE is therefore not "spent
+    but decided against" here, it is simply unavailable at this revision -
+    worth knowing if OSCE-BWE is revisited on a later Opus roll.
+  - The *_data.[ch] files themselves (fargan/plc/pitchdnn/lace/nolace) are
+    not in this vendored tree - m150/fetch-opus-dnn-weights.sh (the
+    pipeline's script) extracts them from the model tarball into
+    third_party/opus/src/dnn before this patch's `sources` list can resolve
+    them; the list above matches exactly what that script's
+    `--wildcards 'dnn/*_data.[ch]'` produces for this tarball, checked
+    against the tarball's own file listing, not the script's intent.
+
+Deliberately not touched: OPUS_ARM_ASM/OPUS_ARM_MAY_HAVE_NEON (P4a's own
+`config("opus_config")` addition is a *different*, non-conflicting set of
+arm64-only defines from those already set in opus_private_config for
+CELT/SILK's own ARM NEON code - no overlap, no override), and nothing in
+`opus_test_config` or the `opus_sse41`/x86 paths, which the owner's "solo
+arm64" decision does not touch.
+
+Order: 5th in the series (m150/series), right after P8 (whose
+qaudion_tuning.h is what P4b/P5 use once this patch's sources exist) and
+before P4b (deep PLC / decoder complexity) and P5 (FEC floor / encoder
+complexity), which both depend on QAUDION_OPUS_DEEP_PLC/QAUDION_OPUS_OSCE
+being defined correctly here to produce a meaningful self-verification log.
+Applies inside the *separate* src/third_party checkout
+(`git -C src/third_party apply`), dir `third_party` in m150/series - this
+is the only patch in the series that does.
+
+Touches: third_party/opus/BUILD.gn only (path `opus/BUILD.gn` relative to
+src/third_party).
+
+Verified: unlike P8/P4b/P5, I could not reach chromium.googlesource.com
+directly from this sandbox for most of this session (persistent 503s on
+every subdomain, including from the owner's own build VPS, so this
+looks like an upstream outage rather than a local restriction) - `git
+apply --check`/symbol-checking this patch therefore first went through
+guesswork based on the plan's own Appendix A. I then found that the VPS
+*can* reach chromium.googlesource.com's git-over-HTTP endpoint even though
+its web/gitiles browsing endpoint (the one `?format=TEXT` URLs use) 503s,
+and used `git fetch --filter=blob:none --depth 1` + a sparse checkout of
+`opus/` from `https://chromium.googlesource.com/chromium/src/third_party`
+at `7c92732938de0ef7e28f5da231994723f938f407` - the exact commit
+webrtc-sdk/webrtc's own DEPS pins for `src/third_party` at
+ba469aa2093ba950066258ca0a59a6fbd1295582 (DEPS line 88-89, read from the
+GitHub mirror). That gave me the real, current third_party/opus/BUILD.gn
+(sha256 152fdf2929b24444643c9bc91471ecd6b927792c63df8c770c9d3aa5cb0e1c62)
+and README.chromium (confirms "Revision: 55513e81d8f606bd75d0ff773d2144e
+5f2a732f5", i.e. the opus upstream commit the plan's "55513e81" refers to),
+and a full `git ls-tree` of third_party/opus/src/dnn confirming every
+source file this patch references exists there already (and that no
+*_data.[ch] or bbwenet file of any kind does). `git apply --check` and a
+real apply of the diff above are clean against that exact file, and the
+resulting file is byte-identical (modulo CRLF from a Windows git checkout)
+to the one I hand-edited. The plan's own line-number references for this
+file (arm block ending ~:107, arm sources block ending ~:410-435) matched
+what I found almost exactly, which is a good sign the plan's original
+research (done with real access before that scratch dir was deleted) was
+accurate here too.
+
+Not verified: `clang -fsyntax-only` on the newly-referenced dnn/*.c files
+themselves (P4a only changes BUILD.gn, not any .c/.h content, so this is a
+build-graph change, not a source change - the actual compile would need
+the *_data.[ch] weight files the pipeline extracts, which I have locally
+from the same tarball but did not attempt to cross-compile against). I did
+grep the three logic files' own #includes (osce.c, osce_features.c,
+nndsp.c all just want arch.h/config.h/float_cast.h/os_support.h/pitch.h/
+stack_alloc.h from src/celt - already in include_dirs - and freq.h/nndsp.h/
+nnet.h/osce.h/osce_features.h from src/dnn, which this patch adds to
+include_dirs) so nothing in the sources list should be missing an include
+path.
+
+Security review, stage 3: added DISABLE_DEBUG_FLOAT next to
+ENABLE_DEEP_PLC/ENABLE_OSCE. All three upstream build systems define it by
+default (configure.ac, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG=OFF, meson
+dnn-debug-float=disabled); without it every *_data.c also compiles a float
+copy of each int8 weight matrix and nnet.c runs the float "debug" path:
+~12.2 MB of weights instead of ~3.0 MB (counted on the pinned tarball),
+which alone would break the G7 size gate (1-6 MB growth) and is not the
+configuration the OSCE/deep-PLC operating point was measured with.
+
+diff --git a/opus/BUILD.gn b/opus/BUILD.gn
+index 1b75504..a19d58a 100644
+--- a/opus/BUILD.gn
++++ b/opus/BUILD.gn
+@@ -12,6 +12,19 @@ use_opus_x86_optimization = current_cpu == "x86" || current_cpu == "x64"
+ 
+ config("opus_config") {
+   include_dirs = [ "src/include" ]
++
++  # Q-Audion (M150 hardening, P4a): arm64-only, self-report defines so
++  # dependents outside this target (webrtc's
++  # modules/audio_coding/codecs/opus/audio_decoder_opus.cc, P4b) can log
++  # what this specific binary was actually built with, without duplicating
++  # the current_cpu check. Safe to read from a dependent because this
++  # config is `public_configs` below.
++  if (current_cpu == "arm64") {
++    defines = [
++      "QAUDION_OPUS_DEEP_PLC=1",
++      "QAUDION_OPUS_OSCE=1",
++    ]
++  }
+ }
+ 
+ config("opus_private_config") {
+@@ -32,6 +45,7 @@ config("opus_private_config") {
+     "src/silk",
+     "src/silk/fixed",
+     "src/silk/float",
++    "src/dnn",
+   ]
+ 
+   cflags = []
+@@ -103,6 +117,36 @@ config("opus_private_config") {
+ 
+     if (current_cpu == "arm64") {
+       defines += [ "OPUS_ARM_PRESUME_AARCH64_NEON_INTR" ]
++
++      # Q-Audion (M150 hardening, P4a): deep PLC (FARGAN + the LPCNet-lite
++      # pieces it needs) and OSCE (LACE/NoLACE only - no OSCE_BWE; osce.c /
++      # osce_features.c at this exact revision (opus upstream 55513e81,
++      # per third_party/opus/README.chromium) have no bbwenet_* symbol at
++      # all - grepped the actual vendored files, not assumed - so nothing
++      # here needs dnn/bbwenet_data.c, which the pinned model tarball
++      # (opus-dnn-weights-160753e9, sha256
++      # 160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58)
++      # does not contain anyway). Nested in the existing arm64-only branch,
++      # not a new if-block, because that is already exactly the scope the
++      # owner wants this in (solo arm64: Android arm64-v8a, iOS device +
++      # simulator arm64). Macro names are xiph/opus's own
++      # (configure.ac: --enable-deep-plc/--enable-osce; CMakeLists.txt:
++      # OPUS_OSCE) and stable across releases.
++      #
++      # DISABLE_DEBUG_FLOAT (security review, stage 3): every upstream build
++      # system defines it by default (configure.ac --enable-dnn-debug-float
++      # defaults to no, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG defaults to OFF,
++      # meson dnn-debug-float defaults to disabled). Without it the *_data.c
++      # files also compile a float copy of every int8 weight matrix and
++      # nnet.c then runs the "debug" float path: ~12.2 MB of weights instead
++      # of ~3.0 MB (measured on the pinned model tarball) and a slower,
++      # non-default inference path than the one the OSCE/deep-PLC operating
++      # point was measured with.
++      defines += [
++        "ENABLE_DEEP_PLC",
++        "ENABLE_OSCE",
++        "DISABLE_DEBUG_FLOAT",
++      ]
+     }
+   }
+ }
+@@ -432,6 +476,40 @@ static_library("opus") {
+       "src/silk/arm/macros_armv5e.h",
+     ]
+   }
++
++  if (current_cpu == "arm64") {
++    sources += [
++      # Deep PLC: FARGAN + the LPCNet-lite pieces it needs. File list is
++      # xiph/opus's own DEEP_PLC_SOURCES (lpcnet_sources.mk); every file
++      # below is already vendored at this revision (opus upstream
++      # 55513e81), just not referenced by this BUILD.gn yet.
++      "src/dnn/burg.c",
++      "src/dnn/freq.c",
++      "src/dnn/fargan.c",
++      "src/dnn/fargan_data.c",
++      "src/dnn/lpcnet_enc.c",
++      "src/dnn/lpcnet_plc.c",
++      "src/dnn/lpcnet_tables.c",
++      "src/dnn/nnet.c",
++      "src/dnn/nnet_default.c",
++      "src/dnn/plc_data.c",
++      "src/dnn/parse_lpcnet_weights.c",
++      "src/dnn/pitchdnn.c",
++      "src/dnn/pitchdnn_data.c",
++      "src/dnn/arm/nnet_neon.c",
++
++      # OSCE: LACE/NoLACE only, no OSCE_BWE (see opus_private_config above).
++      # File list is xiph/opus's own OSCE_SOURCES (lpcnet_sources.mk) minus
++      # dnn/bbwenet_data.c, which is neither referenced by osce.c /
++      # osce_features.c at this revision nor present in the pinned model
++      # tarball.
++      "src/dnn/osce.c",
++      "src/dnn/osce_features.c",
++      "src/dnn/nndsp.c",
++      "src/dnn/lace_data.c",
++      "src/dnn/nolace_data.c",
++    ]
++  }
+ }
+ 
+ executable("opus_compare") {

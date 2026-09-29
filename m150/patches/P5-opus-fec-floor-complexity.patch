@@ -1,0 +1,282 @@
+Opus encoder: FEC packet-loss floor (default 10%, runtime 0..20%) and
+runtime per-call complexity with mid-call change (finding #14), without
+touching the fixed 60 ms / 32 kbps CBR config.
+
+- `audio_encoder_opus.cc`/`.h`: new file-local `QaudionMinLossFraction()`
+  reads `webrtc::qaudion::OpusMinPacketLossPercent()` (P8; default 10,
+  clamped 0..20) and clamps it to the existing `kMaxPacketLossFraction`
+  (20%) ceiling. `packet_loss_rate_` - which used to start at a hardcoded
+  0.0 and only ever rise once `OnReceivedUplinkPacketLossFraction` got a
+  real, smoothed RTCP sample - now starts at this floor, so in-band FEC
+  (LBRR) can protect the very first packets of a call. `SetTargetBitrate`'s
+  existing bitrate-hysteresis complexity table
+  (`GetNewComplexity(config_)`) is now skipped whenever
+  `qaudion::OpusEncoderComplexity() >= 0`, so it cannot fight a runtime
+  override from the app. `EncodeImpl` polls
+  `webrtc::qaudion::TuningGeneration()` once per call (a single atomic
+  load, on the encoder's own task queue that already owns `inst_` - no new
+  synchronization) and, only when it changed, re-derives the complexity
+  (override if set, else the same hysteresis table as before) and
+  re-applies the floor on top of whatever the last real loss report was -
+  this is the actual "mid-call change" finding #14 asks for. Emits one
+  "Q-AUDION opus-enc" log line per applied change (not per frame).
+  `api/audio_codecs/opus/audio_encoder_opus_config.h`'s mobile
+  `kDefaultComplexity` moves from 5 to 9 (matching the existing non-mobile
+  default) - this is the fallback `GetNewComplexity` uses when there is no
+  qaudion override and the bitrate is inside the hysteresis window, not the
+  day-to-day value once the app calls `setQaudionOpusEncoderComplexity`
+  itself.
+
+  Bitrate, ptime and CBR are untouched: nothing here writes
+  `config_.bitrate_bps`, `config_.frame_size_ms` or `config_.cbr_enabled`,
+  and `WebRtcOpus_SetBitRate`/`WebRtcOpus_EnableCbr` are not called from any
+  new code path.
+
+- Finding #14, the other half (see P8's header for the ObjC NSInteger-clamp
+  half): `RecreateEncoderInstance()` used to compute `complexity_` from
+  `GetNewComplexity(config_).value_or(config_.complexity)` and only read
+  `qaudion::TuningGeneration()` afterwards (in an earlier, unshipped sketch
+  of this patch) to remember "what generation this complexity_ reflects".
+  Reading the generation *after* the value is the actual bug: a concurrent
+  `qaudion::SetOpusEncoderComplexity()` landing in the gap would bump the
+  generation to a number that already reflects the new value, while
+  `complexity_` was still computed from the old one - so `EncodeImpl`'s
+  generation check on the next frame would find nothing to do, and the
+  update would never be applied until *another* change happened to bump
+  the generation again. This patch reads the generation first, then the
+  value it corresponds to: the only possible race now is one harmless
+  extra re-check on the very next EncodeImpl() call, never a silently lost
+  update.
+
+Order: 7th and last of this author's four patches (m150/series), right
+after P4b; both depend on P8's qaudion_tuning.h and P4a's compiled-in deep
+PLC/OSCE for the self-verification logs to mean anything, though this
+patch's own mechanism (FEC floor, encoder complexity) does not itself
+require P4a.
+
+Touches (dir "."): modules/audio_coding/codecs/opus/audio_encoder_opus.cc,
+modules/audio_coding/codecs/opus/audio_encoder_opus.h,
+api/audio_codecs/opus/audio_encoder_opus_config.h.
+
+Verified: `git apply --check` and a real apply are clean against the
+pinned webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+checkout, on top of P1 + P2 + P3(partial) + P8 + P4b already applied, in
+series order. Every symbol/line this patch touches
+(`kMaxPacketLossFraction`'s value and location, `packet_loss_rate_`'s
+position in the constructor's initializer list, the exact
+`RecreateEncoderInstance`/`SetTargetBitrate`/`EncodeImpl` bodies,
+`kDefaultComplexity`'s `#if defined(WEBRTC_ANDROID) || defined(WEBRTC_IOS)`
+guard) was read from that same pinned checkout, not assumed. Grepped the
+resulting tree for RTC_LOG of key/secret/salt/password (none in the
+touched files) and for new RTC_CHECK: the two `RTC_CHECK_EQ(0,
+WebRtcOpus_SetComplexity(inst_, complexity_))` calls this patch's new code
+paths can reach are both pre-existing lines (unchanged), fed either by the
+pre-existing, already-bounded `GetNewComplexity` table or by
+`qaudion::OpusEncoderComplexity()`, which - like P4b's decoder equivalent -
+can only ever be -1 or a value its own setter already validated into
+0..10.
+
+Not verified: `clang -fsyntax-only` (same reason as P4b: the local machine
+has no toolchain, and setting up enough of the WebRTC header graph on the
+build VPS to syntax-check this file would need close to a full gclient
+sync).
+
+Security review, stage 3: the floor was only a starting value. The
+original SetProjectedPacketLossRate() still clamped to [0, 20 %], so the
+first RTCP report with 0 % loss (the normal case on a clean call) dropped
+packet_loss_rate_ to 0 and turned LBRR off for the rest of the call, and
+EncodeImpl()'s "re-apply the floor" call passed packet_loss_rate_ back to a
+function that only acts on a change (a no-op). SetProjectedPacketLossRate()
+now clamps to [QaudionMinLossFraction(), 20 %] for every reported value
+(RTCP smoother and ANA alike), and EncodeImpl() re-applies it from the last
+real loss estimate (the smoother's average, or packet_loss_rate_ under
+ANA), so a runtime floor change takes effect in both directions.
+
+diff --git a/api/audio_codecs/opus/audio_encoder_opus_config.h b/api/audio_codecs/opus/audio_encoder_opus_config.h
+index 733586c..de4ba24 100644
+--- a/api/audio_codecs/opus/audio_encoder_opus_config.h
++++ b/api/audio_codecs/opus/audio_encoder_opus_config.h
+@@ -29,7 +29,12 @@ struct RTC_EXPORT AudioEncoderOpusConfig {
+   static constexpr int kMinBitrateBps = 6'000;
+   static constexpr int kMaxBitrateBps = 510'000;
+ #if defined(WEBRTC_ANDROID) || defined(WEBRTC_IOS)
+-  static constexpr int kDefaultComplexity = 5;
++  // Q-Audion (M150 hardening, P5): only used when RecreateEncoderInstance()
++  // finds no qaudion::OpusEncoderComplexity() override (P8) and the start
++  // bitrate is within GetNewComplexity()'s hysteresis window - i.e. this is
++  // the fallback for a caller that never calls the app's own tuning setter,
++  // not the day-to-day value once the app is driving complexity itself.
++  static constexpr int kDefaultComplexity = 9;
+ #else
+   static constexpr int kDefaultComplexity = 9;
+ #endif
+diff --git a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
+index 451fe8b..6b58830 100644
+--- a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
++++ b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
+@@ -45,6 +45,7 @@
+ #include "rtc_base/numerics/exp_filter.h"
+ #include "rtc_base/numerics/safe_conversions.h"
+ #include "rtc_base/numerics/safe_minmax.h"
++#include "rtc_base/qaudion_tuning.h"
+ #include "rtc_base/string_encode.h"
+ #include "rtc_base/string_to_number.h"
+ 
+@@ -84,6 +85,29 @@ constexpr std::array kOpusSupportedFrameLengths = {10, 20, 40, 60};
+ constexpr float kAlphaForPacketLossFractionSmoother = 0.9999f;
+ constexpr float kMaxPacketLossFraction = 0.2f;
+ 
++// Q-Audion (M150 hardening, P5): floor under the packet-loss fraction this
++// encoder ever reports to libopus (WebRtcOpus_SetPacketLossRate ->
++// OPUS_SET_PACKET_LOSS_PERC), so in-band FEC (LBRR) has a chance to protect
++// the first packets of a call instead of only kicking in once
++// OnReceivedUplinkPacketLossFraction has a real, RTCP-derived sample
++// (packet_loss_rate_ starts at this floor now, see the constructor below,
++// and the smoother's own initial average is still 0). Default 10%, runtime
++// override 0..20% via qaudion::SetOpusMinPacketLossPercent (P8;
++// PeerConnectionFactory.setQaudionOpusMinPacketLossPercent /
++// RTCPeerConnectionFactory.setQaudionOpusMinPacketLossPercent).
++//
++// Deliberately does not touch bitrate, ptime, or whether FEC is enabled at
++// all: config_.fec_enabled (negotiated purely via the SDP useinbandfec fmtp
++// parameter) still decides whether libopus's FEC machinery runs at all;
++// this only raises the loss percentage libopus is told to plan for once it
++// does. Clamped to kMaxPacketLossFraction so a misconfigured remote flag
++// value can never push the floor above the ceiling
++// SetProjectedPacketLossRate already enforces on every reported fraction.
++float QaudionMinLossFraction() {
++  return std::min(qaudion::OpusMinPacketLossPercent() / 100.0f,
++                   kMaxPacketLossFraction);
++}
++
+ int CalculateDefaultBitrate(int max_playback_rate, size_t num_channels) {
+   const int bitrate = [&] {
+     if (max_playback_rate <= 8000) {
+@@ -387,7 +411,7 @@ AudioEncoderOpusImpl::AudioEncoderOpusImpl(
+           env_.field_trials().IsEnabled("WebRTC-AdjustOpusBandwidth")),
+       bitrate_changed_(true),
+       bitrate_multipliers_(GetBitrateMultipliers(env_.field_trials())),
+-      packet_loss_rate_(0.0),
++      packet_loss_rate_(QaudionMinLossFraction()),
+       inst_(nullptr),
+       packet_loss_fraction_smoother_(
+           std::make_unique<PacketLossFractionSmoother>(
+@@ -587,6 +611,39 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
+     Buffer* encoded) {
+   MaybeUpdateUplinkBandwidth();
+ 
++  // Q-Audion (M150 hardening, P5): pick up a mid-call encoder-complexity or
++  // FEC-floor change from the app (P8, finding #14's "mid-call change")
++  // without waiting for the next bitrate/ANA update. TuningGeneration() is
++  // a single atomic load, so polling it here on the encoder's own task
++  // queue - the same one that owns `inst_`, so this can never race another
++  // WebRtcOpus_SetComplexity() on it - costs nothing when nothing changed.
++  if (const uint32_t qaudion_gen = qaudion::TuningGeneration();
++      qaudion_gen != qaudion_tuning_gen_) {
++    qaudion_tuning_gen_ = qaudion_gen;
++    const int qaudion_complexity = qaudion::OpusEncoderComplexity();
++    const int wanted_complexity =
++        qaudion_complexity >= 0
++            ? qaudion_complexity
++            : GetNewComplexity(config_).value_or(config_.complexity);
++    if (wanted_complexity != complexity_) {
++      complexity_ = wanted_complexity;
++      RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
++    }
++    // Re-applies the (possibly new) floor on top of the last real loss
++    // estimate: the smoothed RTCP loss when this encoder is driven by
++    // OnReceivedUplinkPacketLossFraction (0 before the first report, so the
++    // floor alone applies), or the audio network adaptor's own last value
++    // when ANA is in charge. Passing packet_loss_rate_ itself would be a
++    // no-op (SetProjectedPacketLossRate only acts on a change) and would
++    // never lower the effective rate after the floor is lowered.
++    SetProjectedPacketLossRate(
++        audio_network_adaptor_ ? packet_loss_rate_
++                               : packet_loss_fraction_smoother_->GetAverage());
++    RTC_LOG(LS_WARNING) << "Q-AUDION opus-enc complexity=" << complexity_
++                        << " min_loss_pct="
++                        << qaudion::OpusMinPacketLossPercent();
++  }
++
+   if (input_buffer_.empty())
+     first_timestamp_in_buffer_ = rtp_timestamp;
+ 
+@@ -684,9 +741,23 @@ bool AudioEncoderOpusImpl::RecreateEncoderInstance() {
+   }
+   RTC_CHECK_EQ(
+       0, WebRtcOpus_SetMaxPlaybackRate(inst_, config_.max_playback_rate_hz));
++  // Q-Audion (M150 hardening, P5 / finding #14): capture the tuning
++  // generation BEFORE reading the override it corresponds to, not after.
++  // Reading it after (as an earlier draft of this patch did) would let a
++  // concurrent qaudion::SetOpusEncoderComplexity() land in between: the
++  // generation stored here would then already reflect the new value while
++  // `complexity_` below was still computed from the old one, so
++  // EncodeImpl()'s generation check would find nothing to do and the
++  // update would be silently lost for the rest of the call. Reading it
++  // first means the worst case is one harmless extra re-check on the next
++  // frame, never a lost update.
++  qaudion_tuning_gen_ = qaudion::TuningGeneration();
++  const int qaudion_complexity = qaudion::OpusEncoderComplexity();
+   // Use the default complexity if the start bitrate is within the hysteresis
+-  // window.
+-  complexity_ = GetNewComplexity(config_).value_or(config_.complexity);
++  // window, unless the app has set a runtime override (Q-Audion, P8).
++  complexity_ = qaudion_complexity >= 0
++                    ? qaudion_complexity
++                    : GetNewComplexity(config_).value_or(config_.complexity);
+   RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
+   bitrate_changed_ = true;
+   if (config_.dtx_enabled) {
+@@ -729,7 +800,13 @@ void AudioEncoderOpusImpl::SetNumChannelsToEncode(
+ }
+ 
+ void AudioEncoderOpusImpl::SetProjectedPacketLossRate(float fraction) {
+-  fraction = std::min(std::max(fraction, 0.0f), kMaxPacketLossFraction);
++  // Q-Audion (M150 hardening, P5): the FEC floor must hold for EVERY
++  // reported fraction, not only as the constructor's starting value -
++  // otherwise the first RTCP report with 0 % loss (the common case) drops
++  // packet_loss_rate_ to 0 and in-band FEC (LBRR) turns off for the rest of
++  // a clean call. QaudionMinLossFraction() is already <= the 20 % ceiling.
++  fraction = std::min(std::max(fraction, QaudionMinLossFraction()),
++                      kMaxPacketLossFraction);
+   if (packet_loss_rate_ != fraction) {
+     packet_loss_rate_ = fraction;
+     RTC_CHECK_EQ(
+@@ -753,10 +830,16 @@ void AudioEncoderOpusImpl::SetTargetBitrate(int bits_per_second) {
+     bitrate_changed_ = true;
+   }
+ 
+-  const auto new_complexity = GetNewComplexity(config_);
+-  if (new_complexity && complexity_ != *new_complexity) {
+-    complexity_ = *new_complexity;
+-    RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
++  // Q-Audion: do not let the bitrate-based hysteresis table fight a runtime
++  // complexity override from the app (P8) - EncodeImpl()'s generation check
++  // is the only thing allowed to change `complexity_` while an override is
++  // active.
++  if (qaudion::OpusEncoderComplexity() < 0) {
++    const auto new_complexity = GetNewComplexity(config_);
++    if (new_complexity && complexity_ != *new_complexity) {
++      complexity_ = *new_complexity;
++      RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
++    }
+   }
+ }
+ 
+diff --git a/modules/audio_coding/codecs/opus/audio_encoder_opus.h b/modules/audio_coding/codecs/opus/audio_encoder_opus.h
+index 6900e0e..f840659 100644
+--- a/modules/audio_coding/codecs/opus/audio_encoder_opus.h
++++ b/modules/audio_coding/codecs/opus/audio_encoder_opus.h
+@@ -166,6 +166,12 @@ class AudioEncoderOpusImpl final : public AudioEncoder {
+   // 1 kbps range.
+   std::vector<float> bitrate_multipliers_;
+   float packet_loss_rate_;
++  // Q-Audion (M150 hardening, P5): the webrtc::qaudion::TuningGeneration()
++  // value last applied to `complexity_` / `packet_loss_rate_`. Written from
++  // RecreateEncoderInstance() and EncodeImpl() only, both of which run on
++  // the same task queue that owns `inst_`, so no synchronization is needed
++  // on this field itself; the atomic is qaudion_tuning.h's, not this one's.
++  uint32_t qaudion_tuning_gen_ = 0;
+   std::vector<int16_t> input_buffer_;
+   OpusEncInst* inst_;
+   uint32_t first_timestamp_in_buffer_;

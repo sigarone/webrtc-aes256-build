@@ -1,0 +1,187 @@
+No key material in logs (m150 rebase of no-key-log.patch) + no ICE password.
+
+1) FrameCryptor. Upstream webrtc-sdk/webrtc m150_release still prints, at
+RTC_LOG(LS_INFO), the input secret, the salt and the DERIVED AES key as
+decimal byte lists every time a frame-cryptor key is installed
+(DeriveHkdfSha256FromSecret, frame_crypto_transformer.cc:264;
+DerivePBKDF2KeyFromRawKey, :288). m150 changed the helper call to
+to_uint8_list(<vector>) (m144 was to_uint8_list(ptr, len)), so the m144
+no-key-log.patch no longer applies. Both statements are deleted with no
+replacement log line. to_uint8_list() stays (external linkage, now unused ->
+no -Wunused-function). The positive control of the binary gate
+("Failed to derive HkdfSha256 key from secret.", :260) is untouched.
+
+2) ICE. p2p/base/port.cc (Port::GetStunMessage, :519 and :586) prints the
+local ICE password (password_) at LS_ERROR whenever a STUN request with a bad
+MESSAGE-INTEGRITY arrives - an unauthenticated remote packet can therefore
+make every default log capture record the ICE credential. Only the
+", password_=" field is removed; the rest of the error line stays.
+
+Binary gate: ci/assert-no-key-strings.sh (derived_key / "slat << " / raw_key)
+must find 0 hits; m150 builds also pass -F 'password_=' (see that script).
+
+Order: after P1 and P2 (m150/apply-series.sh: P1, P2, P3, ...). Hunks do not
+overlap with P1/P2. Verified: `git apply --check` clean alone and after
+P1 + P2 against webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582
+(frame_crypto_transformer.cc blob 1b4b4def08b5, port.cc blob 641d1e32348e).
+
+3) Security review, stage 3: the ICE password was still printed in three
+more places reachable in every call, and two SDK helpers handed the TURN
+credential to whatever the app logs:
+- api/candidate.cc Candidate::ToStringInternal() printed password_ (the ICE
+  pwd of that candidate) in both ToString() and ToSensitiveString() -
+  ToSensitiveString() only redacts addresses - and these strings feed
+  dozens of LS_INFO/LS_WARNING lines (candidate add/remove, connection
+  logs). The field is kept in place but printed as "<redacted>".
+- p2p/base/p2p_transport_channel.cc SetIceParameters() logged the local
+  ICE pwd at LS_INFO on every call; MaybeStartGathering() logged it at
+  LS_ERROR when only the ufrag was empty. Both now omit it.
+- sdk/android/api/org/webrtc/PeerConnection.java IceServer.toString() and
+  sdk/objc/api/peerconnection/RTCIceServer.mm -description returned the
+  TURN password/credential verbatim; both now print "<redacted>".
+None of these strings is parsed anywhere (logging/debug only).
+
+diff --git a/api/candidate.cc b/api/candidate.cc
+index e3e0a28..f6e5d28 100644
+--- a/api/candidate.cc
++++ b/api/candidate.cc
+@@ -428,10 +428,14 @@ std::string Candidate::ToStringInternal(bool sensitive) const {
+       sensitive ? address_.ToSensitiveString() : address_.ToString();
+   std::string related_address = sensitive ? related_address_.ToSensitiveString()
+                                           : related_address_.ToString();
++  // Q-Audion: never print the ICE password (password_) - this string goes
++  // into dozens of LS_INFO/LS_WARNING log lines (ToSensitiveString() only
++  // redacts the addresses). The field position is kept, redacted.
+   ost << "Cand[:" << foundation_ << ":" << component_ << ":" << protocol_ << ":"
+       << priority_ << ":" << address << ":" << type_name() << ":"
+-      << related_address << ":" << username_ << ":" << password_ << ":"
+-      << network_id_ << ":" << network_cost_ << ":" << generation_ << "]";
++      << related_address << ":" << username_ << ":"
++      << (password_.empty() ? "" : "<redacted>") << ":" << network_id_ << ":"
++      << network_cost_ << ":" << generation_ << "]";
+   return ost.Release();
+ }
+ 
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index d5099e5..8671166 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -258,12 +258,11 @@ int DeriveHkdfSha256FromSecret(const std::vector<uint8_t>& secret,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "secret " << to_uint8_list(secret)
+-                   << " len " << secret.size() << " slat << "
+-                   << to_uint8_list(salt) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key)
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material. Upstream printed the input secret, the
++  // salt and the derived key here as decimal byte lists at LS_INFO; apps that
++  // enable INFO logging (RTCSetMinDebugLogLevel(.info), logcat, ...) then leak
++  // the E2EE frame key into their log capture and any uploaded diagnostics.
++  // Removed; keep it removed when rebasing on upstream.
+ 
+   return Success;
+ }
+@@ -282,13 +281,8 @@ int DerivePBKDF2KeyFromRawKey(const std::vector<uint8_t> raw_key,
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "raw_key "
+-                   << to_uint8_list(raw_key) << " len "
+-                   << raw_key.size() << " slat << "
+-                   << to_uint8_list(salt) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key)
+-                   << " len " << derived_key.size();
++  // SECURITY: never log key material (raw key, salt, derived key). See the
++  // note in DeriveHkdfSha256FromSecret().
+ 
+   return Success;
+ }
+diff --git a/p2p/base/p2p_transport_channel.cc b/p2p/base/p2p_transport_channel.cc
+index 4edd58d..bb2fda8 100644
+--- a/p2p/base/p2p_transport_channel.cc
++++ b/p2p/base/p2p_transport_channel.cc
+@@ -491,8 +491,9 @@ IceTransportState P2PTransportChannel::ComputeIceTransportState() const {
+ 
+ void P2PTransportChannel::SetIceParameters(const IceParameters& ice_params) {
+   RTC_DCHECK_RUN_ON(&network_thread_);
+-  RTC_LOG(LS_INFO) << "Set ICE ufrag: " << ice_params.ufrag
+-                   << " pwd: " << ice_params.pwd << " on transport "
++  // Q-Audion: upstream also printed the local ICE password (pwd) here at
++  // LS_INFO. Removed; the ufrag is not a secret.
++  RTC_LOG(LS_INFO) << "Set ICE ufrag: " << ice_params.ufrag << " on transport "
+                    << transport_name();
+   ice_parameters_ = ice_params;
+   // Note: Candidate gathering will restart when MaybeStartGathering is next
+@@ -847,7 +848,8 @@ void P2PTransportChannel::MaybeStartGathering() {
+     RTC_LOG(LS_ERROR)
+         << "Cannot gather candidates because ICE parameters are empty"
+            " ufrag: "
+-        << ice_parameters_.ufrag << " pwd: " << ice_parameters_.pwd;
++        << ice_parameters_.ufrag
++        << " pwd_empty: " << ice_parameters_.pwd.empty();  // Q-Audion: no pwd
+     return;
+   }
+   // Start gathering if we never started before, or if an ICE restart occurred.
+diff --git a/p2p/base/port.cc b/p2p/base/port.cc
+index 641d1e3..718bc9b 100644
+--- a/p2p/base/port.cc
++++ b/p2p/base/port.cc
+@@ -518,8 +518,9 @@ bool Port::GetStunMessage(std::span<const uint8_t> data,
+         StunMessage::IntegrityStatus::kIntegrityOk) {
+       RTC_LOG(LS_ERROR) << ToString() << ": Received "
+                         << StunMethodToString(stun_msg->type())
+-                        << " with bad M-I from " << addr.ToSensitiveString()
+-                        << ", password_=" << password_;
++                        << " with bad M-I from " << addr.ToSensitiveString();
++      // Q-Audion: upstream also printed the local ICE password here (at
++      // LS_ERROR, i.e. in every default log capture). Removed.
+       SendBindingErrorResponse(stun_msg.get(), addr, STUN_ERROR_UNAUTHORIZED,
+                                STUN_ERROR_REASON_UNAUTHORIZED);
+       return true;
+@@ -585,8 +586,9 @@ bool Port::GetStunMessage(std::span<const uint8_t> data,
+         StunMessage::IntegrityStatus::kIntegrityOk) {
+       RTC_LOG(LS_ERROR) << ToString() << ": Received "
+                         << StunMethodToString(stun_msg->type())
+-                        << " with bad M-I from " << addr.ToSensitiveString()
+-                        << ", password_=" << password_;
++                        << " with bad M-I from " << addr.ToSensitiveString();
++      // Q-Audion: upstream also printed the local ICE password here (at
++      // LS_ERROR, i.e. in every default log capture). Removed.
+       SendBindingErrorResponse(stun_msg.get(), addr, STUN_ERROR_UNAUTHORIZED,
+                                STUN_ERROR_REASON_UNAUTHORIZED);
+       return true;
+diff --git a/sdk/android/api/org/webrtc/PeerConnection.java b/sdk/android/api/org/webrtc/PeerConnection.java
+index 52b6b8f..d835c78 100644
+--- a/sdk/android/api/org/webrtc/PeerConnection.java
++++ b/sdk/android/api/org/webrtc/PeerConnection.java
+@@ -243,8 +243,10 @@ public class PeerConnection {
+ 
+     @Override
+     public String toString() {
+-      return urls + " [" + username + ":" + password + "] [" + tlsCertPolicy + "] [" + hostname
+-          + "] [" + tlsAlpnProtocols + "] [" + tlsEllipticCurves + "]";
++      // Q-Audion: never expose the TURN credential through toString() (it ends up in app logs).
++      return urls + " [" + username + ":" + (password.isEmpty() ? "" : "<redacted>") + "] ["
++          + tlsCertPolicy + "] [" + hostname + "] [" + tlsAlpnProtocols + "] ["
++          + tlsEllipticCurves + "]";
+     }
+ 
+     @Override
+diff --git a/sdk/objc/api/peerconnection/RTCIceServer.mm b/sdk/objc/api/peerconnection/RTCIceServer.mm
+index 290a99b..83049b2 100644
+--- a/sdk/objc/api/peerconnection/RTCIceServer.mm
++++ b/sdk/objc/api/peerconnection/RTCIceServer.mm
+@@ -103,7 +103,8 @@
+                     @"RTC_OBJC_TYPE(RTCIceServer):\n%@\n%@\n%@\n%@\n%@\n%@\n%@",
+                     _urlStrings,
+                     _username,
+-                    _credential,
++                    // Q-Audion: never expose the TURN credential in -description.
++                    _credential.length > 0 ? @"<redacted>" : @"",
+                     [self stringForTlsCertPolicy:_tlsCertPolicy],
+                     _hostname,
+                     _tlsAlpnProtocols,

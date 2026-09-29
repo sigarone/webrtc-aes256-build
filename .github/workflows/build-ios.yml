@@ -46,6 +46,11 @@ permissions:
   contents: write
 
 env:
+  # workflow_dispatch inputs reach shell ONLY through these env vars
+  # (never expression-interpolated into a script); validated before first use.
+  IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref }}
+  IN_ARCH: ${{ github.event.inputs.arch }}
+  IN_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
   DEPOT_TOOLS_UPDATE: "0"
 
 jobs:
@@ -54,9 +59,17 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout this repo (patch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: ctrl
+          persist-credentials: false
+
+      - name: Validate dispatch inputs (charset allow-list, fail closed)
+        run: |
+          set -euo pipefail
+          case "$IN_WEBRTC_REF" in ''|*[!A-Za-z0-9._/-]*) echo "::error::webrtc_ref: only [A-Za-z0-9._/-] allowed"; exit 1 ;; esac
+          case "$IN_ARCH" in ''|*[!A-Za-z0-9_:\ -]*) echo "::error::arch: only [A-Za-z0-9_: -] allowed"; exit 1 ;; esac
+          case "$IN_RELEASE_TAG" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_tag: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
 
       - name: Select full Xcode (16.x — M144 needs the iOS 18 SDK modulemaps)
         run: |
@@ -95,7 +108,7 @@ jobs:
           cat > .gclient <<EOF
           solutions = [{
             "name": "src",
-            "url": "https://github.com/sigarone/webrtc.git@${{ github.event.inputs.webrtc_ref }}",
+            "url": "https://github.com/sigarone/webrtc.git@${IN_WEBRTC_REF}",
             "deps_file": "DEPS",
             "managed": False,
             "custom_deps": {},
@@ -104,6 +117,17 @@ jobs:
           EOF
           echo "::group::gclient sync"
           gclient sync --no-history --shallow --nohooks
+          # Integrity: fork tags are mutable. A '<12-hex>-...' ref must resolve to
+          # exactly that upstream commit, or the build stops (fail closed).
+          HEAD_SHA=$(git -C src rev-parse HEAD)
+          echo "src HEAD = $HEAD_SHA"
+          case "$IN_WEBRTC_REF" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*)
+              if [ "${HEAD_SHA#"${IN_WEBRTC_REF%%-*}"}" = "$HEAD_SHA" ]; then
+                echo "::error::webrtc_ref $IN_WEBRTC_REF resolved to $HEAD_SHA (tag moved?)"; exit 1
+              fi ;;
+            *) echo "::warning::webrtc_ref has no <12-hex>- prefix: source commit is not pinned" ;;
+          esac
           echo "::endgroup::"
           echo "::group::runhooks"
           gclient runhooks
@@ -175,7 +199,7 @@ jobs:
           command -v ninja && ninja --version || true
           vpython3 tools_webrtc/ios/build_ios_libs.py \
             --build_config release \
-            --arch ${{ github.event.inputs.arch }} \
+            --arch ${IN_ARCH} \
             --extra-gn-args 'use_clang_modules=false use_siso=false rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false'
           echo "=== output ==="
           ls -la out_ios_libs
@@ -209,11 +233,11 @@ jobs:
           echo "checksum=$SUM" >> "$GITHUB_OUTPUT"
           echo "## WebRTC.xcframework (AES-256 + H265)" >> "$GITHUB_STEP_SUMMARY"
           echo "checksum: \`$SUM\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "url: https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.release_tag }}/WebRTC.xcframework.zip" >> "$GITHUB_STEP_SUMMARY"
+          echo "url: https://github.com/${{ github.repository }}/releases/download/${IN_RELEASE_TAG}/WebRTC.xcframework.zip" >> "$GITHUB_STEP_SUMMARY"
         id: pkg
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: WebRTC-xcframework-aes256-ios
           path: WebRTC.xcframework.zip
@@ -224,7 +248,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.release_tag }}"
+          TAG="${IN_RELEASE_TAG}"
           REPO="${{ github.repository }}"
           # $GITHUB_WORKSPACE is NOT a git repo here (actions/checkout above
           # used `with: path: ctrl`) — gh would otherwise fail to auto-detect
@@ -242,7 +266,7 @@ jobs:
           # not the default branch tip.
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" --title "WebRTC.xcframework AES-256 + H265 (M144)" \
-              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + no-key-log.patch (upstream key-material logging removed) + H265. Source: sigarone/webrtc@${{ github.event.inputs.webrtc_ref }}. checksum: ${{ steps.pkg.outputs.checksum }}"
+              --notes "webrtc-sdk M144 iOS xcframework with aes256-framecryptor.patch + native-pli.patch (W-NATIVEPLI decrypt-failure signal) + no-key-log.patch (upstream key-material logging removed) + H265. Source: sigarone/webrtc@${IN_WEBRTC_REF}. checksum: ${{ steps.pkg.outputs.checksum }}"
           fi
           gh release upload "$TAG" WebRTC.xcframework.zip --repo "$REPO"
           echo "Asset: https://github.com/$REPO/releases/download/$TAG/WebRTC.xcframework.zip"

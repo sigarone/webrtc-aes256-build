@@ -1,0 +1,153 @@
+name: test-webrtc-m150-patches
+
+# Free, fast CI: builds the M150 patch series for host x64 Linux
+# (rtc_include_tests=true) in the two configurations that matter
+# (rtc_qaudion_transport_strict=true/false) and runs the T1-T6 unit tests
+# from webrtc-plan.md v2 §6.1. Does NOT build any shippable artifact (no
+# Android/iOS toolchain here) - see build-m150-android.yml / build-m150-ios.yml
+# for that. Meant to run on every patch-series PR, well before a 3-5h mobile
+# build is worth dispatching.
+#
+# Integrator, stage 2: P1-P8 are in now (m150/patches/*, m150/series), so
+# T1-T6 are filled in below with the closest EXISTING upstream gtest
+# coverage for the functions each patch actually changed (webrtc-plan.md
+# §6.1 describes T1-T6 by behavior, not by test name; none of P1-P8 added a
+# new _unittest.cc of its own, so there is no test that exercises the new
+# qaudion:: runtime API calls directly yet - see the T6 note below). This
+# still isn't a substitute for the full matrix in §6.2-6.3 (real DTLS/SRTP
+# interop against old peers, deep PLC/OSCE on-device, etc.) - it is exactly
+# what the plan asks this workflow for: a fast, free, host-x64 compile +
+# regression check on every patch-series PR, before a 3-5h mobile build is
+# worth dispatching. A still-empty filter is skipped, not failed, by the
+# run step below.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'm150/**'
+      - '.github/workflows/test-m150-patches.yml'
+
+permissions:
+  contents: read
+
+env:
+  WEBRTC_REF: ba469aa2093b-qaudion-m150
+  WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
+  # depot_tools is pinned inside m150/ci/sync.sh itself (no override).
+  WORKDIR: /home/runner/webrtc
+  DEPOT_TOOLS_UPDATE: "0"
+  # T1 (SRTP): api/crypto/crypto_options_unittest.cc already covers exactly
+  # the function P6 rewrites (CryptoOptions::GetSupportedDtlsSrtpCryptoSuites).
+  T1_FILTER: "CryptoOptionsTest.GetSupportedDtlsSrtpCryptoSuites*"
+  # T2 (DTLS): rtc_base/ssl_stream_adapter_unittest.cc's value-parameterized
+  # DTLS-version fixture, run across DTLS 1.2 x 1.3 (client x server) - covers
+  # the version/cipher outcomes in the plan's §6.1 table, plus
+  # TestGetSslGroupIdWithPqc (X25519MLKEM768 negotiation, P7's other half).
+  # It does not cover the plan's stock-client/INCOMPATIBLE_CIPHERSUITE/
+  # QaudionHandshakeMeetsPolicy rows - those need real cross-version fixtures
+  # this file doesn't have; still open, see the integrator's report.
+  T2_FILTER: "*SSLStreamAdapterTestDTLSHandshakeVersion*"
+  # T3 (FEC floor): closest existing coverage for the packet-loss-rate bound
+  # P5's OpusMinPacketLossPercent() feeds into (0.2 = 20%, the same ceiling
+  # P5 clamps its own floor to).
+  T3_FILTER: "AudioEncoderOpusTest.PacketLossRateUpperBounded"
+  # T4 (decoder PLC): closest existing coverage that exercises the PLC/FEC
+  # decode paths P4b's WebRtcOpus_Decode wraps (not deep-PLC/OSCE itself -
+  # those are arm64-only and not built by this host-x64 job, see the plan's
+  # own note under §6.1).
+  T4_FILTER: "AudioDecoderOpusTest.*Plc*:AudioDecoderOpusTest.*Fec*"
+  # T5 (encoder complexity): direct existing coverage for
+  # AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
+  # sits next to (SetTargetBitrate must not clobber an active override).
+  T5_FILTER: "AudioEncoderOpusTest.ConfigComplexityAdaptation"
+  # T6 (BuildInfo/transport markers): rtc_base/qaudion_tuning.{h,cc} (P8) is a
+  # brand-new file with no existing unittest - still a genuine TODO, but now
+  # for whoever adds rtc_base/qaudion_tuning_unittest.cc (new test authoring,
+  # not integration), not a placeholder for missing patches.
+  T6_FILTER: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [strict, switchable]
+    steps:
+      - name: Checkout this repo (patches + scripts)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync M150 source (pinned, hard-verified)
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/ci/sync.sh "$WORKDIR" "$WEBRTC_REF" unix
+
+      - name: Apply patch series (plain series only - variant-agnostic, no LK patch here)
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/apply-series.sh "$WORKDIR/src" android
+
+      - name: Fetch Opus DNN weights
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Build host x64 test binaries (${{ matrix.config }})
+        working-directory: /home/runner/webrtc/src
+        env:
+          STRICT: ${{ matrix.config == 'strict' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          gn gen "out/test-${{ matrix.config }}" --args="is_debug=false rtc_include_tests=true symbol_level=1 treat_warnings_as_errors=false rtc_build_tools=false rtc_qaudion_transport_strict=$STRICT"
+          # T1/T2 live in rtc_unittests (api/crypto, rtc_base); T3-T5 live in
+          # modules_unittests (modules/audio_coding) - security review, stage 3:
+          # only rtc_unittests used to be built, so T3-T5 matched zero tests
+          # and "passed" without running anything.
+          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests
+
+      - name: Run T1-T6 (${{ matrix.config }})
+        working-directory: /home/runner/webrtc/src
+        env:
+          CONFIG: ${{ matrix.config }}
+        run: |
+          set -euo pipefail
+          OUT="out/test-${CONFIG}"
+          any=0
+          # <name>:<binary>:<filter>. In the strict config, T1/T2 are the
+          # upstream expectations that P6/P7 deliberately change (AES-128 /
+          # non-GCM SRTP suites, DTLS 1.2 handshakes), so they are expected
+          # to fail there by design and are run only in the switchable config,
+          # where level 0 must stay byte-for-byte upstream (LiveKit default).
+          for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
+                      "T3:modules_unittests:$T3_FILTER" "T4:modules_unittests:$T4_FILTER" \
+                      "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER"; do
+            name=${spec%%:*}
+            rest=${spec#*:}
+            bin=${rest%%:*}
+            filt=${rest#*:}
+            if [ -z "$filt" ]; then
+              echo "::warning::$name: no gtest filter set yet - skipped"
+              continue
+            fi
+            if [ "$CONFIG" = strict ] && { [ "$name" = T1 ] || [ "$name" = T2 ]; }; then
+              echo "::notice::$name: upstream-behaviour test, intentionally changed by P6/P7 in strict builds - run in the switchable config only"
+              continue
+            fi
+            n=$("$OUT/$bin" "--gtest_filter=$filt" --gtest_list_tests | grep -c '^  ' || true)
+            if [ "${n:-0}" -eq 0 ]; then
+              echo "::error::$name: filter '$filt' matches no test in $bin - the check would silently pass"
+              exit 1
+            fi
+            echo "::group::$name ($bin, $n tests, $filt)"
+            "$OUT/$bin" "--gtest_filter=$filt"
+            echo "::endgroup::"
+            any=$((any + 1))
+          done
+          if [ "$any" -eq 0 ]; then
+            echo "::warning::no T1-T6 filters configured yet - series-apply + build-only smoke passed, no tests ran"
+          fi
