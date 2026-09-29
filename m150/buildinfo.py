@@ -44,6 +44,9 @@ SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 # all three need updating together - see m150/README.md).
 WEBRTC_SRC_PIN = "ba469aa2093ba950066258ca0a59a6fbd1295582"
 BORINGSSL_PIN = "f91f1447397c6719f9774dfb8e67329378e1f3d3"
+# chromium/src/third_party (DEPS 'src/third_party'); Opus is vendored inline
+# there, see m150/ci/sync.sh.
+THIRD_PARTY_PIN = "7c92732938de0ef7e28f5da231994723f938f407"
 OPUS_PIN = "55513e81d8f606bd75d0ff773d2144e5f2a732f5"
 OPUS_WEIGHTS_SHA256 = "160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58"
 OPUS_WEIGHTS_URL = "https://media.xiph.org/opus/models/opus_data-%s.tar.gz" % OPUS_WEIGHTS_SHA256
@@ -135,6 +138,7 @@ def main():
         "source": {
             "webrtc_src_sha": cross_check("WEBRTC_SRC_SHA", WEBRTC_SRC_PIN),
             "boringssl_sha": cross_check("BORINGSSL_SHA", BORINGSSL_PIN),
+            "third_party_sha": cross_check("THIRD_PARTY_SHA", THIRD_PARTY_PIN),
             "opus_sha": cross_check("OPUS_SHA", OPUS_PIN),
         },
         "patches": patch_hashes(series, variant),
@@ -147,6 +151,8 @@ def main():
                 "dnn/pitchdnn_data.c", "dnn/pitchdnn_data.h",
                 "dnn/lace_data.c", "dnn/lace_data.h",
                 "dnn/nolace_data.c", "dnn/nolace_data.h",
+                "dnn/dred_rdovae_constants.h", "dnn/dred_rdovae_dec_data.h",
+                "dnn/dred_rdovae_stats_data.h",
             ],
         },
         "gn_args": os.environ.get("GN_ARGS"),

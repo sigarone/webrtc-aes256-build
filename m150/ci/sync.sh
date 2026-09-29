@@ -63,6 +63,14 @@ case "$DEPOT_TOOLS_SHA" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a
 # them if the source author ever re-pins webrtc_ref.
 WEBRTC_PIN=ba469aa2093ba950066258ca0a59a6fbd1295582
 BORINGSSL_PIN=f91f1447397c6719f9774dfb8e67329378e1f3d3
+# src/third_party is its own repo (chromium/src/third_party, DEPS line 88-89
+# at WEBRTC_PIN). Opus is NOT a separate git checkout at this revision: it
+# is vendored inline in that repo under opus/src, so it is pinned by
+# THIRD_PARTY_PIN and cross-checked through the upstream revision recorded
+# in third_party/opus/README.chromium (security review, stage 3: the
+# previous check looked for third_party/opus/src/.git, which does not exist,
+# so every sync would have failed closed).
+THIRD_PARTY_PIN=7c92732938de0ef7e28f5da231994723f938f407
 OPUS_PIN=55513e81d8f606bd75d0ff773d2144e5f2a732f5
 
 mkdir -p "$WORKDIR"
@@ -79,6 +87,16 @@ ACTUAL_DT=$(git -C "$WORKDIR/depot_tools" rev-parse HEAD)
 echo "$WORKDIR/depot_tools" >> "${GITHUB_PATH:-/dev/null}" 2>/dev/null || true
 PATH="$WORKDIR/depot_tools:$PATH"
 export PATH DEPOT_TOOLS_UPDATE=0
+# DEPOT_TOOLS_UPDATE=0 (needed so the pin above can never be moved by a
+# self-update) also skips the only step that normally bootstraps depot_tools'
+# hermetic python3 (python3_bin_reldir.txt). Without it the python-bin/python3
+# wrapper that GN/ninja actions can end up calling exits 1 ("need to
+# initialize depot_tools") - the M144 iOS workflows hit exactly this. Run
+# depot_tools' own ensure_bootstrap once, from the pinned checkout (its CIPD
+# manifests are part of the pinned commit), and fail closed if it did not
+# produce the file.
+bash "$WORKDIR/depot_tools/ensure_bootstrap"
+[ -f "$WORKDIR/depot_tools/python3_bin_reldir.txt" ] || { echo "::error::sync: depot_tools python3 bootstrap did not produce python3_bin_reldir.txt" >&2; exit 1; }
 echo "::endgroup::"
 
 echo "::group::sync: gclient config + sync ($WEBRTC_REF, target_os=$TARGET_OS_CSV)"
@@ -117,10 +135,22 @@ check_pin() {
   fi
 }
 check_pin "webrtc src"           "$WORKDIR/src"                             "$WEBRTC_PIN"
+check_pin "third_party"           "$WORKDIR/src/third_party"                 "$THIRD_PARTY_PIN"
 check_pin "third_party/boringssl" "$WORKDIR/src/third_party/boringssl/src"  "$BORINGSSL_PIN"
-check_pin "third_party/opus"      "$WORKDIR/src/third_party/opus/src"       "$OPUS_PIN"
+# Opus: inline in the third_party repo verified just above; its README must
+# name exactly the pinned upstream commit, and opus/src must not have been
+# turned into a separate (unverified) checkout by a DEPS change.
+OPUS_README="$WORKDIR/src/third_party/opus/README.chromium"
+if [ -d "$WORKDIR/src/third_party/opus/src/.git" ]; then
+  check_pin "third_party/opus" "$WORKDIR/src/third_party/opus/src" "$OPUS_PIN"
+elif ! grep -qx "Revision: $OPUS_PIN" "$OPUS_README" 2>/dev/null; then
+  echo "::error::sync: $OPUS_README does not record 'Revision: $OPUS_PIN'" >&2
+  fail=1
+else
+  echo "third_party/opus: inline in third_party@$THIRD_PARTY_PIN, README.chromium Revision: $OPUS_PIN"
+fi
 [ "$fail" -eq 0 ] || { echo "::error::sync: one or more source pins do not match - refusing to build from an unverified tree" >&2; exit 1; }
 echo "::endgroup::"
 
 du -sh "$WORKDIR/src" 2>/dev/null || true
-echo "sync: ok - src=$WEBRTC_PIN boringssl=$BORINGSSL_PIN opus=$OPUS_PIN depot_tools=$DEPOT_TOOLS_SHA"
+echo "sync: ok - src=$WEBRTC_PIN third_party=$THIRD_PARTY_PIN boringssl=$BORINGSSL_PIN opus=$OPUS_PIN depot_tools=$DEPOT_TOOLS_SHA"

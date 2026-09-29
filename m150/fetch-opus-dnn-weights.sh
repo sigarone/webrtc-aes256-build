@@ -2,8 +2,8 @@
 # fetch-opus-dnn-weights.sh - download the Opus DNN model weight tarball for
 # the pinned Opus source (55513e81d8f606bd75d0ff773d2144e5f2a732f5), verify
 # its sha256, and extract ONLY the deep-PLC / FARGAN / PitchDNN weight
-# sources (+ LACE/NoLACE, kept for an eventual OSCE-BWE build - see the
-# comment near ALLOWED_MEMBERS) into <opus_src>/dnn/.
+# sources plus the OSCE LACE/NoLACE weights (see the comment near
+# ALLOWED_MEMBERS) into <opus_src>/dnn/.
 #
 # The weights are NOT vendored in this repo (they are large generated C
 # arrays, tens of MB each - see BUILDINFO note below) and are NOT in the
@@ -40,17 +40,22 @@ OPUS_SRC=$(CDPATH= cd -- "$OPUS_SRC" && pwd)
 MODEL_SHA256=160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58
 MODEL_URL="https://media.xiph.org/opus/models/opus_data-${MODEL_SHA256}.tar.gz"
 
-# dnn/*_data.[ch] to extract. PLC + FARGAN + PitchDNN are load-bearing for P4
-# (deep PLC, decoder complexity >=5, §1.2/§2.1 of the plan). LACE/NoLACE are
-# OSCE weights: OSCE itself is compiled OFF in this build (decision D7, plan
-# §7.3) so they are inert, but they are cheap enough to keep on hand for a
-# possible OSCE-BWE follow-up without a second weights fetch/re-pin - if that
-# ever ships, ENABLE_OSCE must be turned on at GN/BUILD.gn level too (source-
-# patch author's call, not this script's). DRED (dred_rdovae_*, lossgen_data)
-# is intentionally NOT extracted: DRED is off (same D7) and those files alone
-# are the bulk of the tarball's weight - skipping them keeps the checked-out
-# tree small.
-ALLOWED_MEMBERS="dnn/plc_data.c dnn/plc_data.h dnn/fargan_data.c dnn/fargan_data.h dnn/pitchdnn_data.c dnn/pitchdnn_data.h dnn/lace_data.c dnn/lace_data.h dnn/nolace_data.c dnn/nolace_data.h"
+# dnn/*_data.[ch] to extract. PLC + FARGAN + PitchDNN are load-bearing for
+# deep PLC (decoder complexity >= 5); LACE/NoLACE are the OSCE weights that
+# P4a compiles in on arm64 (ENABLE_OSCE; complexity 6 = LACE, 7 = NoLACE,
+# kQaudionDefaultDecoderComplexity = 7). There is no OSCE-BWE model at this
+# Opus revision. DRED (dred_rdovae_*, lossgen_data) is intentionally NOT
+# extracted: DRED is off and those files are the bulk of the tarball.
+# Every one of these files is compiled into the library (no USE_WEIGHTS_FILE),
+# so nothing is ever fetched at runtime.
+# The three dred_rdovae_*.h HEADERS are extracted too (security review,
+# stage 3): with ENABLE_DEEP_PLC, src/opus_decoder.c includes
+# dred_rdovae_dec_data.h / dnn/dred_rdovae_dec.h (-> dred_rdovae_stats_data.h)
+# and dnn/nnet.c includes dred_rdovae_constants.h unconditionally, so the
+# arm64 build fails without them (verified with a real clang arm64 compile of
+# third_party/opus:opus on the pinned tree). They are declarations/constants
+# only; no DRED .c (and no DRED weight data) is extracted or compiled.
+ALLOWED_MEMBERS="dnn/plc_data.c dnn/plc_data.h dnn/fargan_data.c dnn/fargan_data.h dnn/pitchdnn_data.c dnn/pitchdnn_data.h dnn/lace_data.c dnn/lace_data.h dnn/nolace_data.c dnn/nolace_data.h dnn/dred_rdovae_constants.h dnn/dred_rdovae_dec_data.h dnn/dred_rdovae_stats_data.h"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
