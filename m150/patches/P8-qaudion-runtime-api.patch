@@ -111,8 +111,26 @@ target names and their existing rtc_base: deps, common_inherited_config's
 location in the root BUILD.gn) were read from that same pinned checkout,
 not assumed.
 
+Security review, stage 3: (1) the qaudion_tuning.h hunk declared 118 new
+lines but carried 119, so `git apply` stopped one line early and silently
+skipped the final "#endif  // RTC_BASE_QAUDION_TUNING_H_" as inter-hunk
+garbage (exit 0, only a "new blank line at EOF" warning): every translation
+unit including the header would have failed with an unterminated #ifndef.
+Regenerated with correct counts. (2) BuildInfo() used to build its
+transport marker from two separate string literals ("...transport=" +
+"strict"), so the contiguous "transport=strict" / "transport=switchable"
+that the binary gate G2 (m150/gates.sh) greps for never existed in any
+shipped binary and G2 would have failed every variant; it is now one
+literal per variant; g_transport_level is compiled only into switchable
+builds (strict builds never touch it, and clang -Werror,-Wunused-variable
+rejected it - found by a real clang compile of every changed object on the
+pinned tree, both GN configs). (3) Fixed the stale "common_inherited_config" wording
+in the #error text and in the root BUILD.gn comment (the define lives in
+//:common_config) and dropped a trailing blank line at EOF of
+qaudion_tuning.cc.
+
 diff --git a/BUILD.gn b/BUILD.gn
-index b484f5b..3c074d1 100644
+index b484f5b..9c04469 100644
 --- a/BUILD.gn
 +++ b/BUILD.gn
 @@ -499,6 +499,18 @@ config("common_config") {
@@ -123,9 +141,9 @@ index b484f5b..3c074d1 100644
 +  # Q-Audion (M150 hardening, P8): a single global macro, propagated through
 +  # this public_configs-shared config to every translation unit in the
 +  # binary. rtc_base/qaudion_tuning.h #errors out if it ever sees a build
-+  # that didn't go through here, so a target that forgets to depend on
-+  # common_inherited_config fails to compile instead of silently linking a
-+  # stale default in from a stray define.
++  # that didn't go through here, so a target that is not built with
++  # common_config fails to compile instead of silently compiling a
++  # different (ODR-violating) default.
 +  if (rtc_qaudion_transport_strict) {
 +    defines += [ "QAUDION_TRANSPORT_STRICT=1" ]
 +  } else {
@@ -174,10 +192,10 @@ index f07e615..8dc42f5 100644
      "rate_limiter.cc",
 diff --git a/rtc_base/qaudion_tuning.cc b/rtc_base/qaudion_tuning.cc
 new file mode 100644
-index 0000000..a36d41f
+index 0000000..2016019
 --- /dev/null
 +++ b/rtc_base/qaudion_tuning.cc
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,157 @@
 +/*
 + *  Q-Audion runtime tuning API (M150 hardening, patch P8). See the header
 + *  for the contract; this file is the whole implementation.
@@ -199,7 +217,10 @@ index 0000000..a36d41f
 +std::atomic<int> g_enc_complexity{-1};
 +std::atomic<int> g_dec_complexity{-1};
 +std::atomic<int> g_min_loss_percent{10};
++#if !QAUDION_TRANSPORT_STRICT
++// Strict builds hard-wire level 3 and never read or write this.
 +std::atomic<int> g_transport_level{0};
++#endif
 +std::atomic<bool> g_require_pqc{false};
 +std::atomic<bool> g_magic_bypass_disabled{false};
 +std::atomic<uint32_t> g_generation{0};
@@ -311,11 +332,14 @@ index 0000000..a36d41f
 +}
 +
 +std::string BuildInfo() {
-+  std::string info = "Q-AUDION build m150 transport=";
++  // One contiguous literal per variant: the M150 binary gate G2
++  // (m150/gates.sh) greps the shipped .so / Mach-O slices for exactly
++  // "transport=strict" (plain) or "transport=switchable" (LiveKit), so the
++  // marker must never be split across two string literals.
 +#if QAUDION_TRANSPORT_STRICT
-+  info += "strict";
++  std::string info = "Q-AUDION build m150 transport=strict";
 +#else
-+  info += "switchable";
++  std::string info = "Q-AUDION build m150 transport=switchable";
 +#endif
 +  info += " level=" + std::to_string(TransportLevel());
 +  info += " pqc_required=" + std::string(RequireDtlsPqc() ? "1" : "0");
@@ -331,10 +355,10 @@ index 0000000..a36d41f
 +}  // namespace webrtc::qaudion
 diff --git a/rtc_base/qaudion_tuning.h b/rtc_base/qaudion_tuning.h
 new file mode 100644
-index 0000000..04fd734
+index 0000000..72f0d94
 --- /dev/null
 +++ b/rtc_base/qaudion_tuning.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,119 @@
 +/*
 + *  Q-Audion runtime tuning API (M150 hardening, patch P8).
 + *
@@ -369,7 +393,7 @@ index 0000000..04fd734
 +
 +#if !defined(QAUDION_TRANSPORT_STRICT)
 +#error \
-+    "QAUDION_TRANSPORT_STRICT must come from //:common_inherited_config (see rtc_qaudion_transport_strict in webrtc.gni and BUILD.gn)"
++    "QAUDION_TRANSPORT_STRICT must come from //:common_config (see rtc_qaudion_transport_strict in webrtc.gni and BUILD.gn)"
 +#endif
 +
 +#include <cstdint>
