@@ -34,8 +34,7 @@ permissions:
 env:
   WEBRTC_REF: ba469aa2093b-qaudion-m150
   WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
-  # TODO: resolve once, see m150/ci/sync.sh's own comment on this var.
-  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+  # depot_tools is pinned inside m150/ci/sync.sh itself (no override).
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
   # T1 (SRTP): api/crypto/crypto_options_unittest.cc already covers exactly
@@ -105,23 +104,47 @@ jobs:
         run: |
           set -euo pipefail
           gn gen "out/test-${{ matrix.config }}" --args="is_debug=false rtc_include_tests=true symbol_level=1 treat_warnings_as_errors=false rtc_build_tools=false rtc_qaudion_transport_strict=$STRICT"
-          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests
+          # T1/T2 live in rtc_unittests (api/crypto, rtc_base); T3-T5 live in
+          # modules_unittests (modules/audio_coding) - security review, stage 3:
+          # only rtc_unittests used to be built, so T3-T5 matched zero tests
+          # and "passed" without running anything.
+          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests
 
       - name: Run T1-T6 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
+        env:
+          CONFIG: ${{ matrix.config }}
         run: |
           set -euo pipefail
-          BIN="out/test-${{ matrix.config }}/rtc_unittests"
+          OUT="out/test-${CONFIG}"
           any=0
-          for spec in "T1:$T1_FILTER" "T2:$T2_FILTER" "T3:$T3_FILTER" "T4:$T4_FILTER" "T5:$T5_FILTER" "T6:$T6_FILTER"; do
+          # <name>:<binary>:<filter>. In the strict config, T1/T2 are the
+          # upstream expectations that P6/P7 deliberately change (AES-128 /
+          # non-GCM SRTP suites, DTLS 1.2 handshakes), so they are expected
+          # to fail there by design and are run only in the switchable config,
+          # where level 0 must stay byte-for-byte upstream (LiveKit default).
+          for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
+                      "T3:modules_unittests:$T3_FILTER" "T4:modules_unittests:$T4_FILTER" \
+                      "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER"; do
             name=${spec%%:*}
-            filt=${spec#*:}
+            rest=${spec#*:}
+            bin=${rest%%:*}
+            filt=${rest#*:}
             if [ -z "$filt" ]; then
-              echo "::warning::$name: no gtest filter set yet (TODO, source-patch author) - skipped"
+              echo "::warning::$name: no gtest filter set yet - skipped"
               continue
             fi
-            echo "::group::$name ($filt)"
-            "$BIN" "--gtest_filter=$filt"
+            if [ "$CONFIG" = strict ] && { [ "$name" = T1 ] || [ "$name" = T2 ]; }; then
+              echo "::notice::$name: upstream-behaviour test, intentionally changed by P6/P7 in strict builds - run in the switchable config only"
+              continue
+            fi
+            n=$("$OUT/$bin" "--gtest_filter=$filt" --gtest_list_tests | grep -c '^  ' || true)
+            if [ "${n:-0}" -eq 0 ]; then
+              echo "::error::$name: filter '$filt' matches no test in $bin - the check would silently pass"
+              exit 1
+            fi
+            echo "::group::$name ($bin, $n tests, $filt)"
+            "$OUT/$bin" "--gtest_filter=$filt"
             echo "::endgroup::"
             any=$((any + 1))
           done

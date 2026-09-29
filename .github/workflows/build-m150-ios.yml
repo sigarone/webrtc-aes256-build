@@ -31,7 +31,8 @@ env:
   IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref }}
   IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url }}
   IN_SUFFIX: ${{ github.event.inputs.release_suffix }}
-  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+  # depot_tools is pinned inside m150/ci/sync.sh itself (reviewed constant,
+  # no Actions-variable override - finding #18).
   MIN_IOS_SDK: "26.5"
 
 permissions:
@@ -61,7 +62,7 @@ jobs:
           echo "tag_plain=webrtc-ios-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
           echo "tag_lk=webrtc-ios-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if either release tag already exists
+      - name: Refuse if either release or git tag already exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,6 +70,14 @@ jobs:
           for t in "webrtc-ios-m150-${IN_SUFFIX}" "webrtc-ios-lk-m150-${IN_SUFFIX}"; do
             if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "::error::release tag '$t' already exists - use a new release_suffix"
+              exit 1
+            fi
+            # A bare git tag (no release) would make `gh release create` attach
+            # the new assets to whatever commit that tag already points at.
+            # ls-remote fails (non-zero) on a network error: fail closed.
+            refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$t")
+            if [ -n "$refs" ]; then
+              echo "::error::git tag '$t' already exists - use a new release_suffix"
               exit 1
             fi
           done
@@ -137,26 +146,40 @@ jobs:
             sed -i '' "/'third_party', 'siso', 'cipd', 'siso'/d" "$f"
           fi
 
-      - name: Build (plain -> build_ios_libs.py, lk -> m150/lk/xcframework.sh)
+      - name: Build (build_ios_libs.py, device:arm64 + simulator:arm64, both variants)
         working-directory: ${{ runner.temp }}/webrtc/src
         env:
           GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
+          # plain -> WebRTC.xcframework; lk -> LiveKitWebRTC.xcframework (the
+          # vendored m150/lk/apple_prefix.patch, applied by apply-series.sh for
+          # ios-lk, renames build_ios_libs.py's SDK_* output names, the
+          # framework output_name and the RTC_OBJC_TYPE_PREFIX to LK).
+          XC_NAME: ${{ matrix.variant == 'plain' && 'WebRTC' || 'LiveKitWebRTC' }}
         run: |
           set -euo pipefail
-          source "$HOME/depot_tools/bootstrap_python3" 2>/dev/null || true
-          bootstrap_python3 2>/dev/null || true
+          # Security review, stage 3: the LK leg used to run the vendored
+          # upstream m150/lk/xcframework.sh, which (a) builds 11 slices
+          # (iOS x64 sim, macOS, Catalyst, tvOS, visionOS) far past this job's
+          # time budget and the G6 arm64-only allow-list, and (b) never
+          # receives GN_ARGS, so the LK framework would have been built with
+          # the GN default rtc_qaudion_transport_strict=true (not switchable)
+          # and treat_warnings_as_errors=true. Both variants now go through
+          # the same build_ios_libs.py invocation; only GN_STRICT and the
+          # (patch-driven) output name differ.
+          # depot_tools lives under $RUNNER_TEMP/webrtc (m150/ci/sync.sh),
+          # which also ran its ensure_bootstrap; fail closed if it did not.
+          test -f "$RUNNER_TEMP/webrtc/depot_tools/python3_bin_reldir.txt"
           GN_ARGS="use_clang_modules=false use_siso=false rtc_use_h264=true rtc_use_h265=true rtc_include_tests=false is_component_build=false rtc_enable_objc_symbol_export=true use_rtti=true rtc_build_examples=false treat_warnings_as_errors=false symbol_level=1 rtc_qaudion_transport_strict=${GN_STRICT}"
           echo "GN_ARGS=$GN_ARGS" >> "$GITHUB_ENV"
-          if [ "${{ matrix.variant }}" = "plain" ]; then
-            vpython3 tools_webrtc/ios/build_ios_libs.py \
-              --build_config release \
-              --arch device:arm64 simulator:arm64 \
-              --extra-gn-args "$GN_ARGS"
-            mkdir -p "$GITHUB_WORKSPACE/out"
-            cp -R out_ios_libs/WebRTC.xcframework "$GITHUB_WORKSPACE/out/"
-            [ -d out_ios_libs/WebRTC.xcframework.dSYMs ] && cp -R out_ios_libs/WebRTC.xcframework.dSYMs "$GITHUB_WORKSPACE/out/" || true
-          else
-            bash "$GITHUB_WORKSPACE/ctrl/m150/lk/xcframework.sh" release "$PWD" "$GITHUB_WORKSPACE/out" LiveKit
+          vpython3 tools_webrtc/ios/build_ios_libs.py \
+            --build_config release \
+            --arch device:arm64 simulator:arm64 \
+            --extra-gn-args "$GN_ARGS"
+          test -d "out_ios_libs/${XC_NAME}.xcframework"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp -R "out_ios_libs/${XC_NAME}.xcframework" "$GITHUB_WORKSPACE/out/"
+          if [ -d "out_ios_libs/${XC_NAME}.xcframework.dSYMs" ]; then
+            cp -R "out_ios_libs/${XC_NAME}.xcframework.dSYMs" "$GITHUB_WORKSPACE/out/"
           fi
           ls -la "$GITHUB_WORKSPACE/out"
 
@@ -211,6 +234,11 @@ jobs:
 
   publish:
     needs: [precheck, build]
+    # Publish each variant that built and passed its gates, even if the other
+    # matrix leg failed: a leg whose build failed never uploaded its artifact
+    # (the upload is the build job's last step, after the gates), so its
+    # publish leg fails closed at the download below.
+    if: ${{ !cancelled() && needs.precheck.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -240,6 +268,11 @@ jobs:
           TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$TAG' now exists - refusing to attach a release to it"
             exit 1
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"

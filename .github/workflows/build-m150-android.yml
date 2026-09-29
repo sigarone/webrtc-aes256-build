@@ -45,10 +45,8 @@ env:
   IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref }}
   IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url }}
   IN_SUFFIX: ${{ github.event.inputs.release_suffix }}
-  # TODO: resolve once (git ls-remote chromium.googlesource.com/.../depot_tools
-  # HEAD, pin a commit contemporary with the m150 cut), then set this as a
-  # repo/org Actions variable. m150/ci/sync.sh fails closed if it is empty.
-  DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
+  # depot_tools is pinned inside m150/ci/sync.sh itself (reviewed constant,
+  # no Actions-variable override - finding #18).
 
 permissions:
   contents: read
@@ -77,7 +75,7 @@ jobs:
           echo "tag_plain=webrtc-android-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
           echo "tag_lk=webrtc-android-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if either release tag already exists (never overwrite a shipped rollback asset)
+      - name: Refuse if either release or git tag already exists (never overwrite a shipped rollback asset)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -85,6 +83,14 @@ jobs:
           for t in "webrtc-android-m150-${IN_SUFFIX}" "webrtc-android-lk-m150-${IN_SUFFIX}"; do
             if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "::error::release tag '$t' already exists - use a new release_suffix"
+              exit 1
+            fi
+            # A bare git tag (no release) would make `gh release create` attach
+            # the new assets to whatever commit that tag already points at.
+            # ls-remote fails (non-zero) on a network error: fail closed.
+            refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$t")
+            if [ -n "$refs" ]; then
+              echo "::error::git tag '$t' already exists - use a new release_suffix"
               exit 1
             fi
           done
@@ -102,6 +108,8 @@ jobs:
     env:
       WORKDIR: /home/runner/webrtc
       GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
+      # Never let a depot_tools wrapper self-update past the pin in sync.sh.
+      DEPOT_TOOLS_UPDATE: "0"
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
@@ -192,6 +200,11 @@ jobs:
 
   publish:
     needs: [precheck, build]
+    # Publish each variant that built and passed its gates, even if the other
+    # matrix leg failed: a leg whose build failed never uploaded its artifact
+    # (the upload is the build job's last step, after the gates), so its
+    # publish leg fails closed at the download below.
+    if: ${{ !cancelled() && needs.precheck.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -221,6 +234,11 @@ jobs:
           TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$TAG' now exists - refusing to attach a release to it"
             exit 1
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"

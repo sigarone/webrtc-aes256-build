@@ -29,9 +29,13 @@ m150/ci/sync.sh              <- pinned depot_tools + gclient sync + hard pin ver
 m150/ci/package-android.sh   <- plain passthrough / lk shadow-relocate+rename
 m150/ios/reclaim-disk.sh
 m150/ios/check-dsym-uuids.sh
-m150/lk/jni_prefix.patch     <- vendored verbatim from webrtc-sdk/webrtc-build@66ed9c7 (MIT)
-m150/lk/apple_prefix.patch   <- idem
-m150/lk/xcframework.sh       <- idem (build/apple/xcframework.sh)
+m150/lk/jni_prefix.patch     <- from webrtc-sdk/webrtc-build@66ed9c7 (MIT); one sdk/android/BUILD.gn
+                                hunk re-based on the pinned tree (same +/- lines, new context)
+m150/lk/apple_prefix.patch   <- idem; plus two build_ios_libs.py lines so the LK binary name
+                                (LiveKitWebRTC) is also used for the lipo/dSYM merge
+m150/lk/xcframework.sh       <- vendored (build/apple/xcframework.sh); NOT used by the M150
+                                workflows (it builds 11 non-arm64 slices and ignores GN args) -
+                                ios-lk is built with build_ios_libs.py like ios
 m150/lk/LICENSE.webrtc-build <- idem (LICENSE)
 ```
 
@@ -73,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/webrtc-sdk/webrtc/<new_ref>/DEPS | 
 | `android` (plain) | `rtc_qaudion_transport_strict=true` | none |
 | `android-lk` | `rtc_qaudion_transport_strict=false` | `m150/lk/jni_prefix.patch` + shadow-relocate/rename |
 | `ios` (plain) | `rtc_qaudion_transport_strict=true` | none |
-| `ios-lk` | `rtc_qaudion_transport_strict=false` | `m150/lk/apple_prefix.patch` (via `xcframework.sh ... LiveKit`) |
+| `ios-lk` | `rtc_qaudion_transport_strict=false` | `m150/lk/apple_prefix.patch` (then `build_ios_libs.py`, same as `ios`) |
 
 P1-P8 (from `m150/series`) apply identically to all four variants - only the
 GN strict flag and the LK-only prefixing patch differ. `apply-series.sh`
@@ -97,17 +101,15 @@ the same series against a host x64 build in both GN configs and runs T1-T6.
 
 ## Open items (for the orchestrator / source-patch author, not done here)
 
-1. **depot_tools pin (finding #18).** `m150/ci/sync.sh` REQUIRES
-   `DEPOT_TOOLS_SHA` (env `M150_DEPOT_TOOLS_SHA` as an Actions variable) and
-   fails closed if it is unset - by design, rather than silently cloning
-   `HEAD` like the M144 workflows do. Resolve once with
-   `git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git HEAD`
-   (a commit contemporary with the m150 cut, ~2026-05) from a host that can
-   reach `*.googlesource.com` - this sandbox could not (503 on every
-   googlesource endpoint tried, GitHub raw/api worked fine throughout).
-2. **T1-T6 gtest filters** in `test-m150-patches.yml` are empty placeholders:
-   the tests land as part of P4-P8, which are still being written in
-   parallel (SOURCE-PATCH author's side, out of this script's ownership).
+1. **depot_tools pin (finding #18).** Done: `m150/ci/sync.sh` hardcodes
+   `DEPOT_TOOLS_SHA=a07c06fe67a1a9d64ac4728df3a11c1ceb0cf73e` (main,
+   2026-09-28) with no Actions-variable override, and runs depot_tools'
+   own `ensure_bootstrap` so the hermetic python3 exists even with
+   `DEPOT_TOOLS_UPDATE=0`.
+2. **T1-T6 gtest filters** are set in `test-m150-patches.yml` (closest
+   existing upstream coverage; T6 still has no test). T1/T2 are
+   upstream-behaviour tests and run only in the switchable config; a filter
+   that matches zero tests now fails the job instead of passing silently.
 3. **G4 detection method is unverified against a real artifact.** No M150
    binary exists yet to test `nm`/raw-byte-scan symbol detection against; see
    the long comment in `gates.sh` for the fallback plan if `symbol_level=1`
@@ -132,8 +134,6 @@ the same series against a host x64 build in both GN configs and runs T1-T6.
 - Run Appendix B (`gh repo sync sigarone/webrtc -b m150_release` +
   create tag `ba469aa2093b-qaudion-m150` via the Git Data API) on the real
   `sigarone/webrtc` fork.
-- Set the `M150_DEPOT_TOOLS_SHA` repository/organization Actions variable
-  once item 1 above is resolved.
 - Push this branch (`m150-ci`) and open/merge whatever PR review process is
   normally used, then dispatch `test-webrtc-m150-patches` first.
 - Confirm `sigarone/webrtc-aes256-build` repo settings match what these
