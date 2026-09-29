@@ -15,6 +15,17 @@
 #   - m150/patches/P4a-opus-dnn-osce-build.patch (OSCE file list: xiph/opus's
 #     own OSCE_SOURCES minus dnn/bbwenet_data.c, which does not exist at
 #     this Opus revision)
+#   - upstream xiph/opus's OWN build description at the pinned commit
+#     (celt_sources.mk CELT_SOURCES, silk_sources.mk SILK_SOURCES +
+#     SILK_SOURCES_FLOAT, opus_sources.mk OPUS_SOURCES + OPUS_SOURCES_FLOAT,
+#     lpcnet_sources.mk DEEP_PLC_SOURCES + OSCE_SOURCES — fetched from
+#     raw.githubusercontent.com/xiph/opus/55513e81.../*_sources.mk and diffed
+#     file-for-file against this list; every path below was also confirmed to
+#     exist in the pinned commit's git tree via the GitHub trees API). This
+#     is what caught celt/mini_kfft.c: it was in an earlier version of this
+#     list but is not a real xiph/opus file at any revision (not in
+#     CELT_SOURCES, not SIMD/RTCD either) and does not exist in the pinned
+#     commit's tree — MSBuild's C1083 on that path was the tell. Removed.
 #
 # No SIMD sources and no OPUS_HAVE_RTCD, matching the private repo and iOS/
 # Android: the DNN and codec kernels resolve to plain C on every platform.
@@ -37,7 +48,6 @@
         "opus/celt/laplace.c",
         "opus/celt/mathops.c",
         "opus/celt/mdct.c",
-        "opus/celt/mini_kfft.c",
         "opus/celt/modes.c",
         "opus/celt/pitch.c",
         "opus/celt/quant_bands.c",
