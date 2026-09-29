@@ -105,11 +105,11 @@ index 38c437e7feda9bfa1ee8aafb864174af1c891913..814989d53484f2b009f08ccfd2c6d0ad
  	<key>CFBundlePackageType</key>
  	<string>FMWK</string>
  	<key>CFBundleShortVersionString</key>
-diff --git forkSrcPrefix/tools_webrtc/ios/build_ios_libs.py forkDstPrefix/tools_webrtc/ios/build_ios_libs.py
-index 50c9398e1739dd765f02e097e7d04544a70221bd..53dc1b12d775b348a40acbf35242a719ec731dc4 100755
---- forkSrcPrefix/tools_webrtc/ios/build_ios_libs.py
-+++ forkDstPrefix/tools_webrtc/ios/build_ios_libs.py
-@@ -27,9 +27,9 @@ sys.path.append(os.path.join(SRC_DIR, 'build'))
+diff --git a/tools_webrtc/ios/build_ios_libs.py b/tools_webrtc/ios/build_ios_libs.py
+index e7967db..8113bf7 100755
+--- a/tools_webrtc/ios/build_ios_libs.py
++++ b/tools_webrtc/ios/build_ios_libs.py
+@@ -28,9 +28,9 @@ sys.path.append(os.path.join(SRC_DIR, 'build'))
  import find_depot_tools
  
  SDK_OUTPUT_DIR = os.path.join(SRC_DIR, 'out_ios_libs')
@@ -122,3 +122,21 @@ index 50c9398e1739dd765f02e097e7d04544a70221bd..53dc1b12d775b348a40acbf35242a719
  
  ENABLED_ARCHS = [
      'device:arm64', 'simulator:arm64', 'simulator:x64',
+@@ -269,7 +269,7 @@ def main():
+         all_lib_paths.extend(lib_paths)
+ 
+         # Combine the slices.
+-        dylib_path = os.path.join(SDK_FRAMEWORK_NAME, 'WebRTC')
++        dylib_path = os.path.join(SDK_FRAMEWORK_NAME, 'LiveKitWebRTC')
+         # Dylibs will be combined, all other files are the same across archs.
+         shutil.rmtree(os.path.join(framework_path, SDK_FRAMEWORK_NAME),
+                       ignore_errors=True)
+@@ -298,7 +298,7 @@ def main():
+                             os.path.join(framework_path, SDK_DSYM_NAME))
+             logging.info('Merging dSYM slices.')
+             dsym_path = os.path.join(SDK_DSYM_NAME, 'Contents', 'Resources',
+-                                     'DWARF', 'WebRTC')
++                                     'DWARF', 'LiveKitWebRTC')
+             lib_dsym_paths = [
+                 os.path.join(path, dsym_path) for path in lib_paths
+             ]
