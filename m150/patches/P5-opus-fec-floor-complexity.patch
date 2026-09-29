@@ -78,8 +78,19 @@ can only ever be -1 or a value its own setter already validated into
 
 Not verified: `clang -fsyntax-only` (same reason as P4b: the local machine
 has no toolchain, and setting up enough of the WebRTC header graph on the
-Helsinki VPS to syntax-check this file would need close to a full gclient
+build VPS to syntax-check this file would need close to a full gclient
 sync).
+
+Security review, stage 3: the floor was only a starting value. The
+original SetProjectedPacketLossRate() still clamped to [0, 20 %], so the
+first RTCP report with 0 % loss (the normal case on a clean call) dropped
+packet_loss_rate_ to 0 and turned LBRR off for the rest of the call, and
+EncodeImpl()'s "re-apply the floor" call passed packet_loss_rate_ back to a
+function that only acts on a change (a no-op). SetProjectedPacketLossRate()
+now clamps to [QaudionMinLossFraction(), 20 %] for every reported value
+(RTCP smoother and ANA alike), and EncodeImpl() re-applies it from the last
+real loss estimate (the smoother's average, or packet_loss_rate_ under
+ANA), so a runtime floor change takes effect in both directions.
 
 diff --git a/api/audio_codecs/opus/audio_encoder_opus_config.h b/api/audio_codecs/opus/audio_encoder_opus_config.h
 index 733586c..de4ba24 100644
@@ -100,7 +111,7 @@ index 733586c..de4ba24 100644
    static constexpr int kDefaultComplexity = 9;
  #endif
 diff --git a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
-index 451fe8b..4cbfbe7 100644
+index 451fe8b..6b58830 100644
 --- a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
 +++ b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
 @@ -45,6 +45,7 @@
@@ -150,7 +161,7 @@ index 451fe8b..4cbfbe7 100644
        inst_(nullptr),
        packet_loss_fraction_smoother_(
            std::make_unique<PacketLossFractionSmoother>(
-@@ -587,6 +611,32 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
+@@ -587,6 +611,39 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
      Buffer* encoded) {
    MaybeUpdateUplinkBandwidth();
  
@@ -172,9 +183,16 @@ index 451fe8b..4cbfbe7 100644
 +      complexity_ = wanted_complexity;
 +      RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
 +    }
-+    // Re-applies the (possibly new) floor on top of whatever
-+    // OnReceivedUplinkPacketLossFraction last reported.
-+    SetProjectedPacketLossRate(packet_loss_rate_);
++    // Re-applies the (possibly new) floor on top of the last real loss
++    // estimate: the smoothed RTCP loss when this encoder is driven by
++    // OnReceivedUplinkPacketLossFraction (0 before the first report, so the
++    // floor alone applies), or the audio network adaptor's own last value
++    // when ANA is in charge. Passing packet_loss_rate_ itself would be a
++    // no-op (SetProjectedPacketLossRate only acts on a change) and would
++    // never lower the effective rate after the floor is lowered.
++    SetProjectedPacketLossRate(
++        audio_network_adaptor_ ? packet_loss_rate_
++                               : packet_loss_fraction_smoother_->GetAverage());
 +    RTC_LOG(LS_WARNING) << "Q-AUDION opus-enc complexity=" << complexity_
 +                        << " min_loss_pct="
 +                        << qaudion::OpusMinPacketLossPercent();
@@ -183,7 +201,7 @@ index 451fe8b..4cbfbe7 100644
    if (input_buffer_.empty())
      first_timestamp_in_buffer_ = rtp_timestamp;
  
-@@ -684,9 +734,23 @@ bool AudioEncoderOpusImpl::RecreateEncoderInstance() {
+@@ -684,9 +741,23 @@ bool AudioEncoderOpusImpl::RecreateEncoderInstance() {
    }
    RTC_CHECK_EQ(
        0, WebRtcOpus_SetMaxPlaybackRate(inst_, config_.max_playback_rate_hz));
@@ -209,7 +227,22 @@ index 451fe8b..4cbfbe7 100644
    RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
    bitrate_changed_ = true;
    if (config_.dtx_enabled) {
-@@ -753,10 +817,16 @@ void AudioEncoderOpusImpl::SetTargetBitrate(int bits_per_second) {
+@@ -729,7 +800,13 @@ void AudioEncoderOpusImpl::SetNumChannelsToEncode(
+ }
+ 
+ void AudioEncoderOpusImpl::SetProjectedPacketLossRate(float fraction) {
+-  fraction = std::min(std::max(fraction, 0.0f), kMaxPacketLossFraction);
++  // Q-Audion (M150 hardening, P5): the FEC floor must hold for EVERY
++  // reported fraction, not only as the constructor's starting value -
++  // otherwise the first RTCP report with 0 % loss (the common case) drops
++  // packet_loss_rate_ to 0 and in-band FEC (LBRR) turns off for the rest of
++  // a clean call. QaudionMinLossFraction() is already <= the 20 % ceiling.
++  fraction = std::min(std::max(fraction, QaudionMinLossFraction()),
++                      kMaxPacketLossFraction);
+   if (packet_loss_rate_ != fraction) {
+     packet_loss_rate_ = fraction;
+     RTC_CHECK_EQ(
+@@ -753,10 +830,16 @@ void AudioEncoderOpusImpl::SetTargetBitrate(int bits_per_second) {
      bitrate_changed_ = true;
    }
  
