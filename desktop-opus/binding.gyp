@@ -187,6 +187,7 @@
       ],
       "include_dirs": [
         "<!@(node -p \"require('node-addon-api').include\")",
+        ".",
         "opus",
         "opus/include",
         "opus/celt",

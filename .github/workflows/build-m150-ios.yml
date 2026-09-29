@@ -217,7 +217,7 @@ jobs:
           RUNNER_IMAGE: macos-26
         run: |
           set -euo pipefail
-          XCODE_VERSION=$(xcodebuild -version | head -1 | awk '{print $2}')
+          XCODE_VERSION=$(xcodebuild -version 2>/dev/null | awk 'NR==1{print $2}')  # no head: SIGPIPE aborts xcodebuild under pipefail
           echo "XCODE_VERSION=$XCODE_VERSION" >> "$GITHUB_ENV"
           XCODE_VERSION="$XCODE_VERSION" python3 ctrl/m150/buildinfo.py ios "${{ matrix.variant }}" > "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
           cat "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
