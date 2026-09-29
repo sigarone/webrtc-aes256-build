@@ -118,7 +118,7 @@ jobs:
 
   build:
     needs: precheck
-    runs-on: windows-latest
+    runs-on: windows-2022  # pinned: windows-latest now ships Visual Studio 18, which node-gyp 11 cannot detect
     timeout-minutes: 45
     permissions:
       contents: read
