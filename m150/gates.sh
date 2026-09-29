@@ -102,7 +102,9 @@ if [ "$PLATFORM" = android ]; then
   [ -n "$BINARIES" ] || gate_fail "G1-G5 setup (no .so found under jni/)"
 else
   [ -d "$ARTIFACT" ] || { echo "::error::gates: ios artifact must be the .xcframework directory" >&2; exit 2; }
-  BINARIES=$(find "$ARTIFACT" -type f \( -name 'WebRTC' -o -name 'LiveKitWebRTC' \))
+  # Mach-O slices only: the dSYM DWARF companions share the file name but
+  # carry no __cstring data, so the mandatory positive control never matches.
+  BINARIES=$(find "$ARTIFACT" -type f \( -name 'WebRTC' -o -name 'LiveKitWebRTC' \) -not -path '*.dSYM/*')
   [ -n "$BINARIES" ] || gate_fail "G1-G5 setup (no Mach-O slice found under $ARTIFACT)"
 fi
 echo "gates: scanning $(printf '%s\n' $BINARIES | wc -l | tr -d ' ') binary file(s):"

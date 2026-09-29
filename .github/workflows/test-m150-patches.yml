@@ -51,12 +51,12 @@ env:
   # T3 (FEC floor): closest existing coverage for the packet-loss-rate bound
   # P5's OpusMinPacketLossPercent() feeds into (0.2 = 20%, the same ceiling
   # P5 clamps its own floor to).
-  T3_FILTER: "AudioEncoderOpusTest.PacketLossRateUpperBounded"
+  T3_FILTER: "*AudioEncoderOpusTest.PacketLossRateUpperBounded*"
   # T4 (decoder PLC): closest existing coverage that exercises the PLC/FEC
   # decode paths P4b's WebRtcOpus_Decode wraps (not deep-PLC/OSCE itself -
   # those are arm64-only and not built by this host-x64 job, see the plan's
   # own note under §6.1).
-  T4_FILTER: "AudioDecoderOpusTest.*Plc*:AudioDecoderOpusTest.*Fec*"
+  T4_FILTER: "*AudioDecoderOpusTest*Plc*:*AudioDecoderOpusTest*Fec*"
   # T5 (encoder complexity): direct existing coverage for
   # AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
   # sits next to (SetTargetBitrate must not clobber an active override).
