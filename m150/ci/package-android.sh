@@ -79,7 +79,16 @@ find "$RAWD" -maxdepth 2
 # or network stall would. $WORK already inherits TMPDIR, so anchoring
 # GRADLE_USER_HOME to it moves every Gradle write onto the same large volume
 # without needing to know the absolute workdir path here.
-export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$WORK/gradle-home}"
+#
+# Must be an unconditional assignment, not "${GRADLE_USER_HOME:-...}": run
+# 36633174033 (first run with this block in place) still showed root at
+# only ~1.1-1.2G free around the gradle invocation, and its "Gate G1-G10"
+# step env dump confirmed why - gradle/actions/setup-gradle unconditionally
+# exports GRADLE_USER_HOME=/home/runner/.gradle into $GITHUB_ENV during the
+# "Set up Gradle 7.6" step, so it is ALREADY non-empty by the time this
+# script runs and the :- default never fired. This build still passed on
+# that ~1G margin, but that's luck, not the fix working - force it here.
+export GRADLE_USER_HOME="$WORK/gradle-home"
 mkdir -p "$GRADLE_USER_HOME"
 
 echo "::group::package-android: relocate classes.jar (org.webrtc -> livekit.org.webrtc)"
