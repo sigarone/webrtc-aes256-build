@@ -200,6 +200,15 @@ this patch is therefore only possible once P8 is integrated (no toolchain
 was available locally for even a partial clang -fsyntax-only check - see the
 stage-1 report).
 
+Security review, stage 3: in QAUDION_TRANSPORT_STRICT builds the DTLS 1.3
+minimum and the AES-256-only cipher configuration are now fixed at compile
+time (#if QAUDION_TRANSPORT_STRICT) instead of depending only on the
+out-of-line qaudion::TransportLevel() returning 3. The relaxed upstream
+cipher list ("...:!AESGCM+AES256:...") is therefore compiled only into the
+switchable (LiveKit) variant; before, it was present in every plain binary
+too, so the binary gate G2 ("plain build must not contain
+'!AESGCM+AES256'") would have failed every plain build.
+
 diff --git a/api/crypto/crypto_options.cc b/api/crypto/crypto_options.cc
 index 08a7bad..4dc3bac 100644
 --- a/api/crypto/crypto_options.cc
@@ -207,7 +216,7 @@ index 08a7bad..4dc3bac 100644
 @@ -173,6 +173,23 @@ void CryptoOptions::EphemeralKeyExchangeCipherGroups::Update(
      });
    }
-
+ 
 +  // Q-Audion (finding #9): "WebRTC-EnableDtlsPqc/Disabled/" is the emergency
 +  // kill switch for the PQC hybrid group that P7's strict-build
 +  // GetDefaultEphemeralKeyExchangeCipherGroups() prefers by default (no
@@ -228,8 +237,28 @@ index 08a7bad..4dc3bac 100644
    // Add those enabled by field-trials first.
    std::vector<uint16_t> current = std::move(enabled_);
    enabled_.clear();
+diff --git a/rtc_base/BUILD.gn b/rtc_base/BUILD.gn
+index 8dc42f5..0a343d0 100644
+--- a/rtc_base/BUILD.gn
++++ b/rtc_base/BUILD.gn
+@@ -1789,6 +1789,15 @@ rtc_library("ssl_adapter") {
+     ":checks",
+     ":digest",
+     ":logging",
++    # Q-Audion (M150 hardening, integrator): P7's OpenSSLStreamAdapter (both
++    # SetupSSLContext()/QaudionHandshakeMeetsPolicy() in
++    # openssl_stream_adapter.cc) and SSLStreamAdapter::
++    # GetDefaultEphemeralKeyExchangeCipherGroups() (ssl_stream_adapter.cc)
++    # read qaudion::TransportLevel()/RequireDtlsPqc() and #include
++    # qaudion_tuning.h directly. Neither P7 (crypto author) nor P8
++    # (audio/API author, who explicitly left this one to the integrator)
++    # added this dep.
++    ":qaudion_tuning",
+     ":safe_conversions",
+     ":socket",
+     ":socket_address",
 diff --git a/rtc_base/openssl_stream_adapter.cc b/rtc_base/openssl_stream_adapter.cc
-index a40c4ec..b194630 100644
+index a40c4ec..f78c486 100644
 --- a/rtc_base/openssl_stream_adapter.cc
 +++ b/rtc_base/openssl_stream_adapter.cc
 @@ -44,6 +44,7 @@
@@ -243,7 +272,7 @@ index a40c4ec..b194630 100644
 @@ -71,6 +72,14 @@
  #error "webrtc requires at least OpenSSL version 1.1.0, to support DTLS-SRTP"
  #endif
-
+ 
 +// Q-Audion (P7): every build variant (strict and switchable) shares the code
 +// below, and the switchable variant's fail-closed path still needs to name
 +// DTLS 1.3 explicitly once the app raises the transport level - so this is
@@ -299,7 +328,7 @@ index a40c4ec..b194630 100644
 @@ -997,6 +1026,30 @@ int OpenSSLStreamAdapter::ContinueSSL() {
        // out if one was missing.
        RTC_DCHECK(peer_cert_chain_ || !GetClientAuthEnabled());
-
+ 
 +      // Q-Audion (P7, finding #10): BoringSSL can complete a DTLS handshake
 +      // under a cipher/version/group SetupSSLContext() could not forbid
 +      // outright (e.g. a TLS 1.3 peer choosing AES-128-GCM - TLS 1.3 cipher
@@ -345,12 +374,10 @@ index a40c4ec..b194630 100644
    RTC_LOG(LS_WARNING) << "OpenSSLStreamAdapter::Error(" << context << ", "
                        << err << ", " << static_cast<int>(alert) << ")";
  #ifdef OPENSSL_IS_BORINGSSL
-@@ -1154,8 +1218,18 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
+@@ -1154,8 +1218,28 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
      return nullptr;
    }
-
--  auto min_version =
--      ssl_mode_ == SSL_MODE_DTLS ? DTLS1_2_VERSION : TLS1_2_VERSION;
+ 
 +  // Q-Audion (P7): in strict 1:1 builds, and in switchable builds once the
 +  // app has raised the transport level to 3 (tighten-only; see
 +  // rtc_base/qaudion_tuning.h / P8), DTLS itself must be 1.3 - the peer
@@ -358,18 +385,29 @@ index a40c4ec..b194630 100644
 +  // then falls back to the sealed relay path instead of retrying ICE). TLS
 +  // mode (used by OpenSSLAdapter for TURN-TLS, a different class) is
 +  // untouched.
-+  const int qaudion_level = qaudion::TransportLevel();  // strict: always 3
++  [[maybe_unused]] const int qaudion_level =
++      qaudion::TransportLevel();  // strict: always 3
++#if QAUDION_TRANSPORT_STRICT
++  // Strict builds: DTLS 1.3 minimum and the AES-256-only list below are
++  // fixed at compile time, not merely by TransportLevel() returning 3, so
++  // the relaxed upstream cipher list is not even present in the binary
++  // (binary gate G2: plain builds must not contain "!AESGCM+AES256").
+   auto min_version =
+-      ssl_mode_ == SSL_MODE_DTLS ? DTLS1_2_VERSION : TLS1_2_VERSION;
++      ssl_mode_ == SSL_MODE_DTLS ? DTLS1_3_VERSION : TLS1_2_VERSION;
++#else
 +  auto min_version = ssl_mode_ == SSL_MODE_DTLS
 +                          ? (qaudion_level >= 3 ? DTLS1_3_VERSION
 +                                                : DTLS1_2_VERSION)
 +                          : TLS1_2_VERSION;
++#endif
    auto max_version = GetMaxVersion(ssl_mode_, ssl_max_version_);
-
+ 
    SSL_CTX_set_min_proto_version(ctx, min_version);
-@@ -1199,13 +1273,54 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
+@@ -1199,13 +1283,61 @@ SSL_CTX* OpenSSLStreamAdapter::SetupSSLContext() {
    SSL_CTX_set_cert_verify_callback(ctx, SSLVerifyCallback, nullptr);
  #endif
-
+ 
 -  // Select list of available ciphers. Note that !SHA256 and !SHA384 only
 -  // remove HMAC-SHA256 and HMAC-SHA384 cipher suites, not GCM cipher suites
 -  // with SHA256 or SHA384 as the handshake hash.
@@ -399,8 +437,12 @@ index a40c4ec..b194630 100644
 +  // levels 0-1 before it starts. So the upstream default list keeps using
 +  // the tolerant setter, and strict validation is reserved for our own,
 +  // hand-picked AES-256-only list.
++#if QAUDION_TRANSPORT_STRICT
++  {
++#else
 +  const bool aes256_only = qaudion_level >= 2;
 +  if (aes256_only) {
++#endif
 +    if (!SSL_CTX_set_strict_cipher_list(
 +            ctx,
 +            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")) {
@@ -420,18 +462,21 @@ index a40c4ec..b194630 100644
 +      SSL_CTX_free(ctx);
 +      return nullptr;
 +    }
-+  } else {
++  }
++#if !QAUDION_TRANSPORT_STRICT
++  else {
 +    SSL_CTX_set_cipher_list(
 +        ctx,
 +        "DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK:!3DES");
 +  }
-
++#endif
+ 
    if (!srtp_ciphers_.empty()) {
      if (SSL_CTX_set_tlsext_use_srtp(ctx, srtp_ciphers_.c_str())) {
-@@ -1455,4 +1570,49 @@ bool OpenSSLStreamAdapter::SetSslGroupIds(const std::vector<uint16_t>& groups) {
+@@ -1455,4 +1587,49 @@ bool OpenSSLStreamAdapter::SetSslGroupIds(const std::vector<uint16_t>& groups) {
    return true;
  }
-
+ 
 +#ifdef OPENSSL_IS_BORINGSSL
 +bool OpenSSLStreamAdapter::QaudionHandshakeMeetsPolicy() {
 +  const int level = qaudion::TransportLevel();  // strict builds: always 3
@@ -485,7 +530,7 @@ index 46335a7..4a287cd 100644
 @@ -196,6 +196,16 @@ class OpenSSLStreamAdapter final : public SSLStreamAdapter {
    // Verify the peer certificate matches the signaled digest.
    bool VerifyPeerCertificate();
-
+ 
 +#ifdef OPENSSL_IS_BORINGSSL
 +  // Q-Audion (P7): checked once, right after a DTLS handshake completes
 +  // (SSL_ERROR_NONE), before the stream is allowed to reach SSL_CONNECTED.
@@ -527,24 +572,3 @@ index 8b6004a..2791713 100644
      return {
  #ifdef SSL_GROUP_X25519_MLKEM768
          SSL_GROUP_X25519_MLKEM768,
-
-diff --git a/rtc_base/BUILD.gn b/rtc_base/BUILD.gn
-index 8dc42f5..0a343d0 100644
---- a/rtc_base/BUILD.gn
-+++ b/rtc_base/BUILD.gn
-@@ -1789,6 +1789,15 @@ rtc_library("ssl_adapter") {
-     ":checks",
-     ":digest",
-     ":logging",
-+    # Q-Audion (M150 hardening, integrator): P7's OpenSSLStreamAdapter (both
-+    # SetupSSLContext()/QaudionHandshakeMeetsPolicy() in
-+    # openssl_stream_adapter.cc) and SSLStreamAdapter::
-+    # GetDefaultEphemeralKeyExchangeCipherGroups() (ssl_stream_adapter.cc)
-+    # read qaudion::TransportLevel()/RequireDtlsPqc() and #include
-+    # qaudion_tuning.h directly. Neither P7 (crypto author) nor P8
-+    # (audio/API author, who explicitly left this one to the integrator)
-+    # added this dep.
-+    ":qaudion_tuning",
-     ":safe_conversions",
-     ":socket",
-     ":socket_address",
