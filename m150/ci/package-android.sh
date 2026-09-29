@@ -64,6 +64,24 @@ mkdir -p "$RAWD"
 unzip -q -o "$RAW_AAR" -d "$RAWD"
 find "$RAWD" -maxdepth 2
 
+# Gradle's default GRADLE_USER_HOME (~/.gradle) lives on the runner's root
+# filesystem. Run 36621762942's build(plain) leg - same sync/patch/build
+# steps as lk, minus packaging - printed `df -h /` right before this script
+# runs and showed root at 100% full (253M free out of 145G), while the big
+# build volume (TMPDIR now lives there, see build-m150-android.yml) had 71G
+# free. gradle/actions/setup-gradle does not relocate GRADLE_USER_HOME, so
+# every lk run to date has pointed the Gradle 7.6 distribution + Shadow
+# plugin + dependency caches at that nearly-full root disk. A write that
+# lands on a filesystem with a few hundred MB left doesn't reliably surface
+# as a clean ENOSPC - it can degrade the whole host (journald, the runner
+# agent's own log upload) before any process gets a clean I/O error, which
+# matches "runner lost, no retrievable log" far better than a plain resource
+# or network stall would. $WORK already inherits TMPDIR, so anchoring
+# GRADLE_USER_HOME to it moves every Gradle write onto the same large volume
+# without needing to know the absolute workdir path here.
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$WORK/gradle-home}"
+mkdir -p "$GRADLE_USER_HOME"
+
 echo "::group::package-android: relocate classes.jar (org.webrtc -> livekit.org.webrtc)"
 mkdir -p "$SHADOW_DIR/libs"
 cp "$RAWD/classes.jar" "$SHADOW_DIR/libs/classes.jar"
@@ -82,8 +100,8 @@ cp "$RAWD/classes.jar" "$SHADOW_DIR/libs/classes.jar"
 # pressure.
 report_resources() {
   label=$1
-  echo "package-android: $label disk:"
-  df -h / "$SHADOW_DIR" 2>&1 | sed 's/^/  /'
+  echo "package-android: $label disk (/ = root, likely near-full; \$SHADOW_DIR project dir; \$GRADLE_USER_HOME = big volume):"
+  df -h / "$SHADOW_DIR" "$GRADLE_USER_HOME" 2>&1 | sed 's/^/  /'
   echo "package-android: $label memory:"
   (free -h 2>/dev/null || vm_stat 2>/dev/null || echo "  (no free/vm_stat on this host)") | sed 's/^/  /'
 }
