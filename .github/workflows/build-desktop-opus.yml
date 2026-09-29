@@ -286,7 +286,7 @@ jobs:
 
   publish:
     needs: [precheck, build]
-    if: ${{ !cancelled() && needs.precheck.result == 'success' }}
+    if: ${{ !cancelled() && needs.precheck.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
