@@ -14,10 +14,17 @@ crypto author) all call into:
   process.
 - RaiseTransportLevel/TransportLevel: 0..3, raise-only, no-op (always 3) in
   QAUDION_TRANSPORT_STRICT builds.
-- DisableMagicBytesBypass/MagicBytesBypassDisabled (finding #13, name not in
-  the plan - picked to match the existing tighten-only naming; the crypto
-  author's P1 amendment calls this): tighten-only, always true in
-  QAUDION_TRANSPORT_STRICT builds.
+- DisableMagicBytesBypass/MagicBytesBypassAllowed (finding #13, name not in
+  the plan - picked to match the existing tighten-only naming; reconciled by
+  the integrator against the crypto author's P1 amendment, which calls
+  qaudion::MagicBytesBypassAllowed() directly): tighten-only, always false in
+  QAUDION_TRANSPORT_STRICT builds. [Integrator, stage 2: this patch's own
+  first draft named the getter MagicBytesBypassDisabled(); P1 was written
+  independently against MagicBytesBypassAllowed(). Renamed here (and
+  inverted the boolean) to the one name both patches now use, since P1 must
+  stay untouched (its line numbers are shared with P2/P3, applied earlier in
+  the series). DisableMagicBytesBypass() itself was already spelled
+  identically in both patches and needed no change.]
 - TuningGeneration: bumped once per setter call that actually changed a
   stored value; P4b/P5 poll it instead of taking a lock or a callback.
 - BuildInfo: ids/booleans/small integers only, safe for telemetry.
@@ -32,12 +39,26 @@ magic-bytes bypass) have no path back to a looser state short of a process
 restart, and QAUDION_TRANSPORT_STRICT builds hard-wire the tightest setting
 regardless of whether the setter was ever called.
 
-QAUDION_TRANSPORT_STRICT is a single macro propagated through
-//:common_inherited_config (root BUILD.gn) from one new GN arg,
-rtc_qaudion_transport_strict (webrtc.gni; default true = plain/strict), so
-every translation unit in a given binary agrees on it - qaudion_tuning.h
-#errors out at compile time if a target didn't route through that config,
-instead of silently linking in a stale per-file default. New rtc_base
+QAUDION_TRANSPORT_STRICT is a single macro propagated through //:common_config
+(root BUILD.gn) from one new GN arg, rtc_qaudion_transport_strict
+(webrtc.gni; default true = plain/strict). common_config is one of
+rtc_add_configs, applied by webrtc.gni's set_defaults() to every
+rtc_library/rtc_source_set/rtc_static_library/rtc_executable/rtc_shared_library/
+rtc_test target's own `configs` - not just to dependents via public_configs,
+so every translation unit built by these templates gets the define directly,
+with no dependency-graph gap possible. [Integrator, stage 2: this paragraph
+originally said "//:common_inherited_config"; the diff below actually edits
+`config("common_config")`, confirmed against the pinned root BUILD.gn (the
+"rtc_use_perfetto" context the hunk below is anchored to sits inside that
+config, not common_inherited_config). Corrected the prose to match the code;
+no behavior changes; common_config's reach turned out to be a superset of
+what common_inherited_config would have given here, since it does not rely
+on any target remembering to depend on qaudion_tuning to inherit the define -
+see the integrator's dep-wiring notes for why several targets needed an
+explicit qaudion_tuning dep for the *symbols*, which is a separate, narrower
+requirement than seeing the macro.] qaudion_tuning.h #errors out at compile
+time if a target somehow still didn't see the define, instead of silently
+linking in a stale per-file default. New rtc_base
 target `qaudion_tuning` (rtc_base/BUILD.gn) is added to the deps of
 modules/audio_coding:webrtc_opus, the sdk/android peerconnection_jni target
 and sdk:peerconnection_objc; api/crypto:options and the ssl_adapter target
@@ -277,11 +298,11 @@ index 0000000..a36d41f
 +  }
 +}
 +
-+bool MagicBytesBypassDisabled() {
++bool MagicBytesBypassAllowed() {
 +#if QAUDION_TRANSPORT_STRICT
-+  return true;
++  return false;
 +#else
-+  return g_magic_bypass_disabled.load(std::memory_order_acquire);
++  return !g_magic_bypass_disabled.load(std::memory_order_acquire);
 +#endif
 +}
 +
@@ -300,7 +321,7 @@ index 0000000..a36d41f
 +  info += " pqc_required=" + std::string(RequireDtlsPqc() ? "1" : "0");
 +  info +=
 +      " magic_bypass_disabled=" +
-+      std::string(MagicBytesBypassDisabled() ? "1" : "0");
++      std::string(MagicBytesBypassAllowed() ? "0" : "1");
 +  info += " enc_cx=" + std::to_string(OpusEncoderComplexity());
 +  info += " dec_cx=" + std::to_string(OpusDecoderComplexity());
 +  info += " min_loss_pct=" + std::to_string(OpusMinPacketLossPercent());
@@ -328,13 +349,14 @@ index 0000000..04fd734
 + *  concurrently with itself.
 + *
 + *  QAUDION_TRANSPORT_STRICT (from webrtc.gni's rtc_qaudion_transport_strict,
-+ *  wired into //:common_inherited_config so every translation unit in the
-+ *  binary agrees on the same value - see BUILD.gn) tells the "fixed" plain
++ *  wired into //:common_config - one of every rtc_library/rtc_source_set/
++ *  etc. target's own default configs, see BUILD.gn - so every translation
++ *  unit in the binary agrees on the same value) tells the "fixed" plain
 + *  builds (1:1 calls, org.webrtc / RTCPeerConnectionFactory) from the
 + *  "switchable" LiveKit-prefixed builds (group calls, an SFU in the
 + *  middle):
 + *    - QAUDION_TRANSPORT_STRICT=1 (plain): TransportLevel() is pinned to 3
-+ *      and MagicBytesBypassDisabled() is pinned to true. RaiseTransportLevel
++ *      and MagicBytesBypassAllowed() is pinned to false. RaiseTransportLevel
 + *      is a no-op. The app cannot loosen anything.
 + *    - QAUDION_TRANSPORT_STRICT=0 (LiveKit): everything starts at today's
 + *      upstream behavior (level 0, bypass allowed) and the app can only
@@ -408,11 +430,11 @@ index 0000000..04fd734
 +// Finding #13: FrameCryptor's `uncrypted_magic_bytes` bypass lets a frame
 +// that merely *ends* with a configured magic value through unauthenticated,
 +// which would let an SFU inject media. Once DisableMagicBytesBypass() is
-+// called it stays disabled for the life of the process (tighten-only). In
-+// QAUDION_TRANSPORT_STRICT builds the bypass is always reported disabled,
-+// independent of whether this setter was ever called.
++// called, MagicBytesBypassAllowed() stays false for the life of the process
++// (tighten-only). In QAUDION_TRANSPORT_STRICT builds the bypass is always
++// reported not-allowed, independent of whether this setter was ever called.
 +void DisableMagicBytesBypass();
-+bool MagicBytesBypassDisabled();
++bool MagicBytesBypassAllowed();
 +
 +// ---------------------------------------------------------------------------
 +// Bumped once for every setter call above that actually changed a stored
