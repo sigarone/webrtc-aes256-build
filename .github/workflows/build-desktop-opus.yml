@@ -1,0 +1,338 @@
+name: build-desktop-opus
+
+# Builds the qaudion-desktop Opus N-API addon (libopus, deep PLC + OSCE) on
+# THIS public repo's free runners, so the owner's private qaudion-desktop
+# repo does not spend its own Actions minutes recompiling it — same reason
+# the M150 WebRTC builds live here (see m150/README.md) rather than in the
+# private repos. Mirrors that job graph exactly (see build-m150-android.yml):
+#
+#   precheck (contents: read)          - validate inputs, refuse if the
+#                                         release tag already exists
+#   build   (contents: read) <- needs precheck
+#     matrix: win32-x64 (Electron 42)  - fetches Opus source (xiph/opus,
+#                                         pinned commit) + DNN weights
+#                                         (sha256-pinned tarball) fresh from
+#                                         their official public hosts, NEVER
+#                                         from qaudion-desktop; compiles;
+#                                         self-tests under Node AND Electron;
+#                                         gates on deep-PLC/OSCE symbols;
+#                                         uploads a workflow artifact only
+#                                         (no repo/release access in this
+#                                         job).
+#   publish (contents: write,
+#            id-token: write,
+#            attestations: write) <- needs [precheck, build]
+#                                       - downloads the build artifact,
+#                                         RE-VERIFIES sha256, re-checks the
+#                                         tag is still free, attests, creates
+#                                         the release.
+#
+# All dispatch inputs reach the shell ONLY via env, charset-validated in
+# `precheck` before anything else runs. See desktop-opus/PINS.md for the
+# Opus commit / weights sha256 this defaults to and why.
+#
+# PUBLIC REPO — nothing private may land here. No qaudion-desktop call/user/
+# device ids, no internal hostnames or IPs, no tokens. desktop-opus/PINS.md
+# documents exactly what was and was not copied from the private repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_suffix:
+        description: "appended to the tag, e.g. osce-1 (the FULL tag - desktop-opus-<this> - must not already exist)"
+        required: true
+      opus_commit:
+        description: "xiph/opus commit to build (40 hex chars) - default is the exact commit the phone (M150) builds already use, see desktop-opus/PINS.md"
+        default: "55513e81d8f606bd75d0ff773d2144e5f2a732f5"
+      opus_weights_sha256:
+        description: "sha256 of the Opus DNN weights tarball for opus_commit above - default is PINS.md's verified value"
+        default: "160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58"
+
+env:
+  IN_SUFFIX: ${{ github.event.inputs.release_suffix }}
+  IN_OPUS_COMMIT: ${{ github.event.inputs.opus_commit }}
+  IN_WEIGHTS_SHA256: ${{ github.event.inputs.opus_weights_sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Validate dispatch inputs (charset allow-list, fail closed)
+        run: |
+          set -euo pipefail
+          case "$IN_SUFFIX" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_suffix: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
+          case "$IN_OPUS_COMMIT" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "::error::opus_commit: must be exactly 40 lowercase hex chars"; exit 1 ;; esac
+          case "$IN_WEIGHTS_SHA256" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "::error::opus_weights_sha256: must be exactly 64 lowercase hex chars"; exit 1 ;; esac
+
+      - name: Checkout this repo (desktop-opus/ scripts, for the cross-check below)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Cross-check opus_weights_sha256 against the pin fetch-opus-dnn-weights.sh actually enforces
+        # That script's own MODEL_SHA256 constant is authoritative and does NOT
+        # read this input (a workflow_dispatch input silently overriding which
+        # hash a download is trusted against would be a supply-chain footgun
+        # for anyone with dispatch access). This step exists so a mismatched
+        # input fails LOUDLY here instead of the two numbers silently
+        # disagreeing between the release notes/BUILDINFO and what was
+        # actually verified.
+        run: |
+          set -euo pipefail
+          BAKED=$(grep -m1 -oE 'MODEL_SHA256=[0-9a-f]{64}' ctrl/desktop-opus/fetch-opus-dnn-weights.sh | cut -d= -f2)
+          if [ "$BAKED" != "$IN_WEIGHTS_SHA256" ]; then
+            echo "::error::opus_weights_sha256 input ($IN_WEIGHTS_SHA256) does not match the constant baked into fetch-opus-dnn-weights.sh ($BAKED). That script is authoritative -- update MODEL_SHA256 there (and PINS.md) first, in its own commit, rather than relying on this input to change what gets verified."
+            exit 1
+          fi
+
+      - name: Compute + reserve tag name
+        id: tag
+        run: |
+          set -euo pipefail
+          echo "tag=desktop-opus-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if the release or git tag already exists (never overwrite a shipped rollback asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="desktop-opus-${IN_SUFFIX}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$TAG' already exists - use a new release_suffix"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$TAG' already exists - use a new release_suffix"
+            exit 1
+          fi
+
+  build:
+    needs: precheck
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: win32-x64, arch: x64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout this repo (desktop-opus/ scripts + addon sources)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Fetch Opus source (pinned commit, official xiph/opus mirror only)
+        run: bash ctrl/desktop-opus/fetch-opus-source.sh "$RUNNER_TEMP/work" "$IN_OPUS_COMMIT"
+
+      - name: Fetch Opus DNN weights (sha256-pinned)
+        # Verifies against MODEL_SHA256, the constant baked into this script
+        # itself (NOT the opus_weights_sha256 input — precheck's cross-check
+        # step already failed the whole run if those two disagree).
+        run: bash ctrl/desktop-opus/fetch-opus-dnn-weights.sh "$RUNNER_TEMP/work/opus"
+
+      - name: Assemble the addon build directory
+        run: |
+          set -euo pipefail
+          cp ctrl/desktop-opus/opus_addon.cc "$RUNNER_TEMP/work/"
+          cp ctrl/desktop-opus/binding.gyp "$RUNNER_TEMP/work/"
+          cp ctrl/desktop-opus/config.h "$RUNNER_TEMP/work/"
+          cp ctrl/desktop-opus/index.cjs "$RUNNER_TEMP/work/"
+          cp ctrl/desktop-opus/package.json "$RUNNER_TEMP/work/"
+          ls -la "$RUNNER_TEMP/work"
+
+      - name: Install build deps
+        working-directory: ${{ runner.temp }}/work
+        run: npm install --ignore-scripts
+
+      # Node ABI first (not Electron's) — this is what the immediately-following
+      # Node self-test loads with a plain `node -e`. Building against Electron's
+      # headers here instead would produce a NODE_MODULE_VERSION mismatch the
+      # instant that self-test tried to require() it — exactly the class of
+      # ABI mixup the private repo's own build-opus-addon.yml separates into
+      # two distinct build steps for. The Electron-ABI build is a SEPARATE
+      # step further down, right before the Electron self-test.
+      - name: Build addon (Node ABI, for the Node self-test)
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          npx node-gyp configure --arch=${{ matrix.arch }}
+          npx node-gyp build
+
+      - name: Gate — deep-PLC and OSCE (LACE + NoLACE) data actually compiled in
+        run: node ctrl/desktop-opus/check-symbols.mjs "$RUNNER_TEMP/work/build/Release/qaudion_opus.node"
+
+      - name: Self-test under Node (encode/decode/conceal, OSCE complexity 6+7)
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          node -e "
+            const opus = require('./index.cjs');
+            const info = opus.buildInfo();
+            console.log('libopus:', info.version);
+            console.log('deepPlcCompiled:', info.deepPlcCompiled, 'osceCompiled:', info.osceCompiled);
+            if (!info.deepPlcCompiled) { console.error('FAIL: no ENABLE_DEEP_PLC'); process.exit(1); }
+            if (!info.osceCompiled) { console.error('FAIL: no ENABLE_OSCE'); process.exit(1); }
+
+            const enc = new opus.Encoder({ channels: 1, sample_rate: 48000, application: 'voip' });
+            enc.bitrate = 32000; enc.vbr = false;
+            const pcm = new Int16Array(2880);
+            for (let i = 0; i < pcm.length; i++) pcm[i] = Math.round(8000 * Math.sin(i / 12));
+            const packet = enc.encode(pcm);
+            console.log('encoded 60ms frame:', packet.length, 'bytes');
+            if (packet.length < 100 || packet.length > 400) { console.error('FAIL: implausible packet size'); process.exit(1); }
+
+            for (const level of [5, 6, 7]) {
+              const dec = new opus.Decoder({ channels: 1, sample_rate: 48000, complexity: level });
+              if (dec.complexity !== level) { console.error('FAIL: complexity ' + level + ' not armed, decoder reports ' + dec.complexity); process.exit(1); }
+              const out = dec.decode(packet);
+              if (out.length !== 5760) { console.error('FAIL: decode at complexity ' + level + ' produced ' + out.length + ' bytes'); process.exit(1); }
+              const concealed = dec.decodePlc(2880);
+              let energy = 0;
+              const view = new DataView(concealed.buffer, concealed.byteOffset, concealed.byteLength);
+              for (let i = 0; i < 2880; i++) energy += Math.abs(view.getInt16(i * 2, true));
+              console.log('complexity', level, 'PLC/OSCE frame mean |amplitude|:', (energy / 2880).toFixed(1));
+              if (energy === 0) { console.error('FAIL: complexity ' + level + ' concealment returned digital silence'); process.exit(1); }
+            }
+            console.log('OK: deep PLC + OSCE (complexity 5/6/7) all live under Node');
+          "
+
+      - name: Rebuild against Electron's ABI for the in-Electron self-test
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          set -euo pipefail
+          ELECTRON_VERSION=$(node -p "require('./package.json').devDependencies.electron.replace(/^[^0-9]*/,'')")
+          echo "electron: $ELECTRON_VERSION"
+          rm -rf build/Release
+          npx node-gyp configure --arch=${{ matrix.arch }} --target="$ELECTRON_VERSION" --dist-url=https://electronjs.org/headers
+          npx node-gyp build
+
+      - name: Self-test inside Electron
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          cat > electron-opus-check.cjs <<'SCRIPT'
+          const { app } = require('electron');
+          app.whenReady().then(() => {
+            try {
+              const opus = require('./index.cjs');
+              const info = opus.buildInfo();
+              console.log('electron libopus:', info.version, 'osceCompiled:', info.osceCompiled);
+              if (!info.deepPlcCompiled) throw new Error('no ENABLE_DEEP_PLC');
+              if (!info.osceCompiled) throw new Error('no ENABLE_OSCE');
+              const enc = new opus.Encoder({ channels: 1, sample_rate: 48000, application: 'voip' });
+              enc.bitrate = 32000; enc.vbr = false;
+              const pcm = new Int16Array(2880);
+              for (let i = 0; i < pcm.length; i++) pcm[i] = Math.round(8000 * Math.sin(i / 12));
+              const packet = enc.encode(pcm);
+              const dec = new opus.Decoder({ channels: 1, sample_rate: 48000, complexity: 7 });
+              if (dec.decode(packet).length !== 5760) throw new Error('bad decode length');
+              const concealed = dec.decodePlc(2880);
+              let energy = 0;
+              const view = new DataView(concealed.buffer, concealed.byteOffset, concealed.byteLength);
+              for (let i = 0; i < 2880; i++) energy += Math.abs(view.getInt16(i * 2, true));
+              if (energy === 0) throw new Error('NoLACE concealment returned digital silence');
+              console.log('OK inside Electron: OSCE (NoLACE, complexity 7) live');
+              app.exit(0);
+            } catch (err) {
+              console.error('FAIL inside Electron:', err && err.message);
+              app.exit(1);
+            }
+          });
+          SCRIPT
+          npx electron electron-opus-check.cjs
+
+      - name: Rename artifact + BUILDINFO.json (BEFORE SHA256SUMS)
+        working-directory: ${{ runner.temp }}/work
+        env:
+          NODE_VERSION: '22'
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          ELECTRON_VERSION=$(node -p "require('./package.json').devDependencies.electron.replace(/^[^0-9]*/,'')")
+          mkdir -p out
+          cp "build/Release/qaudion_opus.node" "out/qaudion-opus-${{ matrix.name }}.node"
+          ELECTRON_VERSION="$ELECTRON_VERSION" bash "$GITHUB_WORKSPACE/ctrl/desktop-opus/buildinfo.sh" \
+            "$IN_OPUS_COMMIT" "$IN_WEIGHTS_SHA256" "out/qaudion-opus-${{ matrix.name }}.node" > out/BUILDINFO.json
+          cat out/BUILDINFO.json
+
+      - name: SHA256SUMS (covers the .node AND BUILDINFO.json)
+        working-directory: ${{ runner.temp }}/work
+        run: (cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload build artifact (workflow-scoped only — no repo/release access in this job)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-opus-${{ matrix.name }}
+          path: ${{ runner.temp }}/work/out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [precheck, build]
+    if: ${{ !cancelled() && needs.precheck.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: desktop-opus-win32-x64
+          path: out
+
+      - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.precheck.outputs.tag }}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$TAG' now exists - refusing to attach a release to it"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "out/*.node\nout/SHA256SUMS"
+
+      - name: Create release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Desktop Opus addon (deep PLC + OSCE), source xiph/opus@${IN_OPUS_COMMIT}, weights sha256 ${IN_WEIGHTS_SHA256}. See BUILDINFO.json and the build-provenance attestation." \
+            out/*
