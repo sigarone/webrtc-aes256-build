@@ -527,3 +527,24 @@ index 8b6004a..2791713 100644
      return {
  #ifdef SSL_GROUP_X25519_MLKEM768
          SSL_GROUP_X25519_MLKEM768,
+
+diff --git a/rtc_base/BUILD.gn b/rtc_base/BUILD.gn
+index 8dc42f5..0a343d0 100644
+--- a/rtc_base/BUILD.gn
++++ b/rtc_base/BUILD.gn
+@@ -1789,6 +1789,15 @@ rtc_library("ssl_adapter") {
+     ":checks",
+     ":digest",
+     ":logging",
++    # Q-Audion (M150 hardening, integrator): P7's OpenSSLStreamAdapter (both
++    # SetupSSLContext()/QaudionHandshakeMeetsPolicy() in
++    # openssl_stream_adapter.cc) and SSLStreamAdapter::
++    # GetDefaultEphemeralKeyExchangeCipherGroups() (ssl_stream_adapter.cc)
++    # read qaudion::TransportLevel()/RequireDtlsPqc() and #include
++    # qaudion_tuning.h directly. Neither P7 (crypto author) nor P8
++    # (audio/API author, who explicitly left this one to the integrator)
++    # added this dep.
++    ":qaudion_tuning",
+     ":safe_conversions",
+     ":socket",
+     ":socket_address",

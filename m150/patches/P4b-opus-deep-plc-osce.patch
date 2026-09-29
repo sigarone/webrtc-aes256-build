@@ -257,3 +257,22 @@ index 4fb1dff..ae0f02a 100644
  /****************************************************************************
   * WebRtcOpus_Decode(...)
   *
+
+diff --git a/modules/audio_coding/BUILD.gn b/modules/audio_coding/BUILD.gn
+index c09e5ea..8fbbe3e 100644
+--- a/modules/audio_coding/BUILD.gn
++++ b/modules/audio_coding/BUILD.gn
+@@ -333,6 +333,13 @@ rtc_library("webrtc_opus_wrapper") {
+   deps = [
+     "../../rtc_base:checks",
+     "../../rtc_base:ignore_wundef",
++    # Q-Audion (M150 hardening, integrator): P4b's WebRtcOpus_DecoderCtl
++    # (opus_interface.cc) reads qaudion::OpusDecoderComplexity() /
++    # kQaudionDefaultDecoderComplexity and #includes qaudion_tuning.h
++    # directly. webrtc_opus (above) already got this dep from P8, but
++    # webrtc_opus_wrapper is a separate target and P8 didn't touch this
++    # file.
++    "../../rtc_base:qaudion_tuning",
+   ]
+ 
+   if (rtc_build_opus) {

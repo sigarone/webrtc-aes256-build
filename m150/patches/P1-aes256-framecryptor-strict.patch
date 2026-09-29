@@ -78,6 +78,20 @@ from raw.githubusercontent.com at the pinned commit - not the local partial
 scan tree, which was found to differ from the pinned blobs for several files
 including port.cc and pc/jsep_transport_controller.{cc,h}).
 
+Integrator, stage 2: reconciled qaudion::MagicBytesBypassAllowed() /
+qaudion::DisableMagicBytesBypass() against P8 (P8's own first draft spelled
+the getter MagicBytesBypassDisabled(); renamed and inverted there rather
+than here, since this file's line numbers are shared with P2/P3 and must not
+move - see qaudion_tuning.h/.cc in P8 for the actual fix). Also appended a
+hunk to api/crypto/BUILD.gn adding the frame_crypto_transformer target's
+missing rtc_base:qaudion_tuning dep (this file's own #include of
+qaudion_tuning.h has no GN dep behind it otherwise; neither this patch's
+original author nor P8 added one - P8's commit message explicitly leaves
+frame_crypto_transformer's wiring to the integrator). Re-verified the full
+series (P1..P7 in order, plus P4a in the separate third_party checkout)
+applies clean, `git apply --check` then a real apply, against a fresh copy
+of the exact pinned blobs for every file the series touches.
+
 diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
 index 1b4b4de..bc1038a 100644
 --- a/api/crypto/frame_crypto_transformer.cc
@@ -243,3 +257,20 @@ index 6d01653..90fe57a 100644
    }
 
    bool DecryptionFailure() {
+diff --git a/api/crypto/BUILD.gn b/api/crypto/BUILD.gn
+index e116a99..9454556 100644
+--- a/api/crypto/BUILD.gn
++++ b/api/crypto/BUILD.gn
+@@ -25,6 +25,12 @@ rtc_library("frame_crypto_transformer") {
+ 
+   deps = [
+    "//api:frame_transformer_interface",
++    # Q-Audion (M150 hardening, integrator): P1's decryptFrame() gates the
++    # uncrypted_magic_bytes bypass on qaudion::MagicBytesBypassAllowed()
++    # (rtc_base/qaudion_tuning.h, P8) and #includes that header directly, so
++    # this target needs the dep even though P8 (applied later in the
++    # series) never edits this file itself.
++    "//rtc_base:qaudion_tuning",
+   ]
+ 
+   if (rtc_build_ssl) {

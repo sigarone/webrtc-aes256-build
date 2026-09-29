@@ -169,3 +169,39 @@ index 2ec3050..a1e95d3 100644
      RTC_LOG(LS_INFO)
          << "Creating UnencryptedRtpTransport, because encryption is disabled.";
      rtp_transport = CreateUnencryptedRtpTransport(
+
+diff --git a/api/crypto/BUILD.gn b/api/crypto/BUILD.gn
+index 9454556..a455b74 100644
+--- a/api/crypto/BUILD.gn
++++ b/api/crypto/BUILD.gn
+@@ -49,6 +49,13 @@ rtc_library("options") {
+   deps = [
+     "..:field_trials_view",
+     "../../rtc_base:checks",
++    # Q-Audion (M150 hardening, integrator): P6/P7 gate
++    # GetSupportedDtlsSrtpCryptoSuites()/cryptex_policy/
++    # EphemeralKeyExchangeCipherGroups::Update() on qaudion::TransportLevel()
++    # and #include qaudion_tuning.h directly. Neither the crypto author's
++    # patches nor P8 (which explicitly left this one to the integrator - see
++    # P8's own commit message) added this dep.
++    "../../rtc_base:qaudion_tuning",
+     "../../rtc_base:ssl_adapter",
+     "../../rtc_base/system:rtc_export",
+     "//third_party/abseil-cpp/absl/algorithm:container",
+diff --git a/pc/BUILD.gn b/pc/BUILD.gn
+index c4847e0..255ef1c 100644
+--- a/pc/BUILD.gn
++++ b/pc/BUILD.gn
+@@ -322,6 +322,12 @@ rtc_library("jsep_transport_controller") {
+     "../rtc_base:event_tracer",
+     "../rtc_base:logging",
+     "../rtc_base:macromagic",
++    # Q-Audion (M150 hardening, integrator): P6's CreateRtpTransport() reads
++    # qaudion::TransportLevel() (finding #12, disableEncryption) and
++    # #includes qaudion_tuning.h directly. Neither P6 (crypto author) nor P8
++    # (audio/API author, who explicitly left this one to the integrator)
++    # added this dep.
++    "../rtc_base:qaudion_tuning",
+     "../rtc_base:ssl",
+     "../rtc_base:ssl_adapter",
+     "../rtc_base:threading",
