@@ -110,11 +110,42 @@ jobs:
       GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
       # Never let a depot_tools wrapper self-update past the pin in sync.sh.
       DEPOT_TOOLS_UPDATE: "0"
+      # Root cause of runs 36547153188/36598248775/36621762942/36627163222
+      # ("build (lk)" always dying with the runner lost, no retrievable
+      # log): the Actions runner's OWN worker crashed with an unhandled
+      # System.IO.IOException ("No space left on device") writing its
+      # _diag trace log to /home/runner/actions-runner/... on the ROOT
+      # filesystem (confirmed via the check-run annotation on run
+      # 36627163222) - not a script-level failure at all. build-livekit-
+      # android.yml (M144, the workflow this lk path was ported from)
+      # already routes depot_tools/vpython/pip caches onto the large build
+      # volume instead of root's default $HOME/.cache; this workflow never
+      # picked that up, so gclient sync + vpython3 (used by both variants,
+      # not just lk) have been writing those caches onto root all along.
+      CIPD_CACHE_DIR: /home/runner/webrtc/.cipd
+      XDG_CACHE_HOME: /home/runner/webrtc/.cache
+      PIP_CACHE_DIR: /home/runner/webrtc/.pipcache
+      VPYTHON_VIRTUALENV_ROOT: /home/runner/webrtc/.vpython
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
         with:
-          root-reserve-mb: 4096
+          # root-reserve-mb is "space to be left free on the root
+          # filesystem" - requested 4096 (4G) on the last 4 runs. The lk
+          # leg's own log for those runs isn't retrievable (the runner that
+          # crashed never flushed it), but the build(plain) leg's log IS
+          # retrievable and runs the identical "Maximize build space" step
+          # on an identical runner image right before it: its own "Disk
+          # space report after modification" showed root at 100M avail
+          # immediately afterward, before any of this workflow's own steps
+          # ran. Whatever accounts for that ~4G gap (rounding, filesystem
+          # reserve blocks, or something else in that pinned action
+          # version), it is a reasonable proxy for what lk's runner saw too,
+          # so the fix here is margin, not precision: ask for 16384 (16G)
+          # instead. The build volume has 71G free at 24% used (this build
+          # uses ~22-24G of it), so giving 12G more of that back to root
+          # costs nothing.
+          root-reserve-mb: 16384
           swap-size-mb: 12288
           remove-dotnet: 'true'
           remove-android: 'true'
