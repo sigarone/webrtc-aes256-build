@@ -26,14 +26,16 @@
 #                     or "ios,mac"
 # env:
 #   WEBRTC_FORK_URL     default https://github.com/sigarone/webrtc.git
-#   DEPOT_TOOLS_SHA     REQUIRED, full 40-hex commit of chromium/tools/depot_tools
-#                        to pin (finding #18). No default: an unpinned
-#                        depot_tools drifts silently (exactly what finding #18
-#                        flagged in the M144 workflows) - resolve it once with
-#                        `git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git HEAD`
-#                        (a commit contemporary with the m150 cut, ~2026-05)
-#                        and pass it in via the workflow env. This script
-#                        refuses to guess and fails closed if it is unset.
+#
+# depot_tools is pinned below (DEPOT_TOOLS_SHA), the same way WEBRTC_PIN/
+# BORINGSSL_PIN/OPUS_PIN are: a hardcoded 40-hex constant, not an
+# Actions-variable input. Finding #18 was that an UNPINNED depot_tools
+# drifts silently; a workflow-level override would reopen exactly that hole
+# (a vars/secrets value that can be changed without a patch review would
+# just move the drift one layer up), so there is deliberately no env
+# override here - integrator, stage 2. To re-pin (e.g. depot_tools ships a
+# breaking change for this m150 cut), edit DEPOT_TOOLS_SHA below in a
+# reviewed commit, the same way the source pins above are re-pinned.
 # exit: 0 ok | 1 sync/verification failed | 2 usage/env problem
 set -eu
 
@@ -47,12 +49,11 @@ case "$WEBRTC_REF" in ''|*[!A-Za-z0-9._/-]*) echo "::error::sync: webrtc_ref cha
 case "$TARGET_OS_CSV" in ''|*[!A-Za-z0-9,_-]*) echo "::error::sync: target_os charset [A-Za-z0-9,_-] only" >&2; exit 2 ;; esac
 
 : "${WEBRTC_FORK_URL:=https://github.com/sigarone/webrtc.git}"
-if [ -z "${DEPOT_TOOLS_SHA:-}" ]; then
-  echo "::error::sync: DEPOT_TOOLS_SHA is not set - refusing to install an unpinned depot_tools (finding #18)." >&2
-  echo "  Resolve once with: git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git HEAD" >&2
-  echo "  then pass it as env DEPOT_TOOLS_SHA in the workflow (a commit contemporary with the m150 cut, ~2026-05)." >&2
-  exit 2
-fi
+# Pinned 2026-09-28 (chromium/tools/depot_tools HEAD at that date, per
+# `git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git HEAD`,
+# contemporary with the m150 cut). Hardcoded, no env override - see the
+# comment block above.
+DEPOT_TOOLS_SHA=a07c06fe67a1a9d64ac4728df3a11c1ceb0cf73e
 case "$DEPOT_TOOLS_SHA" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "::error::sync: DEPOT_TOOLS_SHA must be a full 40-hex commit" >&2; exit 2 ;; esac
 
 # Pins resolved 2026-09-28 from webrtc-sdk/webrtc@ba469aa2093ba950066258ca0a59a6fbd1295582's
