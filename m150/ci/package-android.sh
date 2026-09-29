@@ -9,9 +9,11 @@
 #          and repackage, EXACTLY the steps build-livekit-android.yml (M144)
 #          already does inline - lifted out to a script so build-m150-android.yml
 #          can call one line per variant instead of duplicating ~60 lines of
-#          YAML twice. Needs `gradle` (shadowJar via shadow-relocate/) and
-#          `unzip`/`zip` on PATH; the workflow sets up Java+Gradle before
-#          calling this.
+#          YAML twice. Needs `gradle` (shadowJar via shadow-relocate/),
+#          `unzip`/`zip`, and GNU coreutils `timeout` on PATH; the workflow
+#          sets up Java+Gradle before calling this. The lk shadowJar
+#          invocation runs under a hard `timeout` with bounded GRADLE_OPTS -
+#          see the comment above that call for why.
 #
 # usage: package-android.sh <plain|lk> <raw_aar> <out_dir>
 # exit: 0 ok | 1 packaging failed | 2 usage problem
@@ -65,10 +67,48 @@ find "$RAWD" -maxdepth 2
 echo "::group::package-android: relocate classes.jar (org.webrtc -> livekit.org.webrtc)"
 mkdir -p "$SHADOW_DIR/libs"
 cp "$RAWD/classes.jar" "$SHADOW_DIR/libs/classes.jar"
+
+# Runs 36547153188 and 36598248775 hung here ~30 min with no retrievable log
+# (runner lost) after run 36534186215 hit ENOSPC in /tmp. Two independent
+# failure modes for one step means it gets a hard budget instead of trusting
+# the job's 350-minute ceiling: an unbounded --no-daemon JVM (heap sized off
+# whatever RAM maximize-build-space left) can either OOM the runner outright
+# or, short of that, start swapping hard enough to look identical to a
+# network stall; a plugin/dependency resolution call with no explicit HTTP
+# timeout can also sit retrying against a half-open TCP connection for a
+# very long time. `timeout` below turns either failure into a loud, fast
+# exit instead of a silent one; GRADLE_OPTS bounds the JVM so a real hang is
+# more likely to be the network path (visible in --info) than raw memory
+# pressure.
+report_resources() {
+  label=$1
+  echo "package-android: $label disk:"
+  df -h / "$SHADOW_DIR" 2>&1 | sed 's/^/  /'
+  echo "package-android: $label memory:"
+  (free -h 2>/dev/null || vm_stat 2>/dev/null || echo "  (no free/vm_stat on this host)") | sed 's/^/  /'
+}
+
+report_resources "pre-gradle"
+
+export GRADLE_OPTS="-Xmx2g -Xms256m -Dorg.gradle.internal.http.connectionTimeout=60000 -Dorg.gradle.internal.http.socketTimeout=60000 -Dorg.gradle.internal.repository.max.retries=1"
+GRADLE_STEP_TIMEOUT=20m
+
+set +e
 (
   cd "$SHADOW_DIR"
-  gradle --no-daemon shadowJar
+  timeout -k 30s "$GRADLE_STEP_TIMEOUT" gradle --no-daemon --console=plain --stacktrace --info shadowJar
 )
+gradle_rc=$?
+set -e
+report_resources "post-gradle"
+if [ "$gradle_rc" -eq 124 ] || [ "$gradle_rc" -eq 137 ]; then
+  echo "::error::package-android: gradle shadowJar timed out after $GRADLE_STEP_TIMEOUT (rc=$gradle_rc) - likely stuck plugin/dependency resolution or an OOM-adjacent stall, see --info output and the resource report above" >&2
+  exit 1
+elif [ "$gradle_rc" -ne 0 ]; then
+  echo "::error::package-android: gradle shadowJar failed (rc=$gradle_rc)" >&2
+  exit 1
+fi
+
 RELOCATED=$(find "$SHADOW_DIR/build/libs" -name '*-all.jar' | head -1)
 [ -n "$RELOCATED" ] || { echo "::error::package-android: shadowJar produced no *-all.jar" >&2; exit 1; }
 unzip -l "$RELOCATED" | grep -q 'livekit/org/webrtc/' || { echo "::error::package-android: relocated jar has no livekit/org/webrtc/ entries" >&2; exit 1; }

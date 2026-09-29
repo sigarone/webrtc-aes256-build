@@ -167,6 +167,16 @@ jobs:
           gradle-version: '7.6'
 
       - name: Package (plain passthrough / lk shadow-relocate+rename)
+        # Stage-level safety net on top of package-android.sh's own internal
+        # `timeout 20m` around the lk gradle invocation (runs 36547153188 /
+        # 36598248775 hung here ~30 min with the runner lost and no log): if
+        # the internal timeout somehow doesn't fire (e.g. the runner itself
+        # stops scheduling processes under memory pressure), this bounds the
+        # whole step instead of silently eating the job's 350-minute budget.
+        # plain finishes in well under a minute; 25 gives the lk leg's
+        # internal 20m timeout room to fire and still report before this
+        # outer limit would kill the step.
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           # The root fs keeps only ~4 GB after maximize-build-space and the
