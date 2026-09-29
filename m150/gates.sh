@@ -273,13 +273,16 @@ if [ "$PLATFORM" = android ]; then
   CJ="$AAR_SCAN/classes.jar"
   [ -f "$CJ" ] || gate_fail "G8 (no classes.jar in AAR)"
   unzip -l "$CJ" | grep -qE '(livekit/)?org/webrtc/PeerConnectionFactory\.class' || gate_fail "G8 (PeerConnectionFactory.class not found in classes.jar)"
+  # The Java method lives in classes.jar; the .so only carries the jni_zero
+  # native export, e.g. Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionOpusEncoderComplexity
+  # (capital S after the 'native' prefix), so match the .so case-insensitively.
+  PCF_CLASS=$(unzip -l "$CJ" | awk '{print $4}' | grep -E '^(livekit/)?org/webrtc/PeerConnectionFactory\.class$' | head -1)
+  unzip -p "$CJ" "$PCF_CLASS" | grep -a -q -F 'setQaudionOpusEncoderComplexity' || gate_fail "G8 (PeerConnectionFactory.class lacks setQaudionOpusEncoderComplexity)"
   found=0
   for f in $BINARIES; do
-    grep -a -q -F 'setQaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
-    grep -a -q -F 'Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
-    grep -a -q -F 'Java_livekit_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
+    grep -a -q -i -F 'QaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
   done
-  [ "$found" -eq 1 ] || gate_fail "G8 (no setQaudionOpusEncoderComplexity JNI symbol/string in any .so)"
+  [ "$found" -eq 1 ] || gate_fail "G8 (no QaudionOpusEncoderComplexity JNI export in any .so)"
 else
   HDR=$(find "$ARTIFACT" -path '*/Headers/*' -iname '*PeerConnectionFactory*' 2>/dev/null | head -1)
   [ -n "$HDR" ] || gate_fail "G8 (no *PeerConnectionFactory* header under Headers/ in $ARTIFACT)"
