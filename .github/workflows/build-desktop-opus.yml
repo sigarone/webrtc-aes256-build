@@ -69,8 +69,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$IN_SUFFIX" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_suffix: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
-          case "$IN_OPUS_COMMIT" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "::error::opus_commit: must be exactly 40 lowercase hex chars"; exit 1 ;; esac
-          case "$IN_WEIGHTS_SHA256" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) echo "::error::opus_weights_sha256: must be exactly 64 lowercase hex chars"; exit 1 ;; esac
+          printf %s "$IN_OPUS_COMMIT" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::opus_commit: must be exactly 40 lowercase hex chars"; exit 1; }
+          printf %s "$IN_WEIGHTS_SHA256" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::opus_weights_sha256: must be exactly 64 lowercase hex chars"; exit 1; }
 
       - name: Checkout this repo (desktop-opus/ scripts, for the cross-check below)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
