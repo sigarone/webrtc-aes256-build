@@ -8,14 +8,18 @@ name: test-webrtc-m150-patches
 # for that. Meant to run on every patch-series PR, well before a 3-5h mobile
 # build is worth dispatching.
 #
-# TODO (SOURCE-PATCH author, not this workflow's owner - see m150/series /
-# m150/patches/* ownership in webrtc-plan.md's "SHARED CONTRACT"): T1-T6 are
-# listed in the plan by BEHAVIOR, not yet by gtest target/filter, because the
-# tests land as part of P4-P8 (still being written in parallel with this
-# workflow). Fill in T1_FILTER..T6_FILTER below once those tests exist; until
-# then this job builds + applies the series (which already proves the patches
-# apply cleanly against a fresh checkout) and runs whatever filter is set,
-# skipping cleanly (not failing) when a filter is still the TODO placeholder.
+# Integrator, stage 2: P1-P8 are in now (m150/patches/*, m150/series), so
+# T1-T6 are filled in below with the closest EXISTING upstream gtest
+# coverage for the functions each patch actually changed (webrtc-plan.md
+# §6.1 describes T1-T6 by behavior, not by test name; none of P1-P8 added a
+# new _unittest.cc of its own, so there is no test that exercises the new
+# qaudion:: runtime API calls directly yet - see the T6 note below). This
+# still isn't a substitute for the full matrix in §6.2-6.3 (real DTLS/SRTP
+# interop against old peers, deep PLC/OSCE on-device, etc.) - it is exactly
+# what the plan asks this workflow for: a fast, free, host-x64 compile +
+# regression check on every patch-series PR, before a 3-5h mobile build is
+# worth dispatching. A still-empty filter is skipped, not failed, by the
+# run step below.
 
 on:
   workflow_dispatch:
@@ -34,14 +38,34 @@ env:
   DEPOT_TOOLS_SHA: ${{ vars.M150_DEPOT_TOOLS_SHA }}
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
-  # TODO (source-patch author): gtest filters for T1-T6, e.g.
-  #   T1_FILTER: "SrtpTest.*AeadAes256*"
-  # Left empty = skipped (not failed) by the run step below.
-  T1_FILTER: ""
-  T2_FILTER: ""
-  T3_FILTER: ""
-  T4_FILTER: ""
-  T5_FILTER: ""
+  # T1 (SRTP): api/crypto/crypto_options_unittest.cc already covers exactly
+  # the function P6 rewrites (CryptoOptions::GetSupportedDtlsSrtpCryptoSuites).
+  T1_FILTER: "CryptoOptionsTest.GetSupportedDtlsSrtpCryptoSuites*"
+  # T2 (DTLS): rtc_base/ssl_stream_adapter_unittest.cc's value-parameterized
+  # DTLS-version fixture, run across DTLS 1.2 x 1.3 (client x server) - covers
+  # the version/cipher outcomes in the plan's §6.1 table, plus
+  # TestGetSslGroupIdWithPqc (X25519MLKEM768 negotiation, P7's other half).
+  # It does not cover the plan's stock-client/INCOMPATIBLE_CIPHERSUITE/
+  # QaudionHandshakeMeetsPolicy rows - those need real cross-version fixtures
+  # this file doesn't have; still open, see the integrator's report.
+  T2_FILTER: "*SSLStreamAdapterTestDTLSHandshakeVersion*"
+  # T3 (FEC floor): closest existing coverage for the packet-loss-rate bound
+  # P5's OpusMinPacketLossPercent() feeds into (0.2 = 20%, the same ceiling
+  # P5 clamps its own floor to).
+  T3_FILTER: "AudioEncoderOpusTest.PacketLossRateUpperBounded"
+  # T4 (decoder PLC): closest existing coverage that exercises the PLC/FEC
+  # decode paths P4b's WebRtcOpus_Decode wraps (not deep-PLC/OSCE itself -
+  # those are arm64-only and not built by this host-x64 job, see the plan's
+  # own note under §6.1).
+  T4_FILTER: "AudioDecoderOpusTest.*Plc*:AudioDecoderOpusTest.*Fec*"
+  # T5 (encoder complexity): direct existing coverage for
+  # AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
+  # sits next to (SetTargetBitrate must not clobber an active override).
+  T5_FILTER: "AudioEncoderOpusTest.ConfigComplexityAdaptation"
+  # T6 (BuildInfo/transport markers): rtc_base/qaudion_tuning.{h,cc} (P8) is a
+  # brand-new file with no existing unittest - still a genuine TODO, but now
+  # for whoever adds rtc_base/qaudion_tuning_unittest.cc (new test authoring,
+  # not integration), not a placeholder for missing patches.
   T6_FILTER: ""
 
 jobs:
