@@ -77,7 +77,7 @@ touched files) and for new RTC_CHECK (none added).
 Not verified: `clang -fsyntax-only` (see the M150 brief's note that the
 local machine has no toolchain; setting up enough of the WebRTC header
 graph - abseil, jni_zero, the rest of modules/audio_coding - on the
-Helsinki VPS to syntax-check a single .cc file would need close to a full
+build VPS to syntax-check a single .cc file would need close to a full
 gclient sync of the source tree, which is not "cheap" and risks its disk
 budget, so I did not attempt it).
 

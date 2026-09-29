@@ -74,7 +74,7 @@ src/third_party).
 
 Verified: unlike P8/P4b/P5, I could not reach chromium.googlesource.com
 directly from this sandbox for most of this session (persistent 503s on
-every subdomain, including from the owner's own Helsinki VPS, so this
+every subdomain, including from the owner's own build VPS, so this
 looks like an upstream outage rather than a local restriction) - `git
 apply --check`/symbol-checking this patch therefore first went through
 guesswork based on the plan's own Appendix A. I then found that the VPS
@@ -112,8 +112,17 @@ nnet.h/osce.h/osce_features.h from src/dnn, which this patch adds to
 include_dirs) so nothing in the sources list should be missing an include
 path.
 
+Security review, stage 3: added DISABLE_DEBUG_FLOAT next to
+ENABLE_DEEP_PLC/ENABLE_OSCE. All three upstream build systems define it by
+default (configure.ac, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG=OFF, meson
+dnn-debug-float=disabled); without it every *_data.c also compiles a float
+copy of each int8 weight matrix and nnet.c runs the float "debug" path:
+~12.2 MB of weights instead of ~3.0 MB (counted on the pinned tarball),
+which alone would break the G7 size gate (1-6 MB growth) and is not the
+configuration the OSCE/deep-PLC operating point was measured with.
+
 diff --git a/opus/BUILD.gn b/opus/BUILD.gn
-index 1b75504..2d96764 100644
+index 1b75504..a19d58a 100644
 --- a/opus/BUILD.gn
 +++ b/opus/BUILD.gn
 @@ -12,6 +12,19 @@ use_opus_x86_optimization = current_cpu == "x86" || current_cpu == "x64"
@@ -144,7 +153,7 @@ index 1b75504..2d96764 100644
    ]
  
    cflags = []
-@@ -103,6 +117,22 @@ config("opus_private_config") {
+@@ -103,6 +117,36 @@ config("opus_private_config") {
  
      if (current_cpu == "arm64") {
        defines += [ "OPUS_ARM_PRESUME_AARCH64_NEON_INTR" ]
@@ -163,11 +172,25 @@ index 1b75504..2d96764 100644
 +      # simulator arm64). Macro names are xiph/opus's own
 +      # (configure.ac: --enable-deep-plc/--enable-osce; CMakeLists.txt:
 +      # OPUS_OSCE) and stable across releases.
-+      defines += [ "ENABLE_DEEP_PLC", "ENABLE_OSCE" ]
++      #
++      # DISABLE_DEBUG_FLOAT (security review, stage 3): every upstream build
++      # system defines it by default (configure.ac --enable-dnn-debug-float
++      # defaults to no, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG defaults to OFF,
++      # meson dnn-debug-float defaults to disabled). Without it the *_data.c
++      # files also compile a float copy of every int8 weight matrix and
++      # nnet.c then runs the "debug" float path: ~12.2 MB of weights instead
++      # of ~3.0 MB (measured on the pinned model tarball) and a slower,
++      # non-default inference path than the one the OSCE/deep-PLC operating
++      # point was measured with.
++      defines += [
++        "ENABLE_DEEP_PLC",
++        "ENABLE_OSCE",
++        "DISABLE_DEBUG_FLOAT",
++      ]
      }
    }
  }
-@@ -432,6 +462,40 @@ static_library("opus") {
+@@ -432,6 +476,40 @@ static_library("opus") {
        "src/silk/arm/macros_armv5e.h",
      ]
    }
