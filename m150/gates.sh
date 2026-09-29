@@ -286,9 +286,11 @@ if [ "$PLATFORM" = android ]; then
   done
   [ "$found" -eq 1 ] || gate_fail "G8 (no QaudionOpusEncoderComplexity JNI export in any .so)"
 else
-  HDR=$(find "$ARTIFACT" -path '*/Headers/*' -iname '*PeerConnectionFactory*' 2>/dev/null | head -1)
-  [ -n "$HDR" ] || gate_fail "G8 (no *PeerConnectionFactory* header under Headers/ in $ARTIFACT)"
-  grep -q -i 'setQaudionOpusEncoderComplexity' "$HDR" || gate_fail "G8 (header $HDR does not declare setQaudionOpusEncoderComplexity)"
+  # Several headers match *PeerConnectionFactory* (e.g. ...FactoryOptions.h),
+  # so look for the declaration itself in the framework's public headers.
+  HDR=$(find "$ARTIFACT" -path '*/Headers/*' -name '*.h' -exec grep -l 'setQaudionOpusEncoderComplexity' {} + 2>/dev/null | head -1)
+  [ -n "$HDR" ] || gate_fail "G8 (no public header under Headers/ declares setQaudionOpusEncoderComplexity in $ARTIFACT)"
+  case "$HDR" in *PeerConnectionFactory.h) ;; *) gate_fail "G8 (setQaudionOpusEncoderComplexity declared in unexpected header $HDR)";; esac
   found=0
   for f in $BINARIES; do
     grep -a -q -F 'setQaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1

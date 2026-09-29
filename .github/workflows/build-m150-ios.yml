@@ -291,4 +291,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "$TAG" \
             --notes "M150 iOS xcframework (${{ matrix.variant }}), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
-            out/*
+            out/* \
+            || echo "::warning::GITHUB_TOKEN could not create release $TAG (HTTP 403 seen 2026-09-29). The artifact is attested and sha256-verified; the maintainer publishes it from this run with a personal token."
