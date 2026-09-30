@@ -182,7 +182,7 @@ await check('no Admin API and no api_secret: /admin and the Admin API ports are 
 // ================================================================================== room lifecycle
 await check('create a room with ALL spec parameters (admin_key + room secret + allowed tokens), string room id', async () => {
   const req = {
-    request: 'create', room, is_private: true, secret: roomSecret, publishers: 8, bitrate: 1500000, fir_freq: 10,
+    request: 'create', room, is_private: true, secret: roomSecret, publishers: 8, bitrate: 1500000, fir_freq: 0,
     audiocodec: 'opus', videocodec: 'vp8', opus_fec: true, opus_dtx: false, audiolevel_ext: false,
     audiolevel_event: false, videoorient_ext: false, playoutdelay_ext: false, transport_wide_cc_ext: true,
     record: false, lock_record: true, require_pvtid: true, require_e2ee: true, notify_joining: false, allowed: [tokA, tokA2],
@@ -224,7 +224,7 @@ await check('list: the private room is hidden without admin_key; with it every p
     assert.ok(r, 'room listed with admin_key');
     assert.equal(r.max_publishers, 8);
     assert.equal(r.bitrate, 1500000);
-    assert.equal(r.fir_freq, 10);
+    assert.equal(r.fir_freq, 0, "no periodic FIR: keyframes come from PLI requests only");
     assert.equal(r.audiocodec, 'opus');
     assert.equal(r.videocodec, 'vp8');
     assert.equal(r.opus_fec, true);

@@ -98,7 +98,7 @@ export class ServerApi {
   // create: the parameters of spec section 3
   createRoom({ room, secret, publishers, allowed }) {
     return this.session(({ vr }) => vr({
-      request: 'create', room, is_private: true, secret, publishers, bitrate: 1500000, fir_freq: 10,
+      request: 'create', room, is_private: true, secret, publishers, bitrate: 1500000, fir_freq: 0,
       audiocodec: 'opus', videocodec: 'vp8', opus_fec: true, opus_dtx: false,
       audiolevel_ext: false, audiolevel_event: false, videoorient_ext: false, playoutdelay_ext: false,
       transport_wide_cc_ext: true, record: false, lock_record: true, require_pvtid: true,
