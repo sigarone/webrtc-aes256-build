@@ -9,6 +9,8 @@
 #   QJANUS_HTTP_BIND      address of the server-facing HTTP API        (default 127.0.0.1)
 #   QJANUS_DTLS_CERT      DTLS certificate (PEM)                       (default /etc/qjanus/dtls.crt)
 #   QJANUS_DTLS_KEY       DTLS private key (PEM)                       (default $CREDENTIALS_DIRECTORY/dtls.key)
+#   QJANUS_NAT_1_1        public IPv4 to advertise when the node sits behind a 1:1 NAT (optional;
+#                         nodes that carry their public address on an interface need nothing)
 set -euo pipefail
 
 # the release directory as this script was reached: /opt/qjanus/current/... stays "current"
@@ -29,6 +31,13 @@ QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTO
 [[ $QJANUS_TOKEN_SECRET =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_TOKEN_SECRET must be 32-128 lowercase hex characters"
 [[ $QJANUS_ADMIN_KEY =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_ADMIN_KEY must be 32-128 lowercase hex characters"
 [[ $QJANUS_HTTP_BIND =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || die "QJANUS_HTTP_BIND must be an IPv4 or IPv6 address"
+QJANUS_NAT_1_1=${QJANUS_NAT_1_1:-}
+if [ -n "$QJANUS_NAT_1_1" ]; then
+  [[ $QJANUS_NAT_1_1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "QJANUS_NAT_1_1 must be an IPv4 address"
+  NAT_LINE="nat_1_1_mapping = \"$QJANUS_NAT_1_1\""
+else
+  NAT_LINE="# nat_1_1_mapping is not set (QJANUS_NAT_1_1 is empty)"
+fi
 [[ $QJANUS_DTLS_CERT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_CERT must be an absolute path"
 [[ $QJANUS_DTLS_KEY =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_KEY must be an absolute path"
 [[ $ROOT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the release directory path has unsupported characters"
@@ -49,10 +58,11 @@ for t in "$TMPL"/*.jcfg.tmpl; do
     -e "s|@QJANUS_HTTP_BIND@|$QJANUS_HTTP_BIND|g" \
     -e "s|@QJANUS_DTLS_CERT@|$QJANUS_DTLS_CERT|g" \
     -e "s|@QJANUS_DTLS_KEY@|$QJANUS_DTLS_KEY|g" \
+    -e "s|@QJANUS_NAT_1_1_LINE@|$NAT_LINE|g" \
     "$t" > "$f.tmp"
   if grep -q '@QJANUS_' "$f.tmp"; then
     rm -f "$f.tmp"; die "unreplaced placeholder in $(basename "$t")"
   fi
   mv -f "$f.tmp" "$f"
 done
-echo "qjanus-render-config: rendered $(ls "$OUT" | wc -l) files into $OUT (http bind $QJANUS_HTTP_BIND)" >&2
+echo "qjanus-render-config: rendered $(ls "$OUT" | wc -l) files into $OUT" >&2

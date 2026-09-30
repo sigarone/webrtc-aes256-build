@@ -310,6 +310,11 @@ jobs:
           export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
           OUT_DIR="$OUT_DIR/conformance" SECRETS_FILE="$RUNNER_TEMP/secrets-conformance.json" node conformance.mjs 2>&1 | tee "$OUT_DIR/conformance.log"
 
+      - name: Caddy in front of the WebSocket API (qjanus/conf/Caddyfile.example, the block the README tells to add)
+        env:
+          QJANUS_FINGERPRINT: ${{ steps.install.outputs.fp }}
+        run: bash qjanus/test/caddy-check.sh
+
       - name: E2E - Chromium (PQC trial) group calls with E2EE frames, simulcast, netem loss/reorder, refused peers
         working-directory: qjanus/test/e2e
         run: |
@@ -325,7 +330,7 @@ jobs:
           set -euo pipefail
           sudo journalctl -u qjanus -o cat --no-pager > "$OUT_DIR/journal.txt"
           files=""
-          for f in "$RUNNER_TEMP"/secrets-conformance.json "$RUNNER_TEMP"/secrets-e2e.json; do [ -f "$f" ] && files="$files $f"; done
+          for f in "$RUNNER_TEMP"/secrets-conformance.json "$RUNNER_TEMP"/secrets-caddy.json "$RUNNER_TEMP"/secrets-e2e.json; do [ -f "$f" ] && files="$files $f"; done
           # shellcheck disable=SC2086
           node qjanus/test/lib/check-logs.mjs "$OUT_DIR/journal.txt" $files
 
@@ -345,6 +350,15 @@ jobs:
           set -euo pipefail
           FP1='${{ steps.install.outputs.fp }}'
           rel1=$(basename "$(readlink -f /opt/qjanus/current)")
+          # the address of the server-facing HTTP API is a node setting (the VPN address on a remote node): change it, check, put it back
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 2> "$RUNNER_TEMP/bind.log"); cat "$RUNNER_TEMP/bind.log"
+          [ "$FPB" = "$FP1" ]
+          sudo ss -Hltn | grep -q '127.0.0.2:8088'
+          if sudo ss -Hltn | grep -q '127.0.0.1:8088'; then echo "::error::the HTTP API still listens on 127.0.0.1"; exit 1; fi
+          sudo ss -Hltn | grep -q '127.0.0.1:8188'
+          curl -sf http://127.0.0.2:8088/janus/info | grep -q server_info
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log"); cat "$RUNNER_TEMP/bind.log"
+          sudo ss -Hltn | grep -q '127.0.0.1:8088'
           # a second release: the same tree with another VERSION
           sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
           echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null

@@ -12,7 +12,9 @@ case "${1:-}" in
     for m in sch_prio sch_netem cls_u32; do modprobe "$m" 2> /dev/null || true; done
     tc qdisc del dev "$DEV" root 2> /dev/null || true
     tc qdisc add dev "$DEV" root handle 1: prio bands 4 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-    tc qdisc add dev "$DEV" parent 1:4 handle 40: netem delay 10ms reorder "$REORDER" 50% loss "$LOSS"
+    if [ "$REORDER" = 0% ]; then NETEM_OPTS="loss $LOSS"; else NETEM_OPTS="delay 10ms reorder $REORDER 50% loss $LOSS"; fi
+    # shellcheck disable=SC2086
+    tc qdisc add dev "$DEV" parent 1:4 handle 40: netem $NETEM_OPTS
     tc filter add dev "$DEV" protocol ip parent 1: prio 1 u32 match ip protocol 17 0xff flowid 1:4
     tc filter add dev "$DEV" protocol ipv6 parent 1: prio 2 u32 match ip6 protocol 17 0xff flowid 1:4
     tc qdisc show dev "$DEV"

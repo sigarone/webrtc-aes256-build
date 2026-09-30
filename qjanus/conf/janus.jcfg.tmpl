@@ -58,6 +58,8 @@ nat: {
 	ice_lite = true
 	ice_tcp = false
 	ice_ignore_list = "vmnet,docker,veth,br-,virbr,lxc,wg"
+	# only for a node behind a 1:1 NAT (QJANUS_NAT_1_1 in /etc/qjanus/qjanus.env)
+	@QJANUS_NAT_1_1_LINE@
 }
 
 # No other plugins, transports, event handlers or loggers exist in the build; nothing to disable.

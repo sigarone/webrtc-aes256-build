@@ -168,7 +168,7 @@ class Peer {
     assert.equal(m.jsep.type, 'answer');
     this.pubAnswer = m.jsep.sdp;
     await evalIn(this, ([i, s]) => window.q.setAnswer(i, s), [this.pubPc, m.jsep.sdp]);
-    await this.c.waitEvent((e) => e.janus === 'webrtcup' && e.sender === this.pubHandle, 20000);
+    await this.c.waitEvent((e) => e.janus === 'webrtcup' && e.sender === this.pubHandle, this.upTimeout);
   }
   // every other participant's key must be installed BEFORE its track is rendered (section 5.4)
   async learnKey(other) {
@@ -344,28 +344,33 @@ try {
       assert.ok(c.subMidMap && Object.keys(c.subMidMap).length === 4, 'C subscribes to 2 streams of each of 2 publishers');
     });
 
-    await check('simulcast: the publisher sends 3 layers, the subscriber can select them (substream 0 < 1 < 2 by frame width) with E2EE frames', async () => {
+    await check('simulcast: the publisher sends 3 layers of 160/320/640 px, the subscriber selects each substream (0 < 1 < 2) and gets exactly that size, with E2EE frames', async () => {
       const [A, B] = peers;
       const st = await B.stats(B.pubPc);
-      const rids = st.outbound.filter((x) => x.kind === 'video' && x.rid).filter((x) => x.packetsSent > 0).map((x) => x.rid).sort();
-      assert.deepEqual(rids, ['h', 'l', 'm'], 'B sends all three simulcast layers');
+      const layers = st.outbound.filter((x) => x.kind === 'video' && x.rid && x.packetsSent > 0);
+      assert.deepEqual(layers.map((x) => x.rid).sort(), ['h', 'l', 'm'], 'B sends all three simulcast layers');
+      const out = Object.fromEntries(layers.map((x) => [x.rid, x.frameWidth]));
+      assert.ok(out.l > 0 && out.l < out.m && out.m < out.h, `three distinct layer sizes: ${JSON.stringify(out)}`);
       const vs = (await A.stats(A.subPc)).inbound.find((x) => x.kind === 'video' && A.subMidMap[x.mid] === B.id);
       assert.ok(vs, 'A receives the video of B');
       const videoMid = vs.mid;
-      const widths = {};
-      for (const sub of [0, 1, 2, 0]) {
+      const timeline = [];
+      for (const [sub, want] of [[0, out.l], [1, out.m], [2, out.h], [0, out.l]]) {
         const m = await A.c.message(A.subHandle, { request: 'configure', streams: [{ mid: videoMid, substream: sub, temporal: 2 }] });
         assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 200));
-        await sleep(4500);
-        const s = await A.stats(A.subPc);
-        const v = s.inbound.find((x) => x.mid === videoMid);
-        widths[sub] = v.frameWidth;
+        const end = Date.now() + 20000;
+        let got = 0;
+        while (Date.now() < end) {
+          const v = (await A.stats(A.subPc)).inbound.find((x) => x.mid === videoMid);
+          got = v ? v.frameWidth : 0;
+          if (got === want) break;
+          await sleep(500);
+        }
+        timeline.push(`${sub}:${got}/${want}`);
+        assert.equal(got, want, `substream ${sub}: frame width ${got}, expected ${want} (${timeline.join(' ')}; sent ${JSON.stringify(out)})`);
       }
-      const flat = widths;
-      assert.ok(flat[0] > 0 && flat[1] > 0 && flat[2] > 0, `frames decoded at every substream: ${JSON.stringify(flat)}`);
-      assert.ok(flat[0] <= flat[1] && flat[1] <= flat[2] && flat[0] < flat[2], `substream 0 is the lowest layer: ${JSON.stringify(flat)}`);
       await assertE2ee(A, [B.id]);
-      return `widths(substream 0/1/2)=${flat[0]}/${flat[1]}/${flat[2]}`;
+      return `sent=${JSON.stringify(out)} selected=${timeline.join(' ')}`;
     });
 
     await check('key rotation with E2EE: a sender switches to a new key index; receivers that hold it keep decrypting, without failures', async () => {
@@ -375,6 +380,7 @@ try {
       for (const p of peers) if (p !== A) await evalIn(p, ([id, i, k]) => window.q.setRecvKey(id, i, k), [A.id, 2, newKey]);
       const before = await assertE2ee(B, [A.id]);
       await evalIn(A, ([k, i]) => window.q.setSendKey(k, i), [newKey, 2]);
+      A.key = newKey; A.keyIndex = 2;     // later joiners learn the current key of A
       await sleep(4000);
       const w = await mediaWindow(B);
       assertFlowing(B, w, [A.id, peers[2].id]);
@@ -505,6 +511,46 @@ try {
         execFileSync('sudo', ['-n', 'bash', NETEM, 'off'], { stdio: 'inherit' });
         for (const p of peers) await p.close().catch(() => {});
       }
+    });
+  }
+
+  if (SUITE === 'loss' || SUITE === 'all') {
+    // The DTLS 1.3 retransmission/ACK timer has to keep running after the handshake (spec section 6):
+    // with the stock behaviour only ~75 % of the handshakes survive 30 % loss when Janus is the DTLS client.
+    const SOAK_N = Number(process.env.SOAK_N || 8);
+    async function soakOnce(i) {
+      const room = await makeRoom(4);
+      const pub = await new Peer(`P${i}`, pqc, room, { simulcast: false, upTimeout: 25000 }).open();
+      const sub = await new Peer(`Q${i}`, pqc, room, { simulcast: false, upTimeout: 25000 }).open();
+      const r = { pub: false, sub: false };
+      const t0 = Date.now();
+      try {
+        await api.allow(room, S.roomSecret, 'add', [pub.joinToken, sub.joinToken]);
+        await sub.learnKey(pub);
+        await pub.join(); await sub.join();
+        await pub.publish();                                    // publisher PC: Janus is the DTLS client
+        r.pub = levelOk(await pub.transport(pub.pubPc));
+        await sub.subscribe([{ id: pub.id, streams: [{ mid: '0' }, { mid: '1' }] }]);   // subscriber PC: Janus offers
+        r.sub = levelOk(await sub.transport(sub.subPc));
+      } catch (e) { r.error = String((e && e.message) || e).slice(0, 160); }
+      r.ms = Date.now() - t0;
+      await pub.close().catch(() => {}); await sub.close().catch(() => {});
+      await api.destroyRoom(room, S.roomSecret).catch(() => {});
+      return r;
+    }
+    await check(`netem loss 30 %: ${SOAK_N} of ${SOAK_N} publisher + subscriber DTLS 1.3 handshakes complete at the required level`, async () => {
+      execFileSync('sudo', ['-n', 'bash', NETEM, 'on', '30%', '0%'], { stdio: 'inherit' });
+      const runs = [];
+      try {
+        for (let i = 0; i < SOAK_N; i++) runs.push(await soakOnce(i));
+      } finally {
+        execFileSync('sudo', ['-n', 'bash', NETEM, 'off'], { stdio: 'inherit' });
+      }
+      const ok = runs.filter((r) => r.pub && r.sub).length;
+      const detail = `pub ${runs.filter((r) => r.pub).length}/${SOAK_N}, sub ${runs.filter((r) => r.sub).length}/${SOAK_N}, median ${runs.map((r) => r.ms).sort((a, b) => a - b)[Math.floor(runs.length / 2)]} ms` +
+        (runs.some((r) => r.error) ? `, errors: ${runs.filter((r) => r.error).map((r) => r.error).join(' | ')}` : '');
+      assert.equal(ok, SOAK_N, detail);
+      return detail;
     });
   }
 
