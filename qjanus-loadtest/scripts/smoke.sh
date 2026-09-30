@@ -125,8 +125,12 @@ start_janus() {
   JPID=$!
   local i up=0
   for i in $(seq 1 60); do
-    if curl -sf --max-time 3 "$QJANUS_ADMIN_URL/info" > "$RUN/info.raw.json" 2>/dev/null \
-       && (exec 3<>/dev/tcp/127.0.0.1/8188) 2>/dev/null; then up=1; break; fi
+    # WebSocket port first, then the info: the HTTP transport answers before the WebSockets
+    # transport is registered, and `info` lists only the transports registered so far
+    if (exec 3<>/dev/tcp/127.0.0.1/8188) 2>/dev/null; then
+      sleep 1
+      if curl -sf --max-time 3 "$QJANUS_ADMIN_URL/info" > "$RUN/info.raw.json" 2>/dev/null; then up=1; break; fi
+    fi
     kill -0 "$JPID" 2>/dev/null || break
     sleep 1
   done
