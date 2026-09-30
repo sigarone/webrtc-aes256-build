@@ -95,3 +95,12 @@ binary only by the patches in this repo:
 The two iOS release workflows refuse to overwrite an existing release asset
 (earlier releases are rollback binaries the app pins by checksum): every build
 needs a NEW `release_tag`, and the tag is created at the built commit.
+
+## qjanus (group-call SFU node) — `qjanus/`, `.github/workflows/qjanus.yml`
+
+`qjanus/` builds the patched Janus VideoRoom SFU of the group calls v2 for Ubuntu 24.04 x86_64 from pinned
+sources (Janus v1.4.2, BoringSSL `f91f1447`, libsrtp 2.8.1 on the BoringSSL backend, libnice 0.1.24):
+DTLS 1.3 + X25519MLKEM768 + TLS_AES_256_GCM_SHA384 + SRTP AEAD_AES_256_GCM only, fail closed. The workflow builds
+a relocatable tarball, installs it under systemd like a node, and runs an API conformance suite, headless
+Chromium end-to-end tests (E2EE frames, simulcast, netem loss) and negative tests. Node install, upgrade and
+uninstall: `qjanus/README.md`. A release is created only by running the workflow with `release_tag=qjanus-<version>`.
