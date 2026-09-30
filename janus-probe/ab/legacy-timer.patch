@@ -1,8 +1,8 @@
 diff --git a/src/dtls.c b/src/dtls.c
-index d727c47..59ed31b 100644
+index 190d321..2628e12 100644
 --- a/src/dtls.c
 +++ b/src/dtls.c
-@@ -1176,15 +1176,8 @@ gboolean janus_dtls_retry(gpointer stack) {
+@@ -1182,15 +1182,8 @@ gboolean janus_dtls_retry(gpointer stack) {
  	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP))
  		goto stoptimer;
  	if(dtls->dtls_state == JANUS_DTLS_STATE_CONNECTED) {

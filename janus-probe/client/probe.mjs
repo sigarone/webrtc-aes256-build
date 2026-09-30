@@ -376,13 +376,14 @@ async function soakOnce(browser, timeoutMs) {
     await janus.send(hp, { request: 'publish', audio: true, video: true }, { type: 'offer', sdp: offer });
     const ans = await janus.waitFor((e) => e.sender === hp && e.jsep, 15000);
     await pa.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['pub', ans.jsep.sdp]);
+    const sp = await waitConnected(pa, 'pub', timeoutMs);
     const hs = await janus.attach('janus.plugin.videoroom');
     janus.trickle[hs] = (c) => pb.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['sub', c]).catch(() => {});
     await janus.send(hs, { request: 'join', ptype: 'subscriber', room: 1234, streams: [{ feed: pluginData(joined).id }] });
     const att = await janus.waitFor((e) => e.sender === hs && e.jsep, 15000);
     const answer = await pb.evaluate(([s, o]) => window.probe.makeAnswer('sub', s, o), [att.jsep.sdp, {}]);
     await janus.send(hs, { request: 'start', room: 1234 }, { type: 'answer', sdp: answer });
-    const [sp, ss] = await Promise.all([waitConnected(pa, 'pub', timeoutMs), waitConnected(pb, 'sub', timeoutMs)]);
+    const ss = await waitConnected(pb, 'sub', timeoutMs);
     await sleep(1500);
     const tp = transportOf(await pa.evaluate(() => window.probe.stats('pub')));
     const ts = transportOf(await pb.evaluate(() => window.probe.stats('sub')));
@@ -450,6 +451,7 @@ try {
   await run(roomScenario, pqc, { name: 'B2-videoroom-sub=janus-client', roleS: 'passive', room: 1234, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'E1-videoroom-e2ee-xor', room: 2345, e2ee: true, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'S1-videoroom-simulcast', room: 1234, simulcast: true, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'S2-videoroom-simulcast+e2ee', room: 2345, e2ee: true, simulcast: true, expect: 'pass' });
   await run(echoScenario, pqc, { name: 'L1-echotest-30pct-udp-loss', loss: 0.3, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'L2-videoroom-30pct-udp-loss', room: 1234, loss: 0.3, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'L3-videoroom-sub=janus-client-30pct-udp-loss', roleS: 'passive', room: 1234, loss: 0.3, expect: 'pass' });
