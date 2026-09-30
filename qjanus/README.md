@@ -223,6 +223,11 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
 - Layer selection: `{request:"configure",streams:[{mid,substream:0|1|2,temporal:0..2}]}` -> `configured:"ok"`, then the
   plugin event `{mid,substream}` / `{mid,temporal}` when the switch happened. Verified with a 1280x720 source: substream
   0/1/2 deliver exactly the l/m/h layer (320/640/1280 px) with E2EE frames.
+  Rooms are created with `fir_freq=0` (no periodic keyframe request): the keyframe of the new layer comes from the PLI
+  Janus sends when `configure` changes the substream. Janus sends at most one PLI per second per publisher stream and does
+  not retry one it skipped, so a `configure` issued right after another PLI can end without the switch (measured with
+  the 720p synthetic camera: substream 0 then 1 within a second stays on 0 for 20+ s). A client that has not seen the
+  `substream` event (or the new layer) within a few seconds sends the same `configure` again.
 - Events without a transaction: `webrtcup`, `media` (`mid,type,receiving`), `slowlink` (`mid,media,uplink,lost`) and the
   plugin event `slow_link` (`current-bitrate`), `hangup` (`reason`), plugin events `{publishers:[{id,display,streams}]}`
   (new publisher), `{leaving:"<id>"}`, `{unpublished:"<id>"}`, `{kicked:"<id>"}`, `{videoroom:"destroyed"}`.

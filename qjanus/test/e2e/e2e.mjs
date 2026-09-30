@@ -411,18 +411,28 @@ try {
       assert.ok(vs, 'A receives the video of B');
       const videoMid = vs.mid;
       const timeline = [];
+      // Rooms have fir_freq=0 (no periodic keyframe request): the keyframe of the new layer comes from the PLI that
+      // Janus sends when `configure` changes the substream, and Janus sends at most one PLI per second per
+      // publisher stream and does not retry a PLI it skipped. A switch asked for right after another PLI can
+      // therefore get no keyframe; the client's answer (spec 4.6) is to send `configure` again when the switch
+      // did not happen within a few seconds, which is what this loop does (and reports).
       for (const [sub, want] of [[0, out.l], [1, out.m], [2, out.h], [0, out.l]]) {
-        const m = await A.c.message(A.subHandle, { request: 'configure', streams: [{ mid: videoMid, substream: sub, temporal: 2 }] });
-        assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 200));
+        const configure = async () => {
+          const m = await A.c.message(A.subHandle, { request: 'configure', streams: [{ mid: videoMid, substream: sub, temporal: 2 }] });
+          assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 200));
+        };
+        await configure();
         const end = Date.now() + 20000;
-        let got = 0;
+        let got = 0; let lastSent = Date.now(); let resent = 0;
         while (Date.now() < end) {
           const v = (await A.stats(A.subPc)).inbound.find((x) => x.mid === videoMid);
           got = v ? v.frameWidth : 0;
           if (got === want) break;
+          if (Date.now() - lastSent > 4000) { await configure(); resent++; lastSent = Date.now(); }
           await sleep(500);
         }
-        timeline.push(`${sub}:${got}/${want}`);
+        if (resent) console.log(`      substream ${sub}: no keyframe after the first configure, re-sent ${resent}x`);
+        timeline.push(`${sub}:${got}/${want}${resent ? `(re-sent ${resent}x)` : ''}`);
         assert.equal(got, want, `substream ${sub}: frame width ${got}, expected ${want} (${timeline.join(' ')}; sent ${JSON.stringify(out)})`);
       }
       await assertE2ee(A, [B.id]);
