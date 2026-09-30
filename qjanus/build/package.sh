@@ -22,7 +22,7 @@ STAGE=$OUT/stage/qjanus
 TARBALL=qjanus-$BUILD_ID-ubuntu24.04-x86_64.tar.gz
 
 rm -rf "$OUT/stage"
-mkdir -p "$STAGE"/{bin,lib/janus/plugins,lib/janus/transports,lib/janus/events,lib/janus/loggers,libexec,share/qjanus/conf,share/qjanus/systemd,licenses}
+mkdir -p "$STAGE"/{bin,lib/janus/plugins,lib/janus/transports,lib/janus/events,lib/janus/loggers,libexec,share/qjanus/conf,share/qjanus/systemd,share/qjanus/test,licenses}
 
 # ---- binaries and the libraries that are not the distro's
 install -m 0755 "$PREFIX/bin/janus" "$STAGE/bin/janus"
@@ -54,6 +54,7 @@ install -m 0644 "$QJ/libexec/qjanus-lib.sh" "$STAGE/libexec/qjanus-lib.sh"
 install -m 0644 "$QJ"/conf/*.jcfg.tmpl "$STAGE/share/qjanus/conf/"
 install -m 0644 "$QJ/systemd/qjanus.service" "$STAGE/share/qjanus/systemd/qjanus.service"
 install -m 0644 "$QJ/conf/Caddyfile.example" "$STAGE/share/qjanus/Caddyfile.example"
+install -m 0755 "$QJ/test/node-ice-check.py" "$STAGE/share/qjanus/test/node-ice-check.py"
 install -m 0644 "$QJ/README.md" "$STAGE/README.md"
 printf '%s\n' "$BUILD_ID" > "$STAGE/VERSION"
 cp "${SRC:-$HOME/qjanus-src}/janus/COPYING" "$STAGE/licenses/janus-gateway-COPYING"
@@ -82,7 +83,8 @@ while read -r so; do
   [ -n "$pkg" ] || { echo "ERROR: no package owns $path"; exit 1; }
   echo "$pkg" >> "$OUT/apt-deps.raw"
 done < "$OUT/needed.txt"
-{ cat "$OUT/apt-deps.raw"; echo openssl; } | sort -u > "$STAGE/apt-deps.txt"
+# openssl: the DTLS certificate is created with it; iproute2: install.sh and qjanus-render-config check the ICE interface with `ip`
+{ cat "$OUT/apt-deps.raw"; echo openssl; echo iproute2; } | sort -u > "$STAGE/apt-deps.txt"
 cat "$STAGE/apt-deps.txt"
 
 # ---- BUILDINFO.json
@@ -120,6 +122,7 @@ cat "$OUT/janus-version.txt"
 for n in bin/janus lib/janus/plugins/libjanus_videoroom.so lib/janus/transports/libjanus_http.so lib/janus/transports/libjanus_websockets.so; do
   test -x "$STAGE/$n" || { echo "missing $n"; exit 1; }
 done
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$STAGE/share/qjanus/test/node-ice-check.py"
 bash -n "$STAGE/install.sh" && bash -n "$STAGE/libexec/qjanus-render-config" && bash -n "$STAGE/libexec/qjanus-wait-ready" && bash -n "$STAGE/libexec/qjanus-lib.sh"
 
 # ---- tarball: reproducible ordering/ownership, relocatable (top directory qjanus/)

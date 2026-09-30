@@ -3,9 +3,18 @@
 # holds this script, bin/, lib/ and share/). Idempotent: running it again keeps the DTLS key,
 # the secrets and the node settings, and only changes what differs.
 #
-#   ./install.sh [--http-bind ADDR] [--install-deps] [--no-start] [--keep-releases N]
+#   ./install.sh --ice-iface IFACE [--http-bind ADDR] [--install-deps] [--no-start] [--keep-releases N]
 #   ./install.sh --rollback          switch back to the previous release and restart
 #   ./install.sh --uninstall [--purge]
+#
+# IFACE is the network interface that carries the node's PUBLIC address (eth0, enx3, ...): only its
+# addresses are offered to peers as ICE candidates, never those of a VPN, bridge or other interface.
+# It is required the first time (and when upgrading a node that has none), then kept in
+# /etc/qjanus/qjanus.env (QJANUS_ICE_ENFORCE_IFACE); the same can be given as that environment
+# variable. Without it the script names the interface of the default route and stops: confirm it by
+# running again with  --ice-iface <that name>. Interfaces that are down, loopback/VPN/bridge
+# interfaces and interfaces with private addresses only are refused (--allow-private-ice-iface
+# accepts the last kind on purpose; a node behind a 1:1 NAT sets QJANUS_NAT_1_1 instead).
 #
 # stdout carries ONE line, the pinned DTLS fingerprint ("sha-256 AB:CD:..."), everything else goes
 # to stderr, so that   FP=$(sudo ./install.sh ...)   just works. The DTLS private key is generated
@@ -24,6 +33,8 @@ ENVF=$ETC/qjanus.env
 LOCKF=/run/lock/qjanus-install.lock
 KEEP=3
 HTTP_BIND=""
+ICE_IFACE=""
+ALLOW_PRIVATE_ICE=0
 INSTALL_DEPS=0
 START=1
 MODE=install
@@ -59,6 +70,8 @@ get_env() { grep "^$1=" "$ENVF" 2>/dev/null | head -1 | cut -d= -f2- || true; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --http-bind) [ $# -ge 2 ] || die "--http-bind needs an address"; HTTP_BIND=$2; shift 2 ;;
+    --ice-iface) [ $# -ge 2 ] || die "--ice-iface needs an interface name"; ICE_IFACE=$2; shift 2 ;;
+    --allow-private-ice-iface) ALLOW_PRIVATE_ICE=1; shift ;;
     --install-deps) INSTALL_DEPS=1; shift ;;
     --no-start) START=0; shift ;;
     --keep-releases) [ $# -ge 2 ] || die "--keep-releases needs a number"; KEEP=$2; shift 2 ;;
@@ -187,6 +200,31 @@ if [ -f "$SELF/apt-deps.txt" ]; then
 fi
 "$SELF/bin/janus" --version > /dev/null 2>&1 || die "bin/janus does not run here (Ubuntu 24.04 x86_64 with glibc >= 2.39 is required)"
 
+# ---- the ICE interface: explicit and checked BEFORE anything is changed on this node
+command -v ip > /dev/null || die "the ip command (iproute2) is needed (apt-get install iproute2)"
+[ -n "$ICE_IFACE" ] || ICE_IFACE=${QJANUS_ICE_ENFORCE_IFACE:-}     # the flag wins over the environment
+[ -n "$ICE_IFACE" ] || ICE_IFACE=$(get_env QJANUS_ICE_ENFORCE_IFACE)
+if [ -z "$ICE_IFACE" ]; then
+  det=$(qjanus_default_iface)
+  {
+    echo "qjanus advertises the addresses of ONE interface only, the one that carries this node's public address,"
+    echo "so that the private address of a VPN, tailscale, bridge or container interface is never offered to a peer."
+    if [ -n "$det" ]; then
+      echo "The default route of this host uses interface '$det'. If that is the public interface, confirm it:"
+      echo "    $0 --ice-iface $det"
+    else
+      echo "No default route was found: name the public interface with  --ice-iface <name>  (see: ip -br addr)"
+    fi
+  } >&2
+  die "the ICE interface is not set (--ice-iface or QJANUS_ICE_ENFORCE_IFACE)"
+fi
+# the settings the check depends on: from the environment, else from this node's env file
+: "${QJANUS_NAT_1_1:=$(get_env QJANUS_NAT_1_1)}"
+: "${QJANUS_ALLOW_PRIVATE_ICE_IFACE:=$(get_env QJANUS_ALLOW_PRIVATE_ICE_IFACE)}"
+[ "$ALLOW_PRIVATE_ICE" = 0 ] || QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes
+export QJANUS_NAT_1_1 QJANUS_ALLOW_PRIVATE_ICE_IFACE
+qjanus_check_ice_iface "$ICE_IFACE" || die "interface $ICE_IFACE cannot be the ICE interface of this node"
+
 REL=$(cat "$SELF/VERSION")
 [[ $REL =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid VERSION file"
 CHANGED=0
@@ -252,6 +290,13 @@ if [ -n "$HTTP_BIND" ] && [ "$(get_env QJANUS_HTTP_BIND)" != "$HTTP_BIND" ]; the
   set_env QJANUS_HTTP_BIND "$HTTP_BIND"; CHANGED=1
 fi
 [ -n "$(get_env QJANUS_HTTP_BIND)" ] || { set_env QJANUS_HTTP_BIND 127.0.0.1; CHANGED=1; }
+if [ "$(get_env QJANUS_ICE_ENFORCE_IFACE)" != "$ICE_IFACE" ]; then
+  log "ICE interface: $ICE_IFACE"
+  set_env QJANUS_ICE_ENFORCE_IFACE "$ICE_IFACE"; CHANGED=1
+fi
+if [ "$ALLOW_PRIVATE_ICE" = 1 ] && [ "$(get_env QJANUS_ALLOW_PRIVATE_ICE_IFACE)" != yes ]; then
+  set_env QJANUS_ALLOW_PRIVATE_ICE_IFACE yes; CHANGED=1
+fi
 
 # ---- the release and its unit
 if [ "$(readlink "$OPT/current" 2>/dev/null || true)" != "$DEST" ] || ! cmp -s "$SELF/share/qjanus/systemd/qjanus.service" "$UNIT" 2> /dev/null; then

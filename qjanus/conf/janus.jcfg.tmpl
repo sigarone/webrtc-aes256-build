@@ -57,7 +57,15 @@ media: {
 nat: {
 	ice_lite = true
 	ice_tcp = false
-	ice_ignore_list = "vmnet,docker,veth,br-,virbr,lxc,wg"
+	# The ONE interface that carries the node's public address (QJANUS_ICE_ENFORCE_IFACE, required:
+	# qjanus-render-config refuses to start without it). Only its addresses, IPv4 and IPv6, are ever
+	# offered as ICE candidates: the private address of a VPN, tailscale, qvpn, bridge or container
+	# interface is never advertised to a peer.
+	ice_enforce_list = "@QJANUS_ICE_ENFORCE_IFACE@"
+	# Belt and braces. Janus v1.4.2 ignores this list for interface names while an enforce list is
+	# set (it logs one warning per entry at start-up) and only drops candidate addresses that start
+	# with an entry; it is what keeps those interfaces out if the enforce list were ever emptied.
+	ice_ignore_list = "@QJANUS_ICE_IGNORE_LIST@"
 	# only for a node behind a 1:1 NAT (QJANUS_NAT_1_1 in /etc/qjanus/qjanus.env)
 	@QJANUS_NAT_1_1_LINE@
 }

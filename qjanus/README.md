@@ -24,7 +24,8 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
 | Path | What |
 |---|---|
 | `build/` | pinned dependency + Janus build, packaging, linkage and clean-container checks (used by the workflow) |
-| `patches/` | the five patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber and no session token in any log line, `info` without addresses, WebSockets without TLS, no recordings) |
+| `patches/` | the seven patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber and no session token in any log line, `info` without addresses, WebSockets without TLS, no recordings, build guard for AES-GCM, publisher join token bound to the pseudonym) |
+| `CHANGELOG.md` | release notes per version (the workflow publishes the section of the released version) |
 | `conf/*.jcfg.tmpl` | config templates, rendered at every service start; nothing is edited per node |
 | `conf/Caddyfile.example` | the Caddy block that publishes the client API |
 | `systemd/qjanus.service` | the unit (sandbox and limits of spec section 6) |
@@ -47,9 +48,20 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    ```
    mkdir -p /root/qjanus-install && tar -xzf qjanus-<version>-ubuntu24.04-x86_64.tar.gz -C /root/qjanus-install
    cd /root/qjanus-install/qjanus
-   ./install.sh --install-deps                       # node on the application server host: HTTP API on 127.0.0.1 (default)
-   ./install.sh --install-deps --http-bind <vpn-address>  # remote node: HTTP API on the VPN address only
+   ./install.sh --install-deps --ice-iface <public-interface>                       # node on the application server host: HTTP API on 127.0.0.1 (default)
+   ./install.sh --install-deps --ice-iface <public-interface> --http-bind <vpn-address>  # remote node: HTTP API on the VPN address only
    ```
+
+   `--ice-iface` (or `QJANUS_ICE_ENFORCE_IFACE` in the environment of the script) is REQUIRED: the network interface
+   that carries the node's PUBLIC address (`eth0`, `ens3`, ...). Janus would otherwise offer the address of every
+   interface as an ICE candidate, the private address of a VPN (tailscale, qvpn, wg), a bridge or a container network
+   included: a privacy leak, and candidates that cannot work. qjanus offers the IPv4 and IPv6 addresses of that one
+   interface and nothing else (`nat.ice_enforce_list`). Without the option the script names the interface of the default
+   route and stops; run it again with `--ice-iface <that name>` to confirm. It refuses an interface that does not exist,
+   is down, is a loopback/VPN/bridge/container interface (`lo`, `wg*`, `tailscale*`, `qvpn*`, `docker*`, `br-*`,
+   `veth*`, `virbr*`, `lxc*`, `vmnet*`), whose name is the prefix of another interface (Janus matches names by prefix),
+   or that carries private addresses only (a node behind a 1:1 NAT sets `QJANUS_NAT_1_1`; `--allow-private-ice-iface`
+   accepts private addresses on purpose). `ip -br addr` shows the candidates.
 
    The script prints ONE line on stdout, the pinned certificate fingerprint (`sha-256 AB:CD:...`); everything else
    goes to stderr, so `FP=$(./install.sh ...)` works. Give the fingerprint to the application server (per node,
@@ -66,6 +78,8 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    |---|---|
    | `QJANUS_TOKEN_SECRET` | HMAC-SHA256 key of the signed session tokens (`token_auth_secret`) |
    | `QJANUS_ADMIN_KEY` | VideoRoom `admin_key` (room creation) |
+   | `QJANUS_ICE_ENFORCE_IFACE` | the interface whose addresses are the ONLY ICE candidates (`nat.ice_enforce_list`); required, set by `install.sh --ice-iface`, checked at every install and every service start |
+   | `QJANUS_ALLOW_PRIVATE_ICE_IFACE` | optional, `yes` accepts an ICE interface that carries private addresses only (`install.sh --allow-private-ice-iface`; a hosted CI runner is such a host) |
    | `QJANUS_HTTP_BIND` | address of the server-facing HTTP API (port 8088): loopback, private (RFC 1918), VPN (100.64.0.0/10) or unique-local only |
    | `QJANUS_ALLOW_NONPRIVATE_BIND` | optional, `yes` lets `QJANUS_HTTP_BIND` be a public address (plain HTTP, no TLS: only if you know why) |
    | `QJANUS_NAT_1_1` | optional: public IPv4, only for a node behind a 1:1 NAT (nodes that carry their public address on an interface need nothing) |
@@ -113,7 +127,12 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    systemctl status qjanus
    curl -s http://127.0.0.1:8088/janus/info | head -c 300      # or the VPN address on a remote node
    journalctl -u qjanus -o cat -n 50                            # DTLS-POLICY ... ok=1 per handshake
+   sudo python3 /opt/qjanus/current/share/qjanus/test/node-ice-check.py   # live: the ICE candidates are only the public interface's
    ```
+
+   `node-ice-check.py` (python3, standard library only; also in `test/`) creates a throw-away room, publishes a synthetic
+   E2EE offer through the WebSocket API and asserts that every candidate Janus offers is an address of the enforced
+   interface and none belongs to another interface of the host. `--ws wss://<host>/janus` runs it through Caddy.
 
 ## Upgrade and roll back
 
@@ -122,6 +141,11 @@ tar -xzf qjanus-<new>-ubuntu24.04-x86_64.tar.gz -C /root/qjanus-new && cd /root/
 ./install.sh --install-deps        # new release dir, atomic `current` switch, restart; same key, secrets, settings
 /opt/qjanus/current/install.sh --rollback     # back to the previously installed release
 ```
+
+A node installed before 1.4.2-q2 has no ICE interface in its `qjanus.env` yet: the upgrade stops, names the interface of
+the default route and changes nothing until it is given once, `./install.sh --install-deps --ice-iface eth0` (or
+`QJANUS_ICE_ENFORCE_IFACE=eth0 ./install.sh --install-deps`); afterwards it is kept like every other setting. From 1.4.2-q2
+on the application server must issue publisher join tokens as `<pseudonym>:<32 lowercase hex>` (see below).
 
 The fingerprint printed is unchanged by an upgrade (same key). The last three releases are kept
 (`--keep-releases N`). If the new release (or a changed setting such as `--http-bind`) does not come up healthy, the
@@ -152,7 +176,10 @@ the process as a systemd credential (`LoadCredential`), the rendered configurati
 in `/run/qjanus` (0700, service user). No secret is ever on a command line.
 
 Core settings (spec section 6): `token_auth=true` (sha256), `string_ids=true`, `admin_key`,
-`lock_rtp_forward=true`, `rtp_port_range=20000-20999`, `ice_lite=true`, `ice_tcp=false`, `dtls_mtu=1200`,
+`lock_rtp_forward=true`, `rtp_port_range=20000-20999`, `ice_lite=true`, `ice_tcp=false`,
+`ice_enforce_list=<QJANUS_ICE_ENFORCE_IFACE>` (plus `ice_ignore_list=vmnet,docker,veth,br-,virbr,lxc,wg,tailscale,qvpn,lo`
+as belt and braces: Janus v1.4.2 ignores that list for interface names while an enforce list is set and logs one warning
+per entry at start), `dtls_mtu=1200`,
 `min_nack_queue=500`, `twcc_period=200`, `session_timeout=60`, `reclaim_session_timeout=20`, IPv6 on, no static rooms,
 Admin API off. Log level 4 (INFO): nothing identifying is written at any level (patch `0002-log-scrub.patch`).
 
@@ -173,8 +200,11 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
   433 unauthorized, 436 id exists). One session per batch of calls (session_timeout is 60 s), `destroy` afterwards.
 - `create` needs `admin_key` (429 missing, 433 wrong); `allowed` (add/remove), `kick`, `destroy` need the room `secret`
   (429/433). `list` without `admin_key` never shows the private room; `listparticipants`/`exists` need nothing.
-- `join` publisher: `id` = pseudonym (string), `token` = join token from `allowed`; a token that is not in `allowed`
-  (never added, or removed) -> 433, also after a kick. `joined` carries `private_id`. `publish` without `e2ee:true` in
+- `join` publisher: `id` = pseudonym (string), `token` = join token from `allowed`. Since 1.4.2-q2 the join token is bound
+  to the pseudonym: `<id>:<32 lowercase hex>` with the `id` of the request as its prefix (patch 0007). A missing or
+  non-string `id`, or any token that does not have exactly that form for that `id` (the token of member A used with the
+  id of B, a token without prefix, uppercase or short hex, ...) -> 433 before anything else, `joinandconfigure` included.
+  Besides that, a token that is not in `allowed` (never added, or removed) -> 433, also after a kick. `joined` carries `private_id`. `publish` without `e2ee:true` in
   the JSEP is refused (433 "Room requires end-to-end encrypted media"); a handle whose publish was refused must not be
   reused (attach a new one).
 - Simulcast: Janus assumes the RIDs in the publisher's SDP are listed highest first (`hml`) unless the publish JSEP
@@ -205,6 +235,7 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
 (apt-deps complete, relocatable, no system libssl), installs it under systemd like a node and runs the API
 conformance suite, headless Chromium (publisher + multistream subscribers, VP8 simulcast, E2EE frames that keep
 the codec header clear, key switch-over, kick, destroy, netem loss 5 % + reorder 3 %, 30 % loss handshake soak),
-the refused peers (DTLS 1.2, DTLS 1.3 without ML-KEM, AES-128-GCM), the Caddy block, the log-hygiene check and the
-install/upgrade/rollback/uninstall lifecycle. A release is created only by running the workflow manually with
+the refused peers (DTLS 1.2, DTLS 1.3 without ML-KEM, AES-128-GCM), the ICE candidates of every SDP (only the enforced
+interface, with decoy VPN/private interfaces on the host), the join token binding, the Caddy block, the log-hygiene check
+and the install/upgrade/rollback/uninstall lifecycle. A release is created only by running the workflow manually with
 `release_tag=qjanus-<version>`; assets are attested (`gh attestation verify`).

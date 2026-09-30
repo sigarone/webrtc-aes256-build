@@ -10,6 +10,11 @@
 #                         VPN (CGNAT) or unique-local only, QJANUS_ALLOW_NONPRIVATE_BIND=yes overrides)
 #   QJANUS_DTLS_CERT      DTLS certificate (PEM)                       (default /etc/qjanus/dtls.crt)
 #   QJANUS_DTLS_KEY       DTLS private key (PEM)                       (default $CREDENTIALS_DIRECTORY/dtls.key)
+#   QJANUS_ICE_ENFORCE_IFACE  the ONE interface whose addresses are offered as ICE candidates (required;
+#                         the interface that carries the public address: eth0, enx3, ...). Refused: a
+#                         missing, down, loopback/VPN/bridge interface, a name that is the prefix of
+#                         another interface, an interface with private addresses only (unless
+#                         QJANUS_NAT_1_1 is set or QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes)
 #   QJANUS_NAT_1_1        public IPv4 to advertise when the node sits behind a 1:1 NAT (optional;
 #                         nodes that carry their public address on an interface need nothing)
 set -euo pipefail
@@ -44,6 +49,12 @@ if [ -n "$QJANUS_NAT_1_1" ]; then
 else
   NAT_LINE="# nat_1_1_mapping is not set (QJANUS_NAT_1_1 is empty)"
 fi
+# the ICE interface: fail closed. Without a checked interface Janus would offer the addresses of
+# every interface (VPN, bridges, ...), or none at all when the name is wrong
+QJANUS_ICE_ENFORCE_IFACE=${QJANUS_ICE_ENFORCE_IFACE:-}
+[ -n "$QJANUS_ICE_ENFORCE_IFACE" ] || die "QJANUS_ICE_ENFORCE_IFACE is not set (the interface that carries the public address; see /etc/qjanus/qjanus.env and install.sh --ice-iface)"
+command -v ip > /dev/null || die "the ip command (iproute2) is needed to check QJANUS_ICE_ENFORCE_IFACE"
+qjanus_check_ice_iface "$QJANUS_ICE_ENFORCE_IFACE" || die "QJANUS_ICE_ENFORCE_IFACE=$QJANUS_ICE_ENFORCE_IFACE is not acceptable"
 [[ $QJANUS_DTLS_CERT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_CERT must be an absolute path"
 [[ $QJANUS_DTLS_KEY =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_KEY must be an absolute path"
 [[ $ROOT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the release directory path has unsupported characters"
@@ -65,6 +76,8 @@ for t in "$TMPL"/*.jcfg.tmpl; do
     -e "s|@QJANUS_DTLS_CERT@|$QJANUS_DTLS_CERT|g" \
     -e "s|@QJANUS_DTLS_KEY@|$QJANUS_DTLS_KEY|g" \
     -e "s|@QJANUS_NAT_1_1_LINE@|$NAT_LINE|g" \
+    -e "s|@QJANUS_ICE_ENFORCE_IFACE@|$QJANUS_ICE_ENFORCE_IFACE|g" \
+    -e "s|@QJANUS_ICE_IGNORE_LIST@|$QJANUS_ICE_IGNORE_LIST|g" \
     "$t" > "$f.tmp"
   if grep -q '@QJANUS_' "$f.tmp"; then
     rm -f "$f.tmp"; die "unreplaced placeholder in $(basename "$t")"

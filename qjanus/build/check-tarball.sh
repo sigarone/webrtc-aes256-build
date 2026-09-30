@@ -36,11 +36,38 @@ mkdir -p /tmp/node && cd /tmp/node
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=qjanus" \
   -keyout dtls.key -out dtls.crt 2> /dev/null
 export QJANUS_DTLS_CERT=/tmp/node/dtls.crt QJANUS_DTLS_KEY=/tmp/node/dtls.key
+
+# the ICE interface: required, and only a checked one is rendered (enforce list = that interface alone).
+# Here it is the container's own interface, whose (Docker bridge) address is private.
+# shellcheck source=../libexec/qjanus-lib.sh
+. "$ROOT/libexec/qjanus-lib.sh"
+ICE_IF=$(qjanus_default_iface)
+[ -n "$ICE_IF" ] || fail "the container has no default-route interface"
+if "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /tmp/node/ice.err; then fail "rendering without QJANUS_ICE_ENFORCE_IFACE must be refused"; fi
+grep -q 'QJANUS_ICE_ENFORCE_IFACE is not set' /tmp/node/ice.err || { cat /tmp/node/ice.err; fail "the missing ICE interface is not explained"; }
+ok "no ICE interface, no configuration (fail closed)"
+for bad in lo tailscale0 qvpn0 wg0 docker0 br-1234 veth1 virbr0 missing0 '1.2.3.4' 'eth0;x' 'a b' deadbeef eth0123456789abcd; do
+  if QJANUS_ICE_ENFORCE_IFACE=$bad QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "QJANUS_ICE_ENFORCE_IFACE='$bad' must be refused"; fi
+done
+ok "loopback, VPN, bridge, container, missing and malformed interface names are refused"
+public=0
+while read -r a; do [ -n "$a" ] && ! qjanus_private_addr "$a" && public=1; done < <(qjanus_iface_addrs "$ICE_IF")
+if [ "$public" = 0 ]; then
+  if QJANUS_ICE_ENFORCE_IFACE=$ICE_IF "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /tmp/node/ice.err; then fail "an interface with private addresses only must be refused"; fi
+  grep -q 'private addresses only' /tmp/node/ice.err || { cat /tmp/node/ice.err; fail "the private-only interface is not explained"; }
+  ok "an interface with private addresses only is refused unless allowed on purpose"
+  export QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes
+fi
+export QJANUS_ICE_ENFORCE_IFACE=$ICE_IF
+
 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc
 ls -l /tmp/node/etc
 grep -q "$QJANUS_TOKEN_SECRET" /tmp/node/etc/janus.jcfg || fail "token secret not rendered"
 [ "$(stat -c %a /tmp/node/etc/janus.jcfg)" = 600 ] || fail "rendered config is not 0600"
 ok "templates render"
+grep -q "^	ice_enforce_list = \"$ICE_IF\"\$" /tmp/node/etc/janus.jcfg || fail "ice_enforce_list is not the ICE interface"
+grep -q '^	ice_ignore_list = "vmnet,docker,veth,br-,virbr,lxc,wg,tailscale,qvpn,lo"$' /tmp/node/etc/janus.jcfg || fail "ice_ignore_list is not rendered"
+ok "ice_enforce_list = the ICE interface, ice_ignore_list = the broad list"
 grep -q 'nat_1_1_mapping = ' /tmp/node/etc/janus.jcfg && fail "nat_1_1_mapping must be off by default"
 QJANUS_NAT_1_1=192.0.2.7 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-nat 2> /dev/null
 grep -q '^	nat_1_1_mapping = "192.0.2.7"$' /tmp/node/etc-nat/janus.jcfg || fail "QJANUS_NAT_1_1 is not rendered"
