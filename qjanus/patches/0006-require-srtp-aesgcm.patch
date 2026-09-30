@@ -1,0 +1,17 @@
+diff --git a/src/dtls.c b/src/dtls.c
+index 2c6b4e0..e4e187e 100644
+--- a/src/dtls.c
++++ b/src/dtls.c
+@@ -109,6 +109,12 @@ gboolean janus_is_dtls(char *buf) {
+ #ifndef DTLS1_3_VERSION
+ #error "This BoringSSL does not provide DTLS 1.3"
+ #endif
++/* The SRTP profile switches below are compiled out without AES-GCM support in libsrtp, which
++ * would leave key_length, salt_length and master_length at 0: zero-length SRTP keys. Such a
++ * build must never exist (HAVE_SRTP_AESGCM is also undefined when SRTP_AEAD_AES_256_GCM is missing) */
++#ifndef HAVE_SRTP_AESGCM
++#error "qjanus needs AES-GCM in libsrtp (HAVE_SRTP_AESGCM): without it the SRTP keys would have length zero"
++#endif
+ #define JANUS_DTLS_TLS_AES_256_GCM_SHA384	0x1302
+ static const uint16_t janus_dtls_groups[] = { SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519 };
+ 

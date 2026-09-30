@@ -12,7 +12,8 @@ import http from 'node:http';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { HttpApi, ServerApi, WsClient, hex, sleep, pluginData, remember, secretsSeen } from '../lib/janus.mjs';
+import { HttpApi, ServerApi, WsClient, hex, joinTokenFor, sleep, pluginData, remember, secretsSeen } from '../lib/janus.mjs';
+import { assertIceCandidates, describeCandidates } from '../lib/ice.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WS = process.env.QJANUS_WS || 'ws://127.0.0.1:8188';
@@ -33,6 +34,14 @@ fs.mkdirSync(OUT, { recursive: true });
 const api = new ServerApi(new HttpApi(HTTP, { tokenSecret: TOKEN_SECRET, adminKey: ADMIN_KEY }));
 const results = [];
 const versions = {};
+// every SDP that came out of Janus was checked against the ICE candidate policy (lib/ice.mjs); the first of each kind is logged
+const iceLogged = new Set();
+let iceChecked = 0;
+function note_ice(label, cands) {
+  iceChecked++;
+  const kind = label.replace(/^\S+ /, '');
+  if (!iceLogged.has(kind)) { iceLogged.add(kind); console.log(`ICE   ${kind}: ${describeCandidates(cands)}`); }
+}
 
 // First occurrence of every request/response and unsolicited event shape the group call clients depend on
 // (printed at the end, written to shapes.json); SDP bodies and secrets are redacted.
@@ -165,7 +174,7 @@ class Peer {
     this.name = name;
     this.room = room;
     this.id = hex(16);                   // pseudonym
-    this.joinToken = hex(16);
+    this.joinToken = joinTokenFor(this.id);   // bound to the pseudonym
     this.key = hex(32);                  // K[me, epoch]
     this.keyIndex = 1;
     this.simulcast = simulcast;
@@ -206,6 +215,7 @@ class Peer {
     assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 300));
     assert.equal(m.jsep.type, 'answer');
     this.pubAnswer = m.jsep.sdp;
+    note_ice(`${this.name} publisher answer`, assertIceCandidates(m.jsep.sdp, `${this.name} publisher answer`));
     await evalIn(this, ([i, s]) => window.q.setAnswer(i, s), [this.pubPc, m.jsep.sdp]);
     await this.c.waitEvent((e) => e.janus === 'webrtcup' && e.sender === this.pubHandle, this.upTimeout);
   }
@@ -249,6 +259,7 @@ class Peer {
   }
   async answerOffer(offerSdp) {
     this.lastSubOffer = offerSdp;
+    note_ice(`${this.name} subscriber offer`, assertIceCandidates(offerSdp, `${this.name} subscriber offer`, { require: !this.subUp }));
     const answer = await evalIn(this, ([i, o, mm, opts]) => window.q.answer(i, o, mm, opts), [this.subPc, offerSdp, this.subMidMap, { e2ee: true, setup: this.setup }]);
     const first = !this.subUp;
     await this.c.message(this.subHandle, { request: 'start' }, { type: 'answer', sdp: answer });
@@ -571,6 +582,10 @@ try {
         assert.ok(hup.reason, `${p.name}: hangup after destroy`);
       }
       for (const p of peers) await p.close();
+    });
+    await check('ICE candidate policy: every publisher answer and subscriber offer of the run offered only addresses of the enforced interface (no VPN / private address of another interface)', async () => {
+      assert.ok(iceChecked >= 6, `only ${iceChecked} SDPs were checked`);
+      console.log(`ICE   ${iceChecked} SDPs out of Janus checked against the enforced interface`);
     });
   }
 

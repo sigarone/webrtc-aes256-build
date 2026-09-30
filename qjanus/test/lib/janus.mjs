@@ -7,6 +7,10 @@ import crypto from 'node:crypto';
 export const PLUGIN = 'janus.plugin.videoroom';
 export const hex = (bytes) => crypto.randomBytes(bytes).toString('hex');
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The join token of a publisher (spec section 12.2): "<pseudonym>:<32 lowercase hex>". qjanus refuses a
+// publisher join whose id is missing or differs from the prefix of its token, so the token a member was
+// given cannot be used under the pseudonym of another member.
+export const joinTokenFor = (id) => `${id}:${hex(16)}`;
 
 // Janus core signed token: "<expiry>,janus,<plugin>:<base64 HMAC>" with token_auth_hash = sha256; the
 // HMAC key is the secret string itself. `now` is in ms; a negative ttl mints an already expired token.

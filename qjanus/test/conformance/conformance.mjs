@@ -12,8 +12,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { HttpApi, ServerApi, WsClient, mintToken, hex, sleep, pluginData, remember, secretsSeen, PLUGIN } from '../lib/janus.mjs';
+import { HttpApi, ServerApi, WsClient, mintToken, hex, joinTokenFor, sleep, pluginData, remember, secretsSeen, PLUGIN } from '../lib/janus.mjs';
 import { syntheticOffer } from '../lib/sdp.mjs';
+import { assertIceCandidates, describeCandidates } from '../lib/ice.mjs';
 
 const HTTP = process.env.QJANUS_HTTP || 'http://127.0.0.1:8088/janus';
 const WS = process.env.QJANUS_WS || 'ws://127.0.0.1:8188';
@@ -54,11 +55,11 @@ async function ws(opts) {
 }
 
 // one participant of a test room: WebSocket session + publisher handle
-async function joinAs(room, id, joinToken) {
+async function joinAs(room, id, joinToken, { request = 'join', ...extra } = {}) {
   const c = await ws();
   await c.create();
   const handle = await c.attach();
-  const m = await c.message(handle, { request: 'join', ptype: 'publisher', room, id, display: id, token: joinToken });
+  const m = await c.message(handle, { request, ptype: 'publisher', room, id, display: id, token: joinToken, ...extra });
   return { c, handle, m, data: pluginData(m) };
 }
 
@@ -66,8 +67,9 @@ async function joinAs(room, id, joinToken) {
 const room = hex(16);           // 32 hex, random, not the call id
 const roomSecret = hex(32);
 const idA = hex(16); const idB = hex(16); const idC = hex(16);   // pseudonyms
-const tokA = hex(16); const tokB = hex(16); const tokC = hex(16); // join tokens
-remember(room, roomSecret, idA, idB, idC, tokA, tokB, tokC);
+// join tokens, bound to the pseudonym: "<pseudonym>:<32 hex>" (spec section 12.2); tokA2 = a second token of A
+const tokA = joinTokenFor(idA); const tokA2 = joinTokenFor(idA); const tokB = joinTokenFor(idB); const tokC = joinTokenFor(idC);
+remember(room, roomSecret, idA, idB, idC, tokA, tokA2, tokB, tokC);
 const S = {};
 
 // ============================================================================== core, tokens, info
@@ -183,7 +185,7 @@ await check('create a room with ALL spec parameters (admin_key + room secret + a
     request: 'create', room, is_private: true, secret: roomSecret, publishers: 8, bitrate: 1500000, fir_freq: 10,
     audiocodec: 'opus', videocodec: 'vp8', opus_fec: true, opus_dtx: false, audiolevel_ext: false,
     audiolevel_event: false, videoorient_ext: false, playoutdelay_ext: false, transport_wide_cc_ext: true,
-    record: false, lock_record: true, require_pvtid: true, require_e2ee: true, notify_joining: false, allowed: [tokA],
+    record: false, lock_record: true, require_pvtid: true, require_e2ee: true, notify_joining: false, allowed: [tokA, tokA2],
   };
   await api.session(async ({ vr, sid, handle }) => {
     const { json } = await http.message(sid, handle, http.token(), { ...req, admin_key: ADMIN_KEY });
@@ -261,11 +263,11 @@ await check('allowed add / remove needs the room secret (429 missing, 433 wrong)
     const added = await vr(req);
     shape('videoroom_allowed_add', req, added);
     assert.equal(added.videoroom, 'success');
-    assert.deepEqual([...added.allowed].sort(), [tokA, tokB, tokC].sort());
+    assert.deepEqual([...added.allowed].sort(), [tokA, tokA2, tokB, tokC].sort());
     const req2 = { request: 'allowed', room, secret: roomSecret, action: 'remove', allowed: [tokC] };
     const removed = await vr(req2);
     shape('videoroom_allowed_remove', req2, removed);
-    assert.deepEqual([...removed.allowed].sort(), [tokA, tokB].sort());
+    assert.deepEqual([...removed.allowed].sort(), [tokA, tokA2, tokB].sort());
   });
 });
 
@@ -288,13 +290,69 @@ await check('join is refused without a valid join token (433), for a token remov
   assert.equal(codeOf(noTok.m), 433, JSON.stringify(noTok.m));
   const badTok = await joinAs(room, hex(16), hex(16));
   assert.equal(codeOf(badTok.m), 433);
-  const dupId = await joinAs(room, idA, tokB);
+  const dupId = await joinAs(room, idA, tokA2);
   shape('join_duplicate_id', { request: 'join', ptype: 'publisher', room, id: '<pseudonym>' }, dupId.m);
   assert.equal(codeOf(dupId.m), 436, JSON.stringify(dupId.m));
   const noRoom = await joinAs(hex(16), hex(16), tokB);
   shape('join_unknown_room', { request: 'join', ptype: 'publisher', room: '<unknown>' }, noRoom.m);
   assert.equal(codeOf(noRoom.m), 426, JSON.stringify(noRoom.m));
   [noTok, badTok, dupId, noRoom].forEach((x) => x.c.close());
+});
+
+await check('the join token is bound to the pseudonym (H3): its own id + token join; the token of member A under the id of B, a missing or non-string id and every token that is not exactly "<id>:<32 lowercase hex>" are refused with 433 - although they are all in the allowed list', async () => {
+  const idX = hex(16); const idY = hex(16);
+  const tokX = joinTokenFor(idX); const tokY = joinTokenFor(idY);
+  // every token below IS in the room's allowed list: the refusal has to come from the binding, not from the ACL
+  const plain = hex(16);                          // a pre-H3 token: no id prefix
+  const upper = `${idX}:${hex(16).toUpperCase()}`; // uppercase hex
+  const short = `${idX}:${hex(15)}`;              // 30 hex
+  const long = `${idX}:${hex(17)}`;               // 34 hex
+  const nonhex = `${idX}:${'g'.repeat(32)}`;
+  const nocolon = `${idX}${hex(16)}`;
+  const suffix = `${tokX}0`;                      // a valid token with one character more
+  const prefixed = `x${tokX}`;                    // the id is not at the start
+  const other = `${idY}:${hex(16)}`;              // a valid token of Y (allowed) used under X
+  remember(idX, idY, tokX, tokY, plain, upper, short, long, nonhex, nocolon, suffix, prefixed, other);
+  await api.allow(room, roomSecret, 'add', [tokX, tokY, plain, upper, short, long, nonhex, nocolon, suffix, prefixed, other]);
+  const refused = [
+    ['the token of Y under the id of X', idX, tokY],
+    ['another allowed token of Y under the id of X', idX, other],
+    ['a token without the id prefix', idX, plain],
+    ['uppercase hex', idX, upper],
+    ['30 hex characters', idX, short],
+    ['34 hex characters', idX, long],
+    ['a non-hex suffix', idX, nonhex],
+    ['no colon', idX, nocolon],
+    ['a trailing character', idX, suffix],
+    ['the id not at the start', idX, prefixed],
+    ['a missing id', undefined, tokX],
+    ['an empty id', '', tokX],
+    ['a numeric id', 12345, tokX],
+    ['a missing token', idX, undefined],
+  ];
+  for (const [what, id, token] of refused) {
+    const j = await joinAs(room, id, token);
+    assert.equal(codeOf(j.m), 433, `${what}: expected 433, got ${JSON.stringify(j.m).slice(0, 200)}`);
+    assert.match(String(pluginData(j.m).error), /Unauthorized/i, what);
+    j.c.close();
+  }
+  const sample = await joinAs(room, idX, tokY);
+  shape('join_token_not_bound_to_id', { request: 'join', ptype: 'publisher', room, id: '<pseudonym of B>', token: '<join_token of A>' }, sample.m);
+  sample.c.close();
+  // joinandconfigure is the same door
+  const jc = await joinAs(room, idX, tokY, { request: 'joinandconfigure', audio: true, video: true });
+  assert.equal(codeOf(jc.m), 433, `joinandconfigure with the token of another member: ${JSON.stringify(jc.m).slice(0, 200)}`);
+  jc.c.close();
+  // none of the refusals burned the id or the token: the member that owns them joins
+  const ok = await joinAs(room, idX, tokX);
+  assert.equal(ok.data.videoroom, 'joined', JSON.stringify(ok.m).slice(0, 300));
+  assert.equal(ok.data.id, idX);
+  // and Y joins with its own token, next to X
+  const okY = await joinAs(room, idY, tokY);
+  assert.equal(okY.data.videoroom, 'joined', JSON.stringify(okY.m).slice(0, 300));
+  // the subscriber join needs no join token (spec section 11): the binding is for publisher joins only
+  for (const x of [ok, okY]) { await x.c.message(x.handle, { request: 'leave' }); x.c.close(); }
+  await api.allow(room, roomSecret, 'remove', [tokX, tokY, plain, upper, short, long, nonhex, nocolon, suffix, prefixed, other]);
 });
 
 await check('publish enforces require_e2ee in the JSEP: an offer without e2ee is refused (and that handle cannot publish again: use a new one)', async () => {
@@ -340,6 +398,12 @@ await check('publish with e2ee: the answer carries e2ee, the pinned node fingerp
   assert.match(fp[1], /^sha-256 /i);
 });
 
+await check('ICE candidates: the answer offers ONLY addresses of the enforced interface (QJANUS_ICE_ENFORCE_IFACE), never a VPN / private address of another interface, nor a decoy interface', async () => {
+  const cands = assertIceCandidates(S.answerSdp, 'publisher answer');
+  console.log(`      candidates: ${describeCandidates(cands)}`);
+  shape('ice_candidates_of_the_answer', { note: 'host candidates of the enforced interface only' }, { candidates: cands.length });
+});
+
 await check('listparticipants (server API): id, display, publisher flag; and the publisher cap (432)', async () => {
   const list = await api.listParticipants(room);
   shape('videoroom_listparticipants', { request: 'listparticipants', room }, list);
@@ -350,13 +414,13 @@ await check('listparticipants (server API): id, display, publisher flag; and the
   assert.equal(me.display, idA);
   assert.equal(typeof me.publisher, 'boolean');
   // a room of 1 publisher: the second publish is refused
-  const r1 = hex(16); const s1 = hex(16); const t1 = hex(16); const t2 = hex(16);
-  remember(r1, s1, t1, t2);
+  const r1 = hex(16); const s1 = hex(16); const q1 = hex(16); const q2 = hex(16); const t1 = joinTokenFor(q1); const t2 = joinTokenFor(q2);
+  remember(r1, s1, q1, q2, t1, t2);
   await api.session(async ({ vr }) => {
     const c = await vr({ request: 'create', room: r1, secret: s1, publishers: 1, require_e2ee: true, allowed: [t1, t2], is_private: true }, { admin: true });
     assert.equal(c.videoroom, 'created');
   });
-  const p1 = await joinAs(r1, hex(16), t1); const p2 = await joinAs(r1, hex(16), t2);
+  const p1 = await joinAs(r1, q1, t1); const p2 = await joinAs(r1, q2, t2);
   assert.equal(p1.data.videoroom, 'joined');
   assert.equal(p2.data.videoroom, 'joined');
   const first = await p1.c.message(p1.handle, { request: 'publish', audio: true, video: true }, { type: 'offer', sdp: syntheticOffer(), e2ee: true });
@@ -428,7 +492,7 @@ await check('every request that changes a room needs the room secret (429 missin
 });
 
 await check('leave: the leaver gets leaving/ok, the others get leaving <id>; the id is free again', async () => {
-  const idD = hex(16); const tokD = hex(16);
+  const idD = hex(16); const tokD = joinTokenFor(idD);
   remember(idD, tokD);
   await api.allow(room, roomSecret, 'add', [tokD]);
   const d = await joinAs(room, idD, tokD);
@@ -493,7 +557,7 @@ await check('destroy: needs the room secret (429 missing, 433 wrong); participan
   shape('event_room_destroyed', {}, ev);
   assert.equal(pluginData(ev).room, room);
   assert.equal((await api.exists(room)).exists, false);
-  const late = await joinAs(room, hex(16), tokA);
+  const late = await joinAs(room, idA, tokA);
   assert.equal(codeOf(late.m), 426);
   late.c.close();
   // destroying twice
