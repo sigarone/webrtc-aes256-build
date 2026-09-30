@@ -36,6 +36,12 @@
 # override here - integrator, stage 2. To re-pin (e.g. depot_tools ships a
 # breaking change for this m150 cut), edit DEPOT_TOOLS_SHA below in a
 # reviewed commit, the same way the source pins above are re-pinned.
+# Windows (Git Bash on a windows-2022 runner, target_os "win"): the same pins
+# and the same hard verification apply. Only the depot_tools bootstrap and the
+# gclient launcher differ (depot_tools' Windows bootstrap is bootstrap/
+# win_tools.bat, and gclient is run through gclient.bat under cmd). The
+# caller must also export DEPOT_TOOLS_WIN_TOOLCHAIN=0 so runhooks uses the
+# runner's own Visual Studio instead of Google's internal toolchain package.
 # exit: 0 ok | 1 sync/verification failed | 2 usage/env problem
 set -eu
 
@@ -73,6 +79,16 @@ BORINGSSL_PIN=f91f1447397c6719f9774dfb8e67329378e1f3d3
 THIRD_PARTY_PIN=7c92732938de0ef7e28f5da231994723f938f407
 OPUS_PIN=55513e81d8f606bd75d0ff773d2144e5f2a732f5
 
+case "$(uname -s 2>/dev/null || echo unknown)" in MINGW*|MSYS*|CYGWIN*) IS_WIN=1 ;; *) IS_WIN=0 ;; esac
+if [ "$IS_WIN" -eq 1 ]; then
+  # A CRLF checkout would make every m150 patch (LF) fail `git apply --check`,
+  # and Chromium paths exceed MAX_PATH.
+  git config --global core.autocrlf false
+  git config --global core.longpaths true
+  git config --global core.symlinks true
+  git config --global core.filemode false
+fi
+
 mkdir -p "$WORKDIR"
 WORKDIR=$(CDPATH= cd -- "$WORKDIR" && pwd)
 
@@ -95,7 +111,11 @@ export PATH DEPOT_TOOLS_UPDATE=0
 # depot_tools' own ensure_bootstrap once, from the pinned checkout (its CIPD
 # manifests are part of the pinned commit), and fail closed if it did not
 # produce the file.
-bash "$WORKDIR/depot_tools/ensure_bootstrap"
+if [ "$IS_WIN" -eq 1 ]; then
+  cmd //c "$(cygpath -w "$WORKDIR/depot_tools/bootstrap/win_tools.bat")"
+else
+  bash "$WORKDIR/depot_tools/ensure_bootstrap"
+fi
 [ -f "$WORKDIR/depot_tools/python3_bin_reldir.txt" ] || { echo "::error::sync: depot_tools python3 bootstrap did not produce python3_bin_reldir.txt" >&2; exit 1; }
 echo "::endgroup::"
 
@@ -113,8 +133,21 @@ target_os = [${TARGET_OS_PY}]
 EOF
 (
   cd "$WORKDIR"
-  gclient sync --no-history --shallow --nohooks
-  gclient runhooks
+  if [ "$IS_WIN" -eq 1 ]; then
+    cmd //c "gclient.bat sync --no-history --shallow --nohooks"
+    # build/util/lastchange.py finds no Change-Id commit in the shallow
+    # checkout, falls back to commit time 0 and lld-link then fails with
+    # "invalid timestamp: -2142000" (/TIMESTAMP is derived from it). Give it
+    # the commit time of the pinned webrtc commit instead (reproducible).
+    COMMIT_CT=$(git -C "$WORKDIR/src" log -1 --format=%ct)
+    BASE_COMMIT_HASH=$(git -C "$WORKDIR/src" rev-parse HEAD)
+    BASE_COMMIT_SUBMISSION_MS=$((COMMIT_CT * 1000))
+    export BASE_COMMIT_HASH BASE_COMMIT_SUBMISSION_MS
+    cmd //c "gclient.bat runhooks"
+  else
+    gclient sync --no-history --shallow --nohooks
+    gclient runhooks
+  fi
 )
 echo "::endgroup::"
 

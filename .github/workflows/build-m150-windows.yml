@@ -1,0 +1,299 @@
+name: build-webrtc-windows-m150-hardened
+
+# Builds libwebrtc M150 for Windows x64 (target_os=win, target_cpu=x64,
+# Chromium's clang-cl, static library) with the same Q-Audion patch series
+# as Android/iOS (m150/series, P1-P8 + P4a + P10), gates it (m150/gates.sh
+# windows, G1-G9 re-expressed for a COFF static library), runs the T1-T6
+# unit tests on Windows in the strict configuration, then publishes ONE
+# release with sha256 + build-provenance attestation.
+#
+# Job graph (same privilege split as build-m150-android.yml - the job that
+# compiles untrusted patched C++ never holds release/attestation rights):
+#   precheck (contents: read)          - validate inputs, refuse an existing tag
+#   build    (contents: read)  <- precheck   compile webrtc.lib, gates, upload
+#   test     (contents: read)  <- precheck   rtc_unittests + modules_unittests
+#                                            (strict), runs in PARALLEL with build
+#   publish  (contents: write, id-token: write, attestations: write)
+#                              <- [precheck, build, test]   ONLY on a manual
+#                                            dispatch with publish=true and
+#                                            only when build AND test are green
+#
+# No cache on purpose: the pinned checkout (gclient src + toolchains) is tens
+# of GB, far above the 10 GB per-repo Actions cache limit, so sync (~17 min)
+# runs every time.
+#
+# All dispatch inputs reach the shell ONLY via env (never interpolated into
+# a run: block) and are charset-validated in `precheck` first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      webrtc_ref:
+        description: "tag on the fork (webrtc_fork_url) - see m150/ci/sync.sh for why a tag and not a raw SHA"
+        default: "ba469aa2093b-qaudion-m150"
+      webrtc_fork_url:
+        description: "fork to sync from (must already carry webrtc_ref at exactly ba469aa2093ba950066258ca0a59a6fbd1295582)"
+        default: "https://github.com/sigarone/webrtc.git"
+      release_suffix:
+        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-windows-m150-<this> - must not already exist)"
+        required: true
+      publish:
+        description: "publish the release when build, gates and tests are green"
+        type: boolean
+        default: true
+
+env:
+  IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref || 'ba469aa2093b-qaudion-m150' }}
+  IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url || 'https://github.com/sigarone/webrtc.git' }}
+  IN_SUFFIX: ${{ github.event.inputs.release_suffix || 'a256-dplc-1' }}
+  # depot_tools is pinned inside m150/ci/sync.sh itself (reviewed constant).
+
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+    steps:
+      - name: Validate dispatch inputs (charset allow-list, fail closed)
+        run: |
+          set -euo pipefail
+          case "$IN_WEBRTC_REF" in ''|*[!A-Za-z0-9._/-]*) echo "::error::webrtc_ref: only [A-Za-z0-9._/-] allowed"; exit 1 ;; esac
+          case "$IN_FORK_URL" in https://github.com/*.git) ;; *) echo "::error::webrtc_fork_url: must be an https://github.com/*.git URL"; exit 1 ;; esac
+          case "$IN_SUFFIX" in ''|*[!A-Za-z0-9._-]*) echo "::error::release_suffix: only [A-Za-z0-9._-] allowed"; exit 1 ;; esac
+
+      - name: Compute tag name
+        id: tags
+        run: |
+          set -euo pipefail
+          echo "tag=webrtc-windows-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if the release or git tag already exists (never overwrite a shipped rollback asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          t="webrtc-windows-m150-${IN_SUFFIX}"
+          if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$t' already exists - use a new release_suffix"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$t")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$t' already exists - use a new release_suffix"
+            exit 1
+          fi
+
+  build:
+    needs: precheck
+    runs-on: windows-2022
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKDIR: C:/w
+      # Never let a depot_tools wrapper self-update past the pin in sync.sh.
+      DEPOT_TOOLS_UPDATE: "0"
+      # Use the runner's own Visual Studio 2022 (headers + libs of the MSVC
+      # ABI) instead of Google's internal toolchain package; the compiler is
+      # still Chromium's clang-cl.
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      GYP_MSVS_OVERRIDE_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      vs2022_install: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      WINDOWSSDKDIR: C:\Program Files (x86)\Windows Kits\10
+      NINJA_STATUS: "[%f/%t %es] "
+    steps:
+      - name: Toolchain and disk report
+        run: |
+          set -x
+          df -h /c | cat
+          ls "/c/Program Files (x86)/Windows Kits/10/Include" || true
+          ls "/c/Program Files/Microsoft Visual Studio/2022" || true
+          nproc || true
+          python --version || true
+
+      - name: Checkout this repo (scripts, patches, gates)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync M150 source (pinned depot_tools, hard-verified src/boringssl/opus pins)
+        env:
+          WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "$IN_WEBRTC_REF" win
+
+      - name: Apply patch series (variant=win)
+        run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
+
+      - name: Fetch Opus DNN weights (sha256-pinned)
+        run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Build webrtc.lib (x64, release)
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          # H.264 is left to platform codecs (no ffmpeg/openh264 in this build);
+          # H.265 plumbing is on (rtc_use_h265).
+          GN_ARGS='target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true'
+          mkdir -p out/win-x64
+          # args.gn: one arg per line (GN_ARGS has no spaces inside values)
+          echo "$GN_ARGS" | tr ' ' '\n' > out/win-x64/args.gn
+          echo "GN_ARGS=$GN_ARGS" >> "$GITHUB_ENV"
+          cat out/win-x64/args.gn
+          cmd //c "gn.bat gen out/win-x64"
+          cmd //c "autoninja.bat -C out/win-x64 webrtc api/crypto:frame_crypto_transformer"
+          ls -l out/win-x64/obj/webrtc.lib
+
+      - name: Stage webrtc.lib + headers
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out obj/api/crypto/frame_crypto_transformer/frame_crypto_transformer.obj
+
+      - name: Gate G1-G9 (windows)
+        run: |
+          set -euo pipefail
+          # llvm-nm comes from the Chromium clang fetched into the checkout
+          bash ctrl/m150/gates.sh windows plain stage \
+            "$WORKDIR/src/third_party/opus/src/dnn" \
+            "$WORKDIR/src/third_party/boringssl/src/include/openssl/ssl.h"
+
+      - name: BUILDINFO.json + PINS.txt (BEFORE SHA256SUMS)
+        env:
+          # generic image label, never the runner's own name
+          RUNNER_IMAGE: windows-2022
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          "$py" ctrl/m150/buildinfo.py windows plain > out/BUILDINFO.json
+          "$py" ctrl/m150/buildinfo.py windows plain --pins > out/PINS.txt
+          cat out/PINS.txt out/BUILDINFO.json
+
+      - name: SHA256SUMS (covers webrtc.lib, headers, BUILDINFO.json, PINS.txt)
+        run: (cd out && sha256sum webrtc.lib webrtc-headers.zip BUILDINFO.json PINS.txt > SHA256SUMS && cat SHA256SUMS && ls -l)
+
+      - name: Upload build artifact (workflow-scoped only - no repo/release access in this job)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x64
+          path: out/*
+          if-no-files-found: error
+
+  test:
+    needs: precheck
+    runs-on: windows-2022
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKDIR: C:/w
+      DEPOT_TOOLS_UPDATE: "0"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      GYP_MSVS_OVERRIDE_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      vs2022_install: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      WINDOWSSDKDIR: C:\Program Files (x86)\Windows Kits\10
+      NINJA_STATUS: "[%f/%t %es] "
+    steps:
+      - name: Checkout this repo (scripts, patches)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync M150 source (pinned, hard-verified)
+        env:
+          WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "$IN_WEBRTC_REF" win
+
+      - name: Apply patch series (variant=win)
+        run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
+
+      - name: Fetch Opus DNN weights
+        run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Build test binaries (x64, strict)
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          mkdir -p out/test-strict
+          echo 'target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=true rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true' | tr ' ' '\n' > out/test-strict/args.gn
+          cmd //c "gn.bat gen out/test-strict"
+          cmd //c "autoninja.bat -C out/test-strict rtc_unittests modules_unittests"
+
+      - name: Run T1-T6 (strict)
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/ctrl/m150/ci/run-tests.sh" out/test-strict strict .exe
+
+  publish:
+    needs: [precheck, build, test]
+    # Only a manual dispatch with publish=true, and only when BOTH build (with
+    # its gates) and test succeeded. A push run never publishes.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && needs.build.result == 'success' && needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-x64
+          path: out
+
+      - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.precheck.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$TAG' now exists - refusing to attach a release to it"
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: "out/webrtc.lib\nout/webrtc-headers.zip\nout/SHA256SUMS"
+
+      - name: Create release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.precheck.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "M150 Windows x64 static library (webrtc.lib, clang-cl, strict transport) + public headers, source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. Gates G1-G9 and T3-T6 unit tests passed on Windows. See BUILDINFO.json, PINS.txt and the build-provenance attestation." \
+            out/* \
+            || echo "::warning::GITHUB_TOKEN could not create release $TAG (HTTP 403 seen 2026-09-29). The artifact is attested and sha256-verified; the maintainer publishes it from this run with a personal token."

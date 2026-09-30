@@ -1,5 +1,5 @@
 third_party/opus/BUILD.gn: compile in deep PLC (FARGAN/LPCNet-lite) and
-OSCE (LACE/NoLACE, no BWE), arm64 only.
+OSCE (LACE/NoLACE, no BWE), arm64 and x64.
 
 Chromium's `src/third_party/opus` already vendors every .c/.h file this
 needs (verified against the real, exact revision webrtc's own DEPS pins for
@@ -121,12 +121,43 @@ copy of each int8 weight matrix and nnet.c runs the float "debug" path:
 which alone would break the G7 size gate (1-6 MB growth) and is not the
 configuration the OSCE/deep-PLC operating point was measured with.
 
+Desktop x64 (Windows/Linux host builds; added for m150 Windows): the same
+deep PLC + OSCE sources are compiled on current_cpu == "x64" too. The scope
+is the GN variable `use_qaudion_dnn` (arm64 || x64); 32-bit x86 and arm stay
+excluded, and the arm64 output is unchanged (same defines, same sources).
+x64 differences, all checked against xiph/opus@55513e81's dnn/x86/*:
+- No new weights and no different code: the very same dnn/*.c files and the
+  same sha256-pinned model tarball (m150/fetch-opus-dnn-weights.sh) are used;
+  only the SIMD kernel files differ. arm64 uses dnn/arm/nnet_neon.c; x64 uses
+  dnn/x86/nnet_sse2.c + dnn/x86/x86_dnn_map.c (in the `opus` target) and
+  dnn/x86/nnet_sse4_1.c (in the existing `opus_sse41` source_set, which
+  already carries -msse4.1). Chromium's opus config is RTCD (OPUS_HAVE_RTCD,
+  SSE2 presumed, SSE4.1 may-have, AVX2 not defined), so dnn/x86/dnn_x86.h
+  dispatches through the DNN_COMPUTE_{LINEAR,ACTIVATION,CONV2D}_IMPL tables
+  defined in x86_dnn_map.c; AVX2 slots resolve to the generic C kernels
+  (nnet_default.c, already in the list). No AVX2 file is added on purpose.
+- The self-report defines QAUDION_OPUS_DEEP_PLC/OSCE are therefore also set
+  on x64, so P4b's "Q-AUDION opus-dec" log line and the build gates see them.
+- License: all of dnn/ is xiph/opus BSD-3-Clause (same COPYING as the rest of
+  libopus); the weights come from the official xiph model tarball, unchanged.
+  Not independently verified: a separate license file inside that tarball
+  (the fetch script extracts only dnn/*_data.[ch]).
+- Not verified locally (no compiler here): clang-cl/MSVC-ABI compilation of
+  dnn/*.c; the Linux x64 job of test-m150-patches.yml and the Windows job of
+  build-m150-windows.yml are the checks.
+
 diff --git a/opus/BUILD.gn b/opus/BUILD.gn
-index 1b75504..a19d58a 100644
+index 1b75504..fd14700 100644
 --- a/opus/BUILD.gn
 +++ b/opus/BUILD.gn
-@@ -12,6 +12,19 @@ use_opus_x86_optimization = current_cpu == "x86" || current_cpu == "x64"
+@@ -10,8 +10,25 @@ use_opus_arm_optimization = current_cpu == "arm" || current_cpu == "arm64"
  
+ use_opus_x86_optimization = current_cpu == "x86" || current_cpu == "x64"
+ 
++# Q-Audion (P4a): deep PLC + OSCE are compiled in on arm64 (Android, iOS) and
++# on x64 (desktop: Windows/Linux host builds). 32-bit x86 and arm stay out.
++use_qaudion_dnn = current_cpu == "arm64" || current_cpu == "x64"
++
  config("opus_config") {
    include_dirs = [ "src/include" ]
 +
@@ -136,7 +167,7 @@ index 1b75504..a19d58a 100644
 +  # what this specific binary was actually built with, without duplicating
 +  # the current_cpu check. Safe to read from a dependent because this
 +  # config is `public_configs` below.
-+  if (current_cpu == "arm64") {
++  if (use_qaudion_dnn) {
 +    defines = [
 +      "QAUDION_OPUS_DEEP_PLC=1",
 +      "QAUDION_OPUS_OSCE=1",
@@ -145,7 +176,7 @@ index 1b75504..a19d58a 100644
  }
  
  config("opus_private_config") {
-@@ -32,6 +45,7 @@ config("opus_private_config") {
+@@ -32,6 +49,7 @@ config("opus_private_config") {
      "src/silk",
      "src/silk/fixed",
      "src/silk/float",
@@ -153,49 +184,58 @@ index 1b75504..a19d58a 100644
    ]
  
    cflags = []
-@@ -103,6 +117,36 @@ config("opus_private_config") {
- 
-     if (current_cpu == "arm64") {
+@@ -105,6 +123,32 @@ config("opus_private_config") {
        defines += [ "OPUS_ARM_PRESUME_AARCH64_NEON_INTR" ]
-+
-+      # Q-Audion (M150 hardening, P4a): deep PLC (FARGAN + the LPCNet-lite
-+      # pieces it needs) and OSCE (LACE/NoLACE only - no OSCE_BWE; osce.c /
-+      # osce_features.c at this exact revision (opus upstream 55513e81,
-+      # per third_party/opus/README.chromium) have no bbwenet_* symbol at
-+      # all - grepped the actual vendored files, not assumed - so nothing
-+      # here needs dnn/bbwenet_data.c, which the pinned model tarball
-+      # (opus-dnn-weights-160753e9, sha256
-+      # 160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58)
-+      # does not contain anyway). Nested in the existing arm64-only branch,
-+      # not a new if-block, because that is already exactly the scope the
-+      # owner wants this in (solo arm64: Android arm64-v8a, iOS device +
-+      # simulator arm64). Macro names are xiph/opus's own
-+      # (configure.ac: --enable-deep-plc/--enable-osce; CMakeLists.txt:
-+      # OPUS_OSCE) and stable across releases.
-+      #
-+      # DISABLE_DEBUG_FLOAT (security review, stage 3): every upstream build
-+      # system defines it by default (configure.ac --enable-dnn-debug-float
-+      # defaults to no, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG defaults to OFF,
-+      # meson dnn-debug-float defaults to disabled). Without it the *_data.c
-+      # files also compile a float copy of every int8 weight matrix and
-+      # nnet.c then runs the "debug" float path: ~12.2 MB of weights instead
-+      # of ~3.0 MB (measured on the pinned model tarball) and a slower,
-+      # non-default inference path than the one the OSCE/deep-PLC operating
-+      # point was measured with.
-+      defines += [
-+        "ENABLE_DEEP_PLC",
-+        "ENABLE_OSCE",
-+        "DISABLE_DEBUG_FLOAT",
-+      ]
      }
    }
++
++  if (use_qaudion_dnn) {
++    # Q-Audion (M150 hardening, P4a): deep PLC (FARGAN + the LPCNet-lite
++    # pieces it needs) and OSCE (LACE/NoLACE only - no OSCE_BWE: osce.c /
++    # osce_features.c at this exact revision (opus upstream 55513e81, per
++    # third_party/opus/README.chromium) have no bbwenet_* symbol at all, and
++    # the pinned model tarball (sha256 160753e9...35e58) has no bbwenet data).
++    # Scope: arm64 (Android arm64-v8a, iOS device + simulator) and x64
++    # (desktop). Macro names are xiph/opus's own (configure.ac:
++    # --enable-deep-plc/--enable-osce; CMakeLists.txt: OPUS_OSCE).
++    #
++    # DISABLE_DEBUG_FLOAT (security review, stage 3): every upstream build
++    # system defines it by default (configure.ac --enable-dnn-debug-float
++    # defaults to no, CMakeLists.txt OPUS_DNN_FLOAT_DEBUG defaults to OFF,
++    # meson dnn-debug-float defaults to disabled). Without it the *_data.c
++    # files also compile a float copy of every int8 weight matrix and
++    # nnet.c then runs the "debug" float path: ~12.2 MB of weights instead
++    # of ~3.0 MB (measured on the pinned model tarball) and a slower,
++    # non-default inference path than the one the OSCE/deep-PLC operating
++    # point was measured with.
++    defines += [
++      "ENABLE_DEEP_PLC",
++      "ENABLE_OSCE",
++      "DISABLE_DEBUG_FLOAT",
++    ]
++  }
  }
-@@ -432,6 +476,40 @@ static_library("opus") {
+ 
+ config("opus_test_config") {
+@@ -147,6 +191,12 @@ if (use_opus_x86_optimization) {
+       "src/silk/x86/VQ_WMat_EC_sse4_1.c",
+     ]
+ 
++    # Q-Audion (P4a): SSE4.1 kernels of the deep-PLC/OSCE neural nets (x64
++    # only; the RTCD dispatcher lives in x86_dnn_map.c in the opus target).
++    if (use_qaudion_dnn) {
++      sources += [ "src/dnn/x86/nnet_sse4_1.c" ]
++    }
++
+     configs -= [ "//build/config/compiler:chromium_code" ]
+     configs += [ "//build/config/compiler:no_chromium_code" ]
+     configs += [
+@@ -432,6 +482,55 @@ static_library("opus") {
        "src/silk/arm/macros_armv5e.h",
      ]
    }
 +
-+  if (current_cpu == "arm64") {
++  if (use_qaudion_dnn) {
 +    sources += [
 +      # Deep PLC: FARGAN + the LPCNet-lite pieces it needs. File list is
 +      # xiph/opus's own DEEP_PLC_SOURCES (lpcnet_sources.mk); every file
@@ -214,7 +254,6 @@ index 1b75504..a19d58a 100644
 +      "src/dnn/parse_lpcnet_weights.c",
 +      "src/dnn/pitchdnn.c",
 +      "src/dnn/pitchdnn_data.c",
-+      "src/dnn/arm/nnet_neon.c",
 +
 +      # OSCE: LACE/NoLACE only, no OSCE_BWE (see opus_private_config above).
 +      # File list is xiph/opus's own OSCE_SOURCES (lpcnet_sources.mk) minus
@@ -226,6 +265,22 @@ index 1b75504..a19d58a 100644
 +      "src/dnn/nndsp.c",
 +      "src/dnn/lace_data.c",
 +      "src/dnn/nolace_data.c",
++    ]
++  }
++
++  # Deep-PLC/OSCE neural-net kernels per architecture. arm64: NEON, no runtime
++  # dotprod dispatch (single ABI, per the owner's decision). x64: Chromium
++  # builds opus with RTCD (OPUS_HAVE_RTCD, SSE2 presumed, SSE4.1 optional), so
++  # dnn/x86/dnn_x86.h dispatches through DNN_COMPUTE_*_IMPL, defined in
++  # x86_dnn_map.c; the SSE4.1 kernels are in the opus_sse41 source_set above,
++  # and AVX2 falls back to the C kernels (OPUS_X86_MAY_HAVE_AVX2 is not set).
++  if (current_cpu == "arm64") {
++    sources += [ "src/dnn/arm/nnet_neon.c" ]
++  }
++  if (current_cpu == "x64") {
++    sources += [
++      "src/dnn/x86/nnet_sse2.c",
++      "src/dnn/x86/x86_dnn_map.c",
 +    ]
 +  }
  }
