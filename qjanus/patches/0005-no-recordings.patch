@@ -1,0 +1,17 @@
+diff --git a/src/record.c b/src/record.c
+index 6913a33..87d3f09 100644
+--- a/src/record.c
++++ b/src/record.c
+@@ -87,6 +87,12 @@ janus_recorder *janus_recorder_create(const char *dir, const char *codec, const
+ 	return janus_recorder_create_full(dir, codec, NULL, filename);
+ }
+ janus_recorder *janus_recorder_create_full(const char *dir, const char *codec, const char *fmtp, const char *filename) {
++	/* qjanus never records anything. The VideoRoom lets a participant ask for a recording, with a
++	 * file name of its own, in the join request (joinandconfigure) without presenting the room
++	 * secret that lock_record is meant to demand: the recorder itself is where that is stopped,
++	 * so that no request of any client can make the node write a file */
++	JANUS_LOG(LOG_WARN, "Recordings are disabled in this build, refusing to create one\n");
++	return NULL;
+ 	janus_recorder_medium type = JANUS_RECORDER_AUDIO;
+ 	if(codec == NULL) {
+ 		JANUS_LOG(LOG_ERR, "Missing codec information\n");
