@@ -25,6 +25,7 @@ const OLD_CHROMES = JSON.parse(process.env.OLD_CHROMES || '[]');
 const NETEM = process.env.NETEM || path.join(HERE, 'netem.sh');
 const OUT = process.env.OUT_DIR || path.join(HERE, 'e2e-out');
 const PORT = 8199;
+const REC_PROBE = '/tmp/qjanus-rec-probe/rec';
 const PAGE = `http://127.0.0.1:${PORT}/page.html`;
 if (!TOKEN_SECRET || !ADMIN_KEY) throw new Error('QJANUS_TOKEN_SECRET and QJANUS_ADMIN_KEY are required');
 fs.mkdirSync(OUT, { recursive: true });
@@ -154,6 +155,7 @@ async function waitLevel(p, pcId, ms) {
   }
   return false;
 }
+const codeOf = (m) => (m && m.error && m.error.code) || pluginData(m).error_code || 0;
 const sumBy = (arr, mid, f) => arr.filter((x) => x.mid === mid).reduce((a, x) => a + (x[f] || 0), 0);
 
 // ------------------------------------------------------------- one call participant
@@ -508,12 +510,54 @@ try {
       const hb = await back.attach();
       const rj = await back.message(hb, { request: 'join', ptype: 'publisher', room, id: D.id, token: D.joinToken });
       assert.equal(pluginData(rj).error_code, 433, JSON.stringify(rj).slice(0, 200));
+      // ...nor subscribe with the private_id it had (require_pvtid: the id died with the participant)
+      const hs = await back.attach();
+      const sj = await back.message(hs, { request: 'join', ptype: 'subscriber', room, private_id: D.privateId, streams: [{ feed: A.id, mid: '0' }] });
+      assert.equal(pluginData(sj).error_code, 433, JSON.stringify(sj).slice(0, 200));
       back.close();
       // the others still hear each other
       assertFlowing(A, await mediaWindow(A), [B.id]);
       assertFlowing(B, await mediaWindow(B), [A.id]);
       const list = await api.listParticipants(room);
       assert.ok(!list.participants.some((x) => x.id === D.id));
+    });
+
+    // A participant must never be able to make the node write a file. Upstream VideoRoom honours record + filename in
+    // `joinandconfigure` WITHOUT the room secret that lock_record is meant to demand (patch 0005 stops it in the recorder)
+    await check('recording is impossible: joinandconfigure with record and an absolute file name of its own writes nothing on the node', async () => {
+      const t0 = Date.now() / 1000;
+      const rroom = await makeRoom(4);
+      const p = await new Peer('REC', pqc, rroom, { simulcast: false }).open();
+      try {
+        await api.allow(rroom, S.roomSecret, 'add', [p.joinToken]);
+        await evalIn(p, ([k, i]) => window.q.setSendKey(k, i), [p.key, p.keyIndex]);
+        const offer = await evalIn(p, ([i, o]) => window.q.newPublisher(i, o), [p.pubPc, { e2ee: true, simulcast: false }]);
+        const m = await p.c.message(p.pubHandle, {
+          request: 'joinandconfigure', ptype: 'publisher', room: rroom, id: p.id, display: p.id, token: p.joinToken,
+          audio: true, video: true, record: true, filename: REC_PROBE,
+        }, { type: 'offer', sdp: offer, e2ee: true });
+        assert.equal(pluginData(m).videoroom, 'joined', JSON.stringify(m).slice(0, 300));
+        await evalIn(p, ([i, s]) => window.q.setAnswer(i, s), [p.pubPc, m.jsep.sdp]);
+        await p.c.waitEvent((e) => e.janus === 'webrtcup' && e.sender === p.pubHandle, p.upTimeout);
+        await sleep(4000);                                   // media is flowing: the recorder would be created now
+        // the configure path is locked by the room secret (lock_record): answered or refused, but nothing starts
+        const cfg = await p.c.message(p.pubHandle, { request: 'configure', record: true, filename: `${REC_PROBE}-2` });
+        assert.ok(pluginData(cfg).configured === 'ok' || codeOf(cfg) > 0, JSON.stringify(cfg).slice(0, 200));
+        await sleep(1500);
+        const pid = execFileSync('systemctl', ['show', '-p', 'MainPID', '--value', 'qjanus'], { encoding: 'utf8' }).trim();
+        assert.match(pid, /^[1-9][0-9]*$/);
+        // the service's own (private) /tmp, /var/tmp and runtime directory, seen from the host
+        const found = execFileSync('sudo', ['-n', 'sh', '-c',
+          `find /proc/${pid}/root/tmp /proc/${pid}/root/var/tmp /proc/${pid}/root/run/qjanus -maxdepth 5 \\( -name '*.mjr' -o -name 'qjanus-rec-probe*' \\) 2>/dev/null | head -5; true`], { encoding: 'utf8' }).trim();
+        assert.equal(found, '', `the node wrote a recording: ${found}`);
+        // the attempt did reach the recorder and was refused there (so this test is not vacuous)
+        const refusals = journalSince(t0 - 1).split('\n').filter((l) => /Recordings are disabled in this build/.test(l));
+        assert.ok(refusals.length >= 1, 'no recorder refusal in the journal: the recording request never reached the recorder');
+        return `refused ${refusals.length}x, no file`;
+      } finally {
+        await p.close().catch(() => {});
+        await api.destroyRoom(rroom, S.roomSecret).catch(() => {});
+      }
     });
 
     await check('destroy: the room is gone and every PeerConnection goes down', async () => {
@@ -586,6 +630,7 @@ try {
     // flight is 2-3 datagrams) a few percent of the handshakes may still fail. Without the timer fix only ~75 % survive.
     await check(`netem loss 30 %: at least 87 % of ${SOAK_N} publisher + ${SOAK_N} subscriber DTLS 1.3 handshakes complete, every established one at the required level`, async () => {
       execFileSync('sudo', ['-n', 'bash', NETEM, 'on', '30%', '0%'], { stdio: 'inherit' });
+      const soakStart = Date.now() / 1000;
       const runs = [];
       try {
         for (let i = 0; i < SOAK_N; i++) runs.push(await soakOnce(i));
@@ -597,7 +642,11 @@ try {
       const detail = `${ok}/${tried} handshakes (pub ${runs.filter((r) => r.pub).length}/${SOAK_N}, sub ${runs.filter((r) => r.sub).length}/${runs.reduce((a, r) => a + r.subTried, 0)}), median ${runs.map((r) => r.ms).sort((a, b) => a - b)[Math.floor(runs.length / 2)]} ms` +
         (runs.some((r) => r.error) ? `, errors: ${runs.filter((r) => r.error).map((r) => r.error).join(' | ')}` : '');
       assert.ok(ok / tried >= 0.87, detail);
-      return detail;
+      // Deterministic evidence of the timer fix (patch 0001): the ACK/retransmit timer fired AFTER a handshake was established.
+      // Stock Janus stops the timer the moment the state is `connected`, so this line cannot exist there.
+      const afterConnected = journalSince(soakStart - 1).split('\n').filter((l) => /DTLS timer expired .*\(state=connected\)/.test(l)).length;
+      assert.ok(afterConnected >= 1, `the DTLS timer never ran after a handshake was established (${detail})`);
+      return `${detail}, timer after connected: ${afterConnected}x`;
     });
   }
 
@@ -638,6 +687,8 @@ try {
       } catch (e) { res.publisherSetupError = String(e.message || e).slice(0, 120); }
       const pubTransport = await weak.transport(weak.pubPc).catch(() => null);
       res.pubConnected = pubUp && levelOk(pubTransport);
+      res.pubUp = pubUp;                       // Janus' own `webrtcup`: it must never come for a refused peer
+      res.subUp = !!weak.subUp;
       res.pubHangup = pubHangup;
       await sleep(500);
       const lines = dtlsLines(journalSince(t0 - 1));
@@ -648,10 +699,11 @@ try {
       if (expect === 'refused') {
         assert.ok(!res.subConnected && !res.subMedia, `${label}: subscriber role must be refused: ${JSON.stringify(res)}`);
         assert.ok(!res.pubConnected, `${label}: publisher role must be refused: ${JSON.stringify(res)}`);
+        assert.ok(!res.subUp && !res.pubUp, `${label}: qjanus reported webrtcup for a peer below the required level (either role): ${JSON.stringify(res)}`);
         assert.ok(res.refusalLines >= 1, `${label}: qjanus must log the refusal: ${JSON.stringify(res)}`);
       } else {
         assert.ok(res.subConnected && res.subMedia, `${label}: subscriber role must connect: ${JSON.stringify(res)}`);
-        assert.ok(res.pubConnected, `${label}: publisher role must connect: ${JSON.stringify(res)}`);
+        assert.ok(res.pubConnected && res.subUp && res.pubUp, `${label}: publisher role must connect: ${JSON.stringify(res)}`);
         assert.ok(res.okLines >= 3, `${label}: three policy-ok lines expected (S publisher, W subscriber, W publisher): ${JSON.stringify(res)}`);
       }
       return JSON.stringify(res);
@@ -679,6 +731,15 @@ try {
       await check('negative: Firefox (TLS_AES_128_GCM_SHA256 in DTLS 1.3) is refused', () => weakPeer('firefox', ff, 'refused'));
       await ff.close();
     }
+  }
+  if ((SUITE === 'negative' || SUITE === 'all') && process.env.REQUIRE_ALL_NEGATIVES === '1') {
+    await check('the refused-peer matrix is complete: Chrome 130 / 142 / 148 (stock and with the PQC trial) and Firefox all ran', async () => {
+      const names = results.map((r) => r.name);
+      for (const m of ['130', '142', '148']) {
+        for (const t of ['(stock)', '+ PQC trial']) assert.ok(names.some((n) => n.startsWith(`negative: chrome ${m} ${t}`)), `missing: chrome ${m} ${t}`);
+      }
+      assert.ok(names.some((n) => n.startsWith('negative: Firefox')), 'missing: Firefox');
+    });
   }
   await pqc.close();
 } catch (e) {

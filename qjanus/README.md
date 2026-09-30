@@ -9,7 +9,9 @@ one Janus binary that terminates exactly the transport level of the 1:1 calls an
   BoringSSL backend, libnice 0.1.24 (GnuTLS), libwebsockets (no TLS library). The only TLS/crypto code in the
   process is the static BoringSSL; the build fails if a system `libssl`/`libcrypto` is linked.
 - Only the VideoRoom plugin and the HTTP + WebSockets transports. No data channels, no other plugins or
-  transports, no event handlers, no recordings post-processing.
+  transports, no event handlers, no recordings post-processing. Nothing is ever recorded: upstream VideoRoom lets a
+  participant start a recording, with a file name of its own, in the `joinandconfigure` request without the room secret
+  that `lock_record` is meant to demand, so the recorder itself refuses to create any file (patch 0005).
 - Content is end-to-end encrypted by the clients (`require_e2ee`); qjanus forwards SRTP and never sees keys
   or plaintext. Its logs carry no identifiers, addresses, fingerprints or keys (ids are cut to 8 characters).
 - The DTLS certificate (ECDSA P-256) is fixed per node and generated ON the node by `install.sh`; its
@@ -22,7 +24,7 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
 | Path | What |
 |---|---|
 | `build/` | pinned dependency + Janus build, packaging, linkage and clean-container checks (used by the workflow) |
-| `patches/` | the four patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber, `info` without addresses, WebSockets without TLS) |
+| `patches/` | the five patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber, `info` without addresses, WebSockets without TLS, no recordings) |
 | `conf/*.jcfg.tmpl` | config templates, rendered at every service start; nothing is edited per node |
 | `conf/Caddyfile.example` | the Caddy block that publishes the client API |
 | `systemd/qjanus.service` | the unit (sandbox and limits of spec section 6) |
@@ -64,14 +66,17 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    |---|---|
    | `QJANUS_TOKEN_SECRET` | HMAC-SHA256 key of the signed session tokens (`token_auth_secret`) |
    | `QJANUS_ADMIN_KEY` | VideoRoom `admin_key` (room creation) |
-   | `QJANUS_HTTP_BIND` | address of the server-facing HTTP API (port 8088) |
+   | `QJANUS_HTTP_BIND` | address of the server-facing HTTP API (port 8088): loopback, private (RFC 1918), VPN (100.64.0.0/10) or unique-local only |
+   | `QJANUS_ALLOW_NONPRIVATE_BIND` | optional, `yes` lets `QJANUS_HTTP_BIND` be a public address (plain HTTP, no TLS: only if you know why) |
    | `QJANUS_NAT_1_1` | optional: public IPv4, only for a node behind a 1:1 NAT (nodes that carry their public address on an interface need nothing) |
 
    Change a value by editing the file and running `systemctl restart qjanus`. Rotating the token secret or the
    admin key means updating the application server at the same time; running calls keep their PeerConnections but their
    WebSocket sessions need a fresh token.
 
-   `QJANUS_HTTP_BIND` must be an address that an interface of the node carries and that is UP when the service starts
+   `QJANUS_HTTP_BIND` must be a loopback, private, VPN (CGNAT) or unique-local address: `install.sh --http-bind` and the
+   unit's `qjanus-render-config` refuse a public or wildcard address (the server API is plain HTTP for the application
+   server only). It must also be an address that an interface of the node carries and that is UP when the service starts
    (Janus compares it with the interface list; IPv6 as printed by `ip -6 addr`, compressed and lower case). Janus
    would otherwise keep running without the HTTP transport, so the unit has an `ExecStartPost`
    (`libexec/qjanus-wait-ready`) that fails the start, and lets systemd retry, until both APIs answer: a node is either
@@ -119,7 +124,11 @@ tar -xzf qjanus-<new>-ubuntu24.04-x86_64.tar.gz -C /root/qjanus-new && cd /root/
 ```
 
 The fingerprint printed is unchanged by an upgrade (same key). The last three releases are kept
-(`--keep-releases N`). An upgrade restarts the service, which drops the running calls' media: do it between
+(`--keep-releases N`). If the new release (or a changed setting such as `--http-bind`) does not come up healthy, the
+script puts the previous release (with the unit it shipped) and the previous `qjanus.env` back, starts them again,
+exits with an error and prints no fingerprint; `--rollback` only ever goes to a release that has run on the node
+(never to one that was installed but did not start, nor to an interrupted install). Installing the same version
+name with different content is refused. Only one `install.sh` runs at a time. An upgrade restarts the service, which drops the running calls' media: do it between
 calls, or after moving the rooms away (spec section 2.5).
 
 ## Uninstall

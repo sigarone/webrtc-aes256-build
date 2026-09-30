@@ -385,6 +385,44 @@ await check('subscriber join: an unknown or not yet publishing feed is refused (
   sub.close();
 });
 
+await check('rtp_forward is for the server only (lock_rtp_forward + admin_key): refused without the key (429) and with a wrong one (433), from a client session as over HTTP; the room secret is no substitute', async () => {
+  const req = { request: 'rtp_forward', room, publisher_id: idA, host: '127.0.0.1', audio_port: 5002, audio_pt: 111 };
+  const c = await ws();
+  await c.create();
+  const h = await c.attach();
+  const none = await c.message(h, req);
+  shape('rtp_forward_without_admin_key', req, none);
+  assert.equal(codeOf(none), 429, JSON.stringify(none));
+  const wrong = await c.message(h, { ...req, admin_key: hex(32) });
+  assert.equal(codeOf(wrong), 433, JSON.stringify(wrong));
+  const secretOnly = await c.message(h, { ...req, secret: roomSecret });
+  assert.equal(codeOf(secretOnly), 429, JSON.stringify(secretOnly));
+  const viaHttp = await api.session(({ vr }) => vr(req));
+  assert.equal(viaHttp.error_code, 429, JSON.stringify(viaHttp));
+});
+
+await check('every request that changes a room needs the room secret (429 missing, 433 wrong): edit, enable_recording, stop_rtp_forward, listforwarders - a client cannot turn recording on', async () => {
+  const c = await ws();
+  await c.create();
+  const h = await c.attach();
+  for (const body of [
+    { request: 'edit', room, new_description: 'x' },
+    { request: 'enable_recording', room, record: true },
+    { request: 'stop_rtp_forward', room, publisher_id: idA, stream_id: 1 },
+    { request: 'listforwarders', room },
+  ]) {
+    const none = await c.message(h, body);
+    assert.equal(codeOf(none), 429, `${body.request} without the secret: ${JSON.stringify(none)}`);
+    const wrong = await c.message(h, { ...body, secret: hex(32) });
+    assert.equal(codeOf(wrong), 433, `${body.request} with a wrong secret: ${JSON.stringify(wrong)}`);
+  }
+  // and the room did not change
+  const shown = await api.session(({ vr }) => vr({ request: 'list' }, { admin: true }));
+  const r = shown.list.find((x) => x.room === room);
+  assert.equal(r.record, false);
+  assert.equal(r.lock_record, true);
+});
+
 await check('leave: the leaver gets leaving/ok, the others get leaving <id>; the id is free again', async () => {
   const idD = hex(16); const tokD = hex(16);
   remember(idD, tokD);

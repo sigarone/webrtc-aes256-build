@@ -39,7 +39,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: qjanus-${{ github.ref }}
+  # per event type: an incidental push to the branch must never cancel a release run in progress
+  group: qjanus-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
@@ -110,8 +111,10 @@ jobs:
           sudo mkdir -p "$BSSL" "$PREFIX"
           sudo chown -R "$USER" "$BSSL" "$PREFIX"
 
-      - name: Restore the dependency cache (BoringSSL, libsrtp, libnice, libwebsockets)
+      # A release is built from the pinned sources only: a cache entry is not verified against anything
+      - name: Restore the dependency cache (BoringSSL, libsrtp, libnice, libwebsockets) - never for a release
         id: deps-cache
+        if: ${{ needs.precheck.outputs.release != 'true' }}
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -124,7 +127,7 @@ jobs:
         run: qjanus/build/build-deps.sh
 
       - name: Save the dependency cache
-        if: steps.deps-cache.outputs.cache-hit != 'true'
+        if: ${{ needs.precheck.outputs.release != 'true' && steps.deps-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -270,6 +273,45 @@ jobs:
           grep -q '127.0.0.1:8188' "$RUNNER_TEMP/tcp.txt"
           systemd-analyze security --no-pager qjanus.service | tail -25 || true
 
+      - name: The sandbox and the limits are in effect (what systemd applies and what the process sees, not what the unit says)
+        run: |
+          set -euo pipefail
+          PID=$(systemctl show -p MainPID --value qjanus)
+          bad=0
+          # 1. the properties systemd applies (a misspelled directive is dropped with only a warning)
+          for kv in DynamicUser=yes NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes PrivateTmp=yes PrivateDevices=yes \
+                    ProtectProc=invisible ProtectKernelTunables=yes ProtectKernelModules=yes ProtectKernelLogs=yes \
+                    ProtectControlGroups=yes ProtectClock=yes ProtectHostname=yes RestrictNamespaces=yes RestrictRealtime=yes \
+                    RestrictSUIDSGID=yes LockPersonality=yes MemoryMax=2147483648 CPUQuotaPerSecUSec=2s CPUWeight=50 \
+                    TasksMax=4096 LimitNOFILE=65536 UMask=0077; do
+            k=${kv%%=*}; v=${kv#*=}
+            got=$(systemctl show -p "$k" --value qjanus)
+            [ "$got" = "$v" ] || { echo "::error::unit property $k is '$got', the spec wants '$v'"; bad=1; }
+          done
+          for af in AF_INET AF_INET6 AF_UNIX AF_NETLINK; do
+            systemctl show -p RestrictAddressFamilies --value qjanus | grep -qw "$af" || { echo "::error::RestrictAddressFamilies lacks $af"; bad=1; }
+          done
+          if systemctl show -p RestrictAddressFamilies --value qjanus | grep -qE 'AF_PACKET|AF_BLUETOOTH'; then echo "::error::RestrictAddressFamilies allows more than the spec"; bad=1; fi
+          systemctl show -p SystemCallFilter --value qjanus | grep -q '@system-service' || { echo "::error::SystemCallFilter=@system-service is not applied"; bad=1; }
+          for path in /opt/bcrypto /root /etc/bcrypto /var/lib/bcrypto; do
+            systemctl show -p InaccessiblePaths --value qjanus | grep -qF "$path" || { echo "::error::InaccessiblePaths lacks $path"; bad=1; }
+          done
+          # 2. what the running process sees: read-only system, no home, a private /tmp and /dev
+          ns() { sudo nsenter -t "$PID" -m -- "$@"; }
+          for f in /usr/qjanus-write-probe /etc/qjanus-write-probe /opt/qjanus-write-probe /var/lib/qjanus-write-probe; do
+            if ns sh -c ": > $f" 2> /dev/null; then echo "::error::the service can write $f (ProtectSystem=strict is not in effect)"; ns rm -f "$f"; bad=1; fi
+          done
+          [ -z "$(ns ls -A /home /root 2> /dev/null)" ] || { echo "::error::/home or /root is visible to the service"; bad=1; }
+          sudo touch /tmp/qjanus-host-marker
+          if ns test -e /tmp/qjanus-host-marker; then echo "::error::the service shares the host /tmp"; bad=1; fi
+          sudo rm -f /tmp/qjanus-host-marker
+          if ns test -e /dev/kmsg; then echo "::error::the service sees the host /dev (/dev/kmsg)"; bad=1; fi
+          # 3. an overall exposure level, so that a dropped directive shows up as a number
+          score=$(systemd-analyze security --no-pager qjanus.service | sed -n 's/.*Overall exposure level for qjanus.service: \([0-9.]*\).*/\1/p')
+          echo "systemd-analyze exposure level: ${score:-?}"
+          awk -v s="$score" 'BEGIN { exit !(s != "" && s + 0 <= 2.5) }' || { echo "::error::exposure level '$score' is above 2.5"; bad=1; }
+          [ "$bad" = 0 ]
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
@@ -277,20 +319,23 @@ jobs:
       - name: Playwright + Chromium + Firefox
         working-directory: qjanus/test/e2e
         run: |
-          npm install --no-audit --no-fund
-          npx playwright install --with-deps chromium firefox
+          npm ci --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium firefox
 
       - name: Older Chrome-for-Testing builds (weaker peers for the negative tests)
         working-directory: qjanus/test/e2e
         run: |
           json='['
           for m in 130 142 148; do
-            out=$(npx --yes @puppeteer/browsers install "chrome@$m" --path "$HOME/cft" 2>&1 | tail -1) || true
+            out=$(./node_modules/.bin/browsers install "chrome@$m" --path "$HOME/cft" 2>&1 | tail -1) || true
             p=$(echo "$out" | awk '{print $2}')
             echo "chrome@$m -> $out"
             if [ -n "$p" ] && [ -x "$p" ]; then json="$json{\"label\":\"$m\",\"path\":\"$p\"},"; fi
           done
           json="${json%,}]"
+          # a missing build would silently shrink the negative peer matrix: fail instead
+          [ "$(printf '%s' "$json" | grep -o '"label"' | wc -l)" = 3 ] \
+            || { echo "::error::an older Chrome-for-Testing build could not be installed (the refused-peer tests need 130, 142 and 148)"; exit 1; }
           echo "OLD_CHROMES=$json" >> "$GITHUB_ENV"
 
       - name: netem is available (tc, sch_netem)
@@ -322,7 +367,7 @@ jobs:
           set -a; . <(sudo cat /etc/qjanus/qjanus.env); set +a
           echo "::add-mask::$QJANUS_TOKEN_SECRET"; echo "::add-mask::$QJANUS_ADMIN_KEY"
           export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
-          SUITE=all NETEM="$PWD/netem.sh" OUT_DIR="$OUT_DIR/e2e" SECRETS_FILE="$RUNNER_TEMP/secrets-e2e.json" node e2e.mjs 2>&1 | tee "$OUT_DIR/e2e.log"
+          SUITE=all REQUIRE_ALL_NEGATIVES=1 NETEM="$PWD/netem.sh" OUT_DIR="$OUT_DIR/e2e" SECRETS_FILE="$RUNNER_TEMP/secrets-e2e.json" node e2e.mjs 2>&1 | tee "$OUT_DIR/e2e.log"
 
       - name: Log hygiene - no identifiers, addresses, fingerprints or secrets in the service journal
         if: always()
@@ -345,25 +390,43 @@ jobs:
           done < "$RUNNER_TEMP/udp.txt"
           sudo ss -Hltnp | grep janus | awk '{print $4}' | sort
 
-      - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README)
+      - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README), and every way an install can go wrong
         run: |
           set -euo pipefail
           trap 'rc=$?; echo "::error::lifecycle step failed (exit $rc) at: $BASH_COMMAND"; sudo journalctl -u qjanus -n 40 --no-pager -o cat || true' ERR
           # awk reads all of ss's output (grep -q would end the pipe early: SIGPIPE + pipefail)
           listening() { sudo ss -Hltn | awk -v a="$1" '$4 == a { f = 1 } END { exit !f }'; }
+          envval() { sudo grep "^$1=" /etc/qjanus/qjanus.env | head -1 | cut -d= -f2-; }
           FP1='${{ steps.install.outputs.fp }}'
           rel1=$(basename "$(readlink -f /opt/qjanus/current)")
-          # the address of the server-facing HTTP API is a node setting (the VPN address on a remote node).
-          # 1. an address that no interface carries: Janus cannot bind it, the node must FAIL CLOSED (no half-working node)
+          sudo test -e "/opt/qjanus/releases/$rel1/.healthy"
+          # 0. the server API (plain HTTP) is never bound to a public or wildcard address: refused before anything is touched
+          for bad in 8.8.8.8 203.0.113.9 0.0.0.0 ::; do
+            if (cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind "$bad" > /dev/null 2> "$RUNNER_TEMP/bind-public.log"); then
+              echo "::error::--http-bind $bad must be refused"; exit 1
+            fi
+            grep -q 'not acceptable' "$RUNNER_TEMP/bind-public.log"
+          done
+          [ "$(envval QJANUS_HTTP_BIND)" = 127.0.0.1 ]
+          systemctl is-active --quiet qjanus
+          # 1. an address that no interface carries: Janus cannot bind it. The start fails (no half-working node),
+          #    the installer puts the previous settings back, the node keeps serving on its old address
           if (cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 > /dev/null 2> "$RUNNER_TEMP/bind-bad.log"); then
-            echo "::error::a HTTP bind that Janus cannot use must fail the start"; exit 1
+            echo "::error::a HTTP bind that Janus cannot use must fail the install"; exit 1
           fi
-          tail -3 "$RUNNER_TEMP/bind-bad.log"
-          if systemctl is-active --quiet qjanus; then echo "::error::qjanus is active although its HTTP API is not"; exit 1; fi
+          tail -4 "$RUNNER_TEMP/bind-bad.log"
+          grep -q 'putting back the previous' "$RUNNER_TEMP/bind-bad.log"
+          [ "$(envval QJANUS_HTTP_BIND)" = 127.0.0.1 ]
+          systemctl is-active --quiet qjanus
+          listening 127.0.0.1:8088
           # 2. an address of a real interface (the runner's, standing in for the VPN address): only that address, not loopback
           ADDR=$(ip -4 route get 192.0.2.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')
           [ -n "$ADDR" ]
           echo "::add-mask::$ADDR"
+          # a hosted runner may carry a public address: the override is what an operator with such a node would set
+          if ! bash -c '. /tmp/pkg/qjanus/libexec/qjanus-lib.sh; qjanus_private_addr "$1"' _ "$ADDR"; then
+            echo "QJANUS_ALLOW_NONPRIVATE_BIND=yes" | sudo tee -a /etc/qjanus/qjanus.env > /dev/null
+          fi
           FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind "$ADDR" 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
           [ "$FPB" = "$FP1" ]
           listening "$ADDR:8088"
@@ -374,7 +437,29 @@ jobs:
           FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
           listening 127.0.0.1:8088
           systemctl is-active --quiet qjanus
-          # a second release: the same tree with another VERSION
+          # 4. the same version name with different content is refused (never keep running an old tree silently)
+          sudo rm -rf /tmp/pkg4 && sudo mkdir /tmp/pkg4 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg4/qjanus
+          echo '{"tampered":true}' | sudo tee /tmp/pkg4/qjanus/BUILDINFO.json > /dev/null
+          if (cd /tmp/pkg4/qjanus && sudo ./install.sh > /dev/null 2> "$RUNNER_TEMP/same.log"); then
+            echo "::error::an install of the same version with other content must be refused"; exit 1
+          fi
+          grep -q 'different content' "$RUNNER_TEMP/same.log"
+          # 5. a release that installs but cannot start (its ExecStartPost fails): the installer puts the previous release
+          #    back by itself, exits with an error and prints no fingerprint; the broken release is never a rollback target
+          sudo rm -rf /tmp/pkg3 && sudo mkdir /tmp/pkg3 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg3/qjanus
+          echo "${rel1}-broken" | sudo tee /tmp/pkg3/qjanus/VERSION > /dev/null
+          printf '#!/bin/sh\necho broken release >&2\nexit 1\n' | sudo tee /tmp/pkg3/qjanus/libexec/qjanus-wait-ready > /dev/null
+          if FPX=$(cd /tmp/pkg3/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/broken.log"); then
+            echo "::error::a release that cannot start must fail the install"; exit 1
+          fi
+          tail -5 "$RUNNER_TEMP/broken.log"
+          [ -z "${FPX:-}" ]
+          grep -q "putting back $rel1" "$RUNNER_TEMP/broken.log"
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
+          systemctl is-active --quiet qjanus
+          listening 127.0.0.1:8088
+          sudo test ! -e "/opt/qjanus/releases/${rel1}-broken/.healthy"
+          # 6. a second release: the same tree with another VERSION
           sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
           echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null
           pid1=$(systemctl show -p MainPID --value qjanus)
@@ -383,10 +468,13 @@ jobs:
           [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "${rel1}-upgrade" ]
           [ "$(systemctl show -p MainPID --value qjanus)" != "$pid1" ]
           systemctl is-active --quiet qjanus
+          # 7. rollback goes to the last release that ever ran (not to the broken one, not to an interrupted install)
+          sudo mkdir -p /opt/qjanus/releases/zz-interrupted.tmp
           FP3=$(sudo /opt/qjanus/current/install.sh --rollback 2> "$RUNNER_TEMP/rb.log") || { cat "$RUNNER_TEMP/rb.log"; exit 1; }; cat "$RUNNER_TEMP/rb.log"
           [ "$FP3" = "$FP1" ]
           [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
           systemctl is-active --quiet qjanus
+          # 8. uninstall keeps the node's key and secrets, a reinstall reuses them, --purge removes them
           sudo /opt/qjanus/current/install.sh --uninstall
           [ ! -e /opt/qjanus ]
           [ ! -e /etc/systemd/system/qjanus.service ]

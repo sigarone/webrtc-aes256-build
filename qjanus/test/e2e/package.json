@@ -4,6 +4,7 @@
   "type": "module",
   "version": "0.0.0",
   "dependencies": {
-    "playwright": "^1.55.0"
+    "@puppeteer/browsers": "3.2.3",
+    "playwright": "1.63.0"
   }
 }
