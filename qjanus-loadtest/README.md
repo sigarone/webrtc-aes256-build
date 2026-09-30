@@ -162,11 +162,14 @@ skip themselves without Chromium), `bash test/sampler.test.sh`.
 
 ## Choosing bot machines
 
-Headless Chromium with fake media is heavy, video far more than audio: a GitHub `ubuntu-latest` runner (4 vCPU) carries a few
-dozen audio bots but only a handful of full-spec simulcast video bots (each 3-layer 720p VP8 encode plus N-1 decodes).
-Use `--video-profile lite|tiny` on small machines, look at `clientCpu` in `steps.jsonl`, and add shards until it stays below
-90 %. Bots of one room always live on one shard. The harness measures its own CPU precisely so that a saturated generator is
-never mistaken for a saturated SFU.
+Headless Chromium with fake media is heavy, video far more than audio. Measured in the CI smoke (GitHub `ubuntu-latest`,
+4 vCPU, Janus and the sampler on the same machine, loopback, so treat as a floor): one `audio8` room (8 bots) costs about 11-13 %
+of the machine and Janus about 4 % of one core; one `video8` room with the `tiny` profile about 27 % of the machine (Janus 7 %);
+two `audio8` rooms about 30 %. So one runner carries roughly 5-6 `audio8` rooms, 2-3 tiny-video `video8` rooms and far fewer
+full-spec (3-layer 720p VP8 encode plus 7 decodes per bot) video rooms: use `--video-profile lite|tiny` on small machines, watch
+`clientCpu` in `steps.jsonl`/`report.md`, and add shards until it stays below 90 %. Bots of one room always live on one shard.
+The harness measures its own CPU so that a saturated generator is reported as `inconclusive_client_saturated` and never mistaken for
+a saturated SFU. All browsers and pages are opened before step 1 (`prewarm`), so start-up cost does not distort the first step.
 
 ## Limits of this harness (read before believing a number)
 
@@ -185,6 +188,10 @@ never mistaken for a saturated SFU.
 * **CPU stop online only with a CPU source** (`--cpu-file`/`--cpu-cmd`). GitHub runners cannot read the node, so in remote
   mode the CPU limit is applied post-hoc by `report --sampler`; the run itself continues past a CPU breach until loss/freeze/join stop it or
   `--ramp-max` is reached, so keep `--ramp-max` sane.
+* `--duration-cap-sec` counts from process start (a far-future `--start-at` eats into it); `derived.audioOutPpsAvg` in `bots.jsonl`
+  includes the ramp-up interval of the first sample (use the step's `audioPubPps.p50`: 16.5 pps = 60 ms packets).
+* A peer counts as "flowing" once it has delivered media (steady is sticky); a stream that dies later shows up as loss/freeze/concealment,
+  not as a state change.
 * Shards synchronize by a start instant, not by a control channel: a shard that starts late reports `lateStartSec`; a breach seen
   by one shard does not stop the others (they see the same node and normally breach in the same step).
 * The Janus token **TTL is refreshed by the harness** (`--token-ttl-sec 600 --token-refresh-sec 300`), see the first finding below.
@@ -196,7 +203,8 @@ never mistaken for a saturated SFU.
 1. **Signed tokens are checked on every request, including keepalive.** With `token_auth` on, `janus_request_check_secret` runs for every
    session-level request. A `session_token` with `ttl_s: 600` therefore stops working 600 s after it was minted for a call that is still running: the
    clients need a refresh path (new token pushed by the server, or a longer TTL) or every keepalive/`configure`/`trickle` after 10 minutes is answered
-   with error 403. The harness models the refresh (`setTokens`), `--token-refresh-sec 0` reproduces the failure.
+   with error 403. Confirmed against the real patched Janus by the smoke's access-control step ("a token that expires mid-session stops working").
+   The harness models the refresh (`--token-ttl-sec 600 --token-refresh-sec 300`: fresh tokens are pushed to every live bot).
 2. **The E2EE flag is on the JSEP** (`{type:"offer", sdp, e2ee:true}`), not in the `publish` body as spec 4.2 says. Rooms with `require_e2ee` reject a publish without it.
 3. The videoroom subscriber `private_id` is an **integer**; ids/rooms are strings only with `string_ids=true`.
 4. Chromium <= 148 needs the `WebRTC-LegacySimulcastLayerLimit/Disabled/` trial to send 3 simulcast layers below 960x540 capture (the harness sets it by default; irrelevant for real 720p sources).

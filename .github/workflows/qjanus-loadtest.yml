@@ -313,6 +313,7 @@ jobs:
 
       # qjanus-load reads the three secrets from these environment variables and
       # never prints or writes them; the summary carries only a hash of the URL.
+      # The same scripts/run-shard.sh is exercised by smoke step i.
       - name: Run the load test (shard ${{ matrix.shard }} of ${{ inputs.shards }})
         env:
           QJANUS_TOKEN_SECRET: ${{ secrets[inputs.token_secret_name] }}
@@ -354,18 +355,9 @@ jobs:
           if [ -z "$QJANUS_LOADTEST_SEED" ]; then echo "::error::The secret '$SEED_SECRET_NAME' (id seed) is empty or missing."; missing=1; fi
           [ "$missing" = 0 ] || exit 1
 
-          # every value is passed as its own quoted argument; qjanus-load validates it
-          args=("$RUN_MODE" --scenario "$SCENARIO" --shard "$SHARD/$SHARDS" --start-at "$START_AT"
-                --hold-sec "$HOLD_SEC" --join-rate "$JOIN_RATE" --video-profile "$VIDEO_PROFILE"
-                --bots-per-browser "$BOTS_PER_BROWSER" --run-id "$RUN_ID" --out "out/shard-$SHARD"
-                --expect-transport strict)
-          if [ "$RUN_MODE" = run ]; then
-            args+=(--rooms "$ROOMS")
-          else
-            args+=(--ramp-start "$RAMP_START" --ramp-step "$RAMP_STEP" --ramp-max "$RAMP_MAX")
-          fi
-          # No --manage-rooms: the Janus HTTP API is node-local, the rooms must exist already.
-          node bin/qjanus-load.mjs "${args[@]}"
+          # scripts/run-shard.sh validates every input and builds the qjanus-load command line
+          # (no --manage-rooms: the Janus HTTP API is node-local, the rooms must exist already)
+          bash scripts/run-shard.sh
 
       - name: Upload shard output
         if: always()

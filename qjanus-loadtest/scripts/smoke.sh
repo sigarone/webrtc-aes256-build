@@ -25,12 +25,16 @@
 #   f         audio8  run of 2 rooms as two concurrent shards (0/2, 1/2, --start-at)
 #   report    merge f0 + f1 + the sampler CSV with `qjanus-load report` (runs with f)
 #   g         audio8  run with --manage-rooms ON (the harness creates and destroys its room)
+#   i         remote mode as the workflow's shard step runs it: two concurrent scripts/run-shard.sh
+#             processes (shards 0/2 and 1/2, audio8 ramp 1..2 rooms), then `qjanus-load report`
+#   h         audio8  ramp under injected UDP loss: expects stopReason loss (see step_h). Runs LAST;
+#             needs passwordless `sudo -n iptables`, otherwise it is reported as SKIP.
 # Rooms for a..f are pre-created by `qjanus-admin create-rooms` (--manage-rooms OFF).
 #
 # Environment
 #   PREFIX             build-deps.sh prefix, default /opt/qjanus-loadtest (Janus in $PREFIX/janus)
 #   OUT                output dir, default <qjanus-loadtest>/out/smoke
-#   SMOKE_ONLY         comma list of steps to run (negative,a,b,c,d,e,f,report,g)
+#   SMOKE_ONLY         comma list of steps to run (negative,a,b,c,d,e,f,report,g,i,h)
 #   SMOKE_ICE_LITE     0 switches Janus ICE lite off (default on)
 #   SMOKE_DEBUG_LEVEL  Janus debug level (default 5; the DTLS-POLICY lines need >= 4)
 #   SMOKE_STEP_TIMEOUT time limit in seconds of every load / negative run (default 600)
@@ -47,7 +51,7 @@ OUT=${OUT:-$ROOT/out/smoke}
 ICE_LITE=true; [ "${SMOKE_ICE_LITE:-1}" = 0 ] && ICE_LITE=false
 DEBUG_LEVEL=${SMOKE_DEBUG_LEVEL:-5}
 STEP_TIMEOUT=${SMOKE_STEP_TIMEOUT:-600}
-ALL_STEPS="negative a b c d e f report g"
+ALL_STEPS="negative a b c d e f report g i h"
 ONLY=${SMOKE_ONLY:-}
 
 for s in ${ONLY//,/ }; do
@@ -201,6 +205,7 @@ CLEANED=0
 cleanup() {
   [ "$CLEANED" = 0 ] || return 0
   CLEANED=1
+  if [ -e "${LOSS_MARK:-}" ]; then loss_remove || echo "smoke: WARNING the loopback loss rule could not be removed"; fi
   stop_samplers
   stop_janus
   finish_logs
@@ -211,7 +216,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ------------------------------------------------------------- step bookkeeping
+SKIP_RC=77                                         # a step function returns this to be reported as SKIP (not FAIL)
 S_IDS=(); S_TITLES=(); S_RCS=(); S_SECS=()
+result_word() {                                    # result_word RC
+  case $1 in 0) echo PASS ;; "$SKIP_RC") echo SKIP ;; *) echo "FAIL (exit $1)" ;; esac
+}
 run_step() {                                       # run_step ID "title" command...
   local id=$1 title=$2 rc t0=$SECONDS
   shift 2
@@ -219,7 +228,7 @@ run_step() {                                       # run_step ID "title" command
   { "$@" 2>&1; } | sanitize | tee "$OUT/logs/$id.log"
   rc=${PIPESTATUS[0]}
   echo "::endgroup::"
-  echo "[$id] $title: $([ "$rc" = 0 ] && echo PASS || echo "FAIL (exit $rc)") after $((SECONDS - t0)) s"
+  echo "[$id] $title: $(result_word "$rc") after $((SECONDS - t0)) s"
   S_IDS+=("$id"); S_TITLES+=("$title"); S_RCS+=("$rc"); S_SECS+=("$((SECONDS - t0))")
   return 0
 }
@@ -280,6 +289,63 @@ step_g() {                                         # --manage-rooms ON: the harn
   return "$rc"
 }
 
+# i: remote mode end to end. scripts/run-shard.sh is what the workflow's shard step runs; it gets the
+# same environment variables here. With 2 shards and a ramp 1..2, step 1 has room 0 (shard 0 only) and
+# step 2 adds room 1 (shard 1), so shard 1 owns no room in step 1. The smoke's own QJANUS_* variables
+# (URL, token secret, seed) are already exported.
+step_i() {
+  ensure_rooms || return 1
+  local start i rc=0
+  local -a pids=()
+  start=$(( $(date +%s) + 15 ))
+  for i in 0 1; do
+    SHARD=$i SHARDS=2 START_AT=$start RUN_ID=smoke-i SCENARIO=audio8 RUN_MODE=ramp       RAMP_START=1 RAMP_STEP=1 RAMP_MAX=2 HOLD_SEC=12 JOIN_RATE=4 SETTLE_SEC=6       VIDEO_PROFILE=spec BOTS_PER_BROWSER=16 OUT_DIR="$OUT/i$i" EXTRA_ARGS="--cpu-file $OUT/sampler.csv"       timeout -k 20 "$STEP_TIMEOUT" bash "$HERE/run-shard.sh" > "$RUN/i$i.out" 2>&1 &
+    pids+=($!)
+  done
+  for i in 0 1; do
+    wait "${pids[$i]}" || rc=1
+    sed "s/^/[shard $i] /" "$RUN/i$i.out"
+  done
+  load report --in "$OUT/i0" --in "$OUT/i1" --sampler "$OUT/sampler.csv" --out "$OUT/report-i" || rc=1
+  return "$rc"
+}
+
+# ---- step h: injected loss on the loopback interface, like the feasibility probe (withLoss)
+# 6 % of all UDP datagrams delivered over `lo` are dropped (browser <-> Janus media and DTLS
+# alike). The rule is ALWAYS removed again: at the end of the step, and from the EXIT/INT/TERM
+# cleanup through the marker file (the step runs in a subshell, so a variable would be lost).
+LOSS_RULE=(INPUT -i lo -p udp -m statistic --mode random --probability 0.06 -j DROP)
+LOSS_MARK=$RUN/loss-rule-armed
+loss_present() { sudo -n iptables -C "${LOSS_RULE[@]}" 2>/dev/null; }
+loss_remove() {                                    # idempotent: delete every copy, up to 20
+  local n=0
+  while [ "$n" -lt 20 ] && loss_present; do
+    sudo -n iptables -D "${LOSS_RULE[@]}" 2>/dev/null || break
+    n=$((n + 1))
+  done
+  loss_present && return 1
+  rm -f "$LOSS_MARK"
+  return 0
+}
+step_h() {
+  if ! sudo -n iptables -S INPUT > /dev/null 2>&1; then
+    echo "SKIP: 'sudo -n iptables' is not usable here (needs passwordless sudo and iptables); step h only runs on CI runners"
+    return "$SKIP_RC"
+  fi
+  ensure_rooms || return 1
+  local rc=0
+  : > "$LOSS_MARK"                                 # armed BEFORE the rule exists, so no window without a cleanup
+  if sudo -n iptables -I "${LOSS_RULE[@]}"; then
+    echo "loopback UDP loss rule installed (6 %)"
+    # default cpu limit (180), so CPU cannot be the reason; DTLS handshakes must survive the loss
+    load ramp --scenario audio8 --ramp-start 1 --ramp-step 1 --ramp-max 2 --hold-sec 25 --breach-windows 2 --loss-limit-pct 1       --join-timeout-sec 90 --out "$OUT/h" --run-id smoke-h "${COMMON[@]}" "${CPU_REAL[@]}" || rc=1
+  else
+    echo "ERROR: could not install the loopback loss rule"; rc=1
+  fi
+  if loss_remove; then echo "loopback UDP loss rule removed"; else echo "ERROR: the loopback UDP loss rule is still installed"; rc=1; fi
+  return "$rc"
+}
+
 # ------------------------------------------------------------------------ run
 echo "== smoke: starting Janus"
 rc_start=0
@@ -299,7 +365,7 @@ if wanted e; then
 fi
 sleep 3                                            # a few baseline rows before the first load
 
-for id in negative a b c d e f report g; do
+for id in negative a b c d e f report g i h; do
   wanted "$id" || continue
   case $id in
     negative) run_step negative "access control: tokens, admin key, join tokens, kick" step_negative ;;
@@ -311,6 +377,8 @@ for id in negative a b c d e f report g; do
     f) run_step f "audio8 run, 2 rooms as 2 concurrent shards" step_f ;;
     report) run_step report "merge shards + sampler into a report" step_report ;;
     g) run_step g "audio8 run with --manage-rooms" step_g ;;
+    i) run_step i "remote-mode shards via run-shard.sh (ramp 1..2 rooms, 2 shards)" step_i ;;
+    h) run_step h "audio8 ramp under injected UDP loss (expects stopReason loss)" step_h ;;
   esac
 done
 
@@ -327,7 +395,12 @@ bash "$HERE/sampler-summary.sh" --json "$OUT/sampler.csv" > "$OUT/sampler-summar
 
 # ------------------------------------------------------------------ assertions
 ASSERT_STEPS=""
-for id in negative a b c d e f g; do wanted "$id" && ASSERT_STEPS="$ASSERT_STEPS,$id"; done
+for id in negative a b c d e f g i h; do
+  wanted "$id" || continue
+  skipped=0
+  for n in "${!S_IDS[@]}"; do [ "${S_IDS[$n]}" = "$id" ] && [ "${S_RCS[$n]}" = "$SKIP_RC" ] && skipped=1; done
+  [ "$skipped" = 1 ] || ASSERT_STEPS="$ASSERT_STEPS,$id"
+done
 ASSERT_STEPS=${ASSERT_STEPS#,}
 run_step assert "assert the outputs (smoke-assert.mjs)" \
   node "$HERE/smoke-assert.mjs" --out "$OUT" --steps "$ASSERT_STEPS" --janus-log "$OUT/janus-main.sanitized.log" --json "$OUT/assert.json"
@@ -340,7 +413,7 @@ FAILED=0
   echo "| step | what | result | seconds |"
   echo "| --- | --- | --- | --- |"
   for n in "${!S_IDS[@]}"; do
-    res=PASS; [ "${S_RCS[$n]}" = 0 ] || { res="FAIL (exit ${S_RCS[$n]})"; FAILED=1; }
+    res=$(result_word "${S_RCS[$n]}")
     echo "| ${S_IDS[$n]} | ${S_TITLES[$n]} | $res | ${S_SECS[$n]} |"
   done
   echo
@@ -350,7 +423,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const out = process.argv[2];
 const rows = [];
-for (const d of ['a', 'b', 'c', 'd', 'e', 'f0', 'f1', 'g']) {
+for (const d of ['a', 'b', 'c', 'd', 'e', 'f0', 'f1', 'g', 'i0', 'i1', 'h']) {
   const f = path.join(out, d, 'summary.json');
   if (!fs.existsSync(f)) continue;
   const s = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -381,7 +454,7 @@ JS
   echo '```'
 } > "$OUT/SUMMARY.md"
 
-for rc in "${S_RCS[@]}"; do [ "$rc" = 0 ] || FAILED=1; done
+for rc in "${S_RCS[@]}"; do [ "$rc" = 0 ] || [ "$rc" = "$SKIP_RC" ] || FAILED=1; done
 echo
 if [ "$FAILED" = 0 ]; then echo "== smoke: ALL STEPS PASSED"; else echo "== smoke: FAILED (see $OUT/SUMMARY.md)"; fi
 exit "$FAILED"

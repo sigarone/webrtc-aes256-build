@@ -1061,14 +1061,20 @@ class Bot {
     }
   }
 
-  /** Per-stream delta of one cumulative counter; never negative (a reset counts from zero). */
+  /**
+   * Per-stream delta of one cumulative counter; never negative. A counter that went down was reset
+   * and counts from zero, except packetsLost: it legitimately shrinks when late or retransmitted
+   * packets fill a gap (W3C stats spec), which must not be read as a reset (that would add the
+   * whole cumulative loss to the interval and fake a loss breach on video with NACK/RTX).
+   */
   _delta(role, r, field, scale = 1) {
     const cur = num(r[field]);
     const key = `${role}|${r.id}|${field}`;
     const prev = this.prev.get(key);
     this.seen.set(key, cur === null ? 0 : cur);
     if (cur === null) return 0;
-    const raw = prev === undefined || cur < prev ? cur : cur - prev;
+    const shrinkIsReset = field !== 'packetsLost';
+    const raw = prev === undefined ? cur : (cur < prev ? (shrinkIsReset ? cur : 0) : cur - prev);
     return Math.max(0, raw) * scale;
   }
 

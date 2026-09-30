@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 // Assertions over the outputs of scripts/smoke.sh.
 //
-//   node scripts/smoke-assert.mjs --out DIR [--steps negative,a,b,c,d,e,f,g]
+//   node scripts/smoke-assert.mjs --out DIR [--steps negative,a,b,c,d,e,f,g,i,h]
 //                                 [--janus-log FILE] [--json FILE]
 //
-// DIR holds what smoke.sh wrote (a/ b/ c/ d/ e/ f0/ f1/ g/ report/ sampler.csv
+// DIR holds what smoke.sh wrote (a/ b/ c/ d/ e/ f0/ f1/ g/ i0/ i1/ h/ report/ report-i/ sampler.csv
 // negative.json rooms-after-g.json). --steps lists the steps that were run
 // (default: all); the checks of the others are skipped. Every check is printed as
 // PASS/FAIL, all checks run, the exit code is 1 if any failed.
 //
 // Steps: a = audio8 run, b = video4 run (lite), c = video8 run (tiny), d = audio8
 // ramp to 2 rooms, e = audio8 ramp that must stop on the CPU limit, f = two shards
-// of one 2-room run + merged report, g = audio8 run with --manage-rooms.
+// of one 2-room run + merged report, g = audio8 run with --manage-rooms, i = the
+// workflow's remote-mode shards (scripts/run-shard.sh, 2 shards, ramp 1..2 rooms) +
+// merged report-i, h = audio8 ramp under 6 % injected loopback UDP loss that must stop on loss.
 // The Janus log must show only fully compliant transport negotiations. Secret
 // values (read from the environment, if present) must not appear in any file.
 
@@ -23,7 +25,7 @@ import { parseSamplerCsv } from '../src/cpu-source.mjs';
 const { values: flags } = parseArgs({
   options: {
     out: { type: 'string' },
-    steps: { type: 'string', default: 'negative,a,b,c,d,e,f,g' },
+    steps: { type: 'string', default: 'negative,a,b,c,d,e,f,g,i,h' },
     'janus-log': { type: 'string' },
     json: { type: 'string' },
   },
@@ -156,6 +158,27 @@ for (const [id, label, o] of RUNS) {
     mediaChecks(at(id), readJson(at(id, 'summary.json')), o);
   });
 }
+if (STEPS.has('b')) {
+  // timeseries rows: { t, step, bots, up, steady, d: { aIn, vIn, aOut, vOut }, g: { vWidthMin, vWidthMax, ... }, ... }
+  const series = () => readJsonl(at('b', 'timeseries.jsonl'));
+  const maxOf = (rows, pick) => Math.max(...rows.map(pick).filter(isNum));
+  await check('b: layer selection works (widest received layer > narrowest, simulcast lmh)', () => {
+    const rows = series();
+    const wMax = maxOf(rows, (r) => r.g?.vWidthMax);
+    const wMin = maxOf(rows, (r) => r.g?.vWidthMin);
+    expect(Number.isFinite(wMax) && Number.isFinite(wMin), 'vWidthMin / vWidthMax were never reported');
+    expect(wMax > wMin, `max vWidthMax ${wMax} is not greater than max vWidthMin ${wMin}: every subscriber got the same layer`);
+  });
+  await check('b: video was decoded and never froze', () => {
+    const rows = series();
+    const sum = (pick) => rows.reduce((a, r) => a + (isNum(pick(r)) ? pick(r) : 0), 0);
+    const decoded = sum((r) => r.d?.vIn?.framesDecoded);
+    const freezes = sum((r) => r.d?.vIn?.freezeCount);
+    expect(decoded > 0, `framesDecoded total is ${decoded}`);
+    expect(freezes === 0, `freezeCount total is ${freezes}, wanted 0`);
+  });
+}
+
 if (STEPS.has('g')) {
   await check('g: the harness destroyed the rooms it created', () => {
     const after = readJson(at('rooms-after-g.json'));
@@ -173,6 +196,51 @@ if (STEPS.has('d')) {
     expect(bad.length === 0, `steps not ok: ${bad.join('; ')}`);
   });
 } else skip('d', 'not run');
+
+if (STEPS.has('i')) {
+  await check('i: remote-mode shards (run-shard.sh) ramp 1..2 rooms, each shard only its own rooms', () => {
+    // 2 shards, ramp 1..2: step 1 = room 0 (shard 0), step 2 adds room 1 (shard 1); room k belongs to shard k % 2
+    const wantRooms = [[1, 1], [0, 1]];             // shardRooms per step, for shard 0 and shard 1
+    const rooms = [];
+    for (const i of [0, 1]) {
+      const dir = at(`i${i}`);
+      const s = runChecks(dir, { attempted: 8, mode: 'ramp' });
+      expect(s.shard.index === i && s.shard.count === 2, `i${i}: shard ${JSON.stringify(s.shard)}, wanted ${i}/2`);
+      expect(s.stopReason === 'max_rooms', `i${i}: stopReason ${s.stopReason}, wanted max_rooms`);
+      expect(s.maxSustainable && s.maxSustainable.rooms === 2 && s.maxSustainable.participants === 16, `i${i}: maxSustainable ${JSON.stringify(s.maxSustainable)}, wanted 2 rooms / 16 participants`);
+      expect(s.steps.length === 2, `i${i}: ${s.steps.length} steps, wanted 2`);
+      const own = s.steps.map((st) => st.shardRooms);
+      expect(JSON.stringify(own) === JSON.stringify(wantRooms[i]), `i${i}: shardRooms per step ${JSON.stringify(own)}, wanted ${JSON.stringify(wantRooms[i])}`);
+      rooms.push(new Set(readJsonl(path.join(dir, 'bots.jsonl')).map((b) => b.room)));
+    }
+    expect(rooms[0].size === 1 && rooms[1].size === 1, `each shard must drive exactly 1 room (got ${rooms[0].size} and ${rooms[1].size})`);
+    expect(!rooms[1].has([...rooms[0]][0]), 'both shards drove the same room');
+  });
+  await check('i: merged report-i covers both shards: max sustainable 2 rooms / 16 participants', () => {
+    const r = readJson(at('report-i', 'report.json'));
+    expect(r.expectedShards === 2 && r.missingShards.length === 0, `shards ${JSON.stringify({ expected: r.expectedShards, missing: r.missingShards })}`);
+    expect(r.bots.attempted === 16 && r.bots.failed === 0, `bots ${JSON.stringify(r.bots)}`);
+    expect(r.samplerUsed === true && r.samplerRows > 0, 'the sampler CSV was not used by the report');
+    expect(r.maxSustainable && r.maxSustainable.rooms === 2 && r.maxSustainable.participants === 16, `maxSustainable ${JSON.stringify(r.maxSustainable)}, wanted 2 rooms / 16 participants`);
+    expect(r.ok === true, 'report.ok is not true');
+    const md = readText(at('report-i', 'report.md'));
+    expect(md.startsWith('# qjanus load test report') && md.length > 300, 'report.md is empty or has no title');
+  });
+} else skip('i', 'not run');
+
+if (STEPS.has('h')) {
+  await check('h: under 6 % loopback UDP loss the ramp stops on loss at the first step', () => {
+    // every bot still completes DTLS 1.3 and reaches steady (runChecks), so 'join' is not the reason
+    const s = runChecks(at('h'), { attempted: 8, mode: 'ramp' });
+    const st = s.steps[0];
+    expect(s.stopReason === 'loss', `stopReason ${s.stopReason} (breach reasons ${JSON.stringify(st?.breachReasons)}), wanted loss`);
+    expect(s.steps.length === 1, `${s.steps.length} steps, wanted 1`);
+    expect(s.maxSustainable === null, `maxSustainable ${JSON.stringify(s.maxSustainable)}, wanted null`);
+    expect(st.checks.loss.breached === true && st.checks.loss.value > 1, `loss check ${JSON.stringify(st.checks.loss)}, wanted breached with value > 1`);
+    expect(st.checks.cpu.breached === false, `cpu check breached (${JSON.stringify(st.checks.cpu)}): CPU must not be the reason`);
+    expect(st.checks.join.breached === false, `join check breached (${JSON.stringify(st.checks.join)})`);
+  });
+} else skip('h', 'not run');
 
 if (STEPS.has('e')) {
   await check('e: audio8 ramp stops on the CPU limit at the first step', () => {
