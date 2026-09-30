@@ -1,0 +1,9 @@
+Ip6InReceives	100
+Udp6InDatagrams	500
+Udp6NoPorts	0
+Udp6InErrors	1
+Udp6OutDatagrams	600
+Udp6RcvbufErrors	0
+Udp6SndbufErrors	0
+Udp6InCsumErrors	0
+UdpLite6InDatagrams	99999
