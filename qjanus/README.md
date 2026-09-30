@@ -24,7 +24,7 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
 | Path | What |
 |---|---|
 | `build/` | pinned dependency + Janus build, packaging, linkage and clean-container checks (used by the workflow) |
-| `patches/` | the five patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber, `info` without addresses, WebSockets without TLS, no recordings) |
+| `patches/` | the five patches applied to pristine Janus v1.4.2 (DTLS policy, log scrubber and no session token in any log line, `info` without addresses, WebSockets without TLS, no recordings) |
 | `conf/*.jcfg.tmpl` | config templates, rendered at every service start; nothing is edited per node |
 | `conf/Caddyfile.example` | the Caddy block that publishes the client API |
 | `systemd/qjanus.service` | the unit (sandbox and limits of spec section 6) |

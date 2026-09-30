@@ -20,6 +20,7 @@ for (const l of lines) {
   if (/([0-9A-Fa-f]{2}:){7,}[0-9A-Fa-f]{2}/.test(l)) bad('fingerprint-like colon hex', l);
   if (/([0-9a-fA-F]{1,4}:){3,}[0-9a-fA-F]{0,4}/.test(l) && !/\d\d:\d\d:\d\d/.test(l)) bad('IPv6-like address', l);
   if (/ice-pwd|ice-ufrag|a=fingerprint|BEGIN (EC |RSA )?PRIVATE KEY/i.test(l)) bad('ICE credential / fingerprint / key marker', l);
+  if (/\d{9,11},janus/.test(l)) bad('a signed session token (bearer credential)', l);
 }
 let checked = 0;
 for (const s of secrets) {

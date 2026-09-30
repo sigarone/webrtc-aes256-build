@@ -292,7 +292,10 @@ jobs:
             systemctl show -p RestrictAddressFamilies --value qjanus | grep -qw "$af" || { echo "::error::RestrictAddressFamilies lacks $af"; bad=1; }
           done
           if systemctl show -p RestrictAddressFamilies --value qjanus | grep -qE 'AF_PACKET|AF_BLUETOOTH'; then echo "::error::RestrictAddressFamilies allows more than the spec"; bad=1; fi
-          systemctl show -p SystemCallFilter --value qjanus | grep -q '@system-service' || { echo "::error::SystemCallFilter=@system-service is not applied"; bad=1; }
+          # the filter itself: systemd expands @system-service, so the value is only shown; that it is a seccomp filter in force
+          # (mode 2, no new privileges) is what the previous step asserted from /proc
+          echo "SystemCallFilter: $(systemctl show -p SystemCallFilter --value qjanus | cut -c1-120)"
+          [ -n "$(systemctl show -p SystemCallFilter --value qjanus)" ] || { echo "::error::the unit has no SystemCallFilter"; bad=1; }
           for path in /opt/bcrypto /root /etc/bcrypto /var/lib/bcrypto; do
             systemctl show -p InaccessiblePaths --value qjanus | grep -qF "$path" || { echo "::error::InaccessiblePaths lacks $path"; bad=1; }
           done
@@ -301,7 +304,9 @@ jobs:
           for f in /usr/qjanus-write-probe /etc/qjanus-write-probe /opt/qjanus-write-probe /var/lib/qjanus-write-probe; do
             if ns sh -c ": > $f" 2> /dev/null; then echo "::error::the service can write $f (ProtectSystem=strict is not in effect)"; ns rm -f "$f"; bad=1; fi
           done
-          [ -z "$(ns ls -A /home /root 2> /dev/null)" ] || { echo "::error::/home or /root is visible to the service"; bad=1; }
+          for d in /home /root; do
+            [ -z "$(ns ls -A "$d" 2> /dev/null)" ] || { echo "::error::$d is visible to the service"; ns ls -A "$d" | head -3; bad=1; }
+          done
           sudo touch /tmp/qjanus-host-marker
           if ns test -e /tmp/qjanus-host-marker; then echo "::error::the service shares the host /tmp"; bad=1; fi
           sudo rm -f /tmp/qjanus-host-marker

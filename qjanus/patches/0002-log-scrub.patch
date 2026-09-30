@@ -144,3 +144,17 @@ index 3f07616..8a8357a 100644
  	/* Queue the new log buffer */
  	janus_log_buffer *b = g_malloc(sizeof(janus_log_buffer));
  	b->timestamp = janus_get_real_time();
+diff --git a/src/janus.c b/src/janus.c
+index 028ffe4..5a039d7 100644
+--- a/src/janus.c
++++ b/src/janus.c
+@@ -1256,7 +1256,8 @@ int janus_process_incoming_request(janus_request *request) {
+ 			if(token != NULL) {
+ 				token_value = json_string_value(token);
+ 				if(token_value && !janus_auth_check_plugin(token_value, plugin_t)) {
+-					JANUS_LOG(LOG_ERR, "Token '%s' can't access plugin '%s'\n", token_value, plugin_text);
++					/* qjanus: a signed token is a bearer credential, it is never logged */
++					JANUS_LOG(LOG_ERR, "The token of this request can't access plugin '%s'\n", plugin_text);
+ 					ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNAUTHORIZED_PLUGIN, "Provided token can't access plugin '%s'", plugin_text);
+ 					goto jsondone;
+ 				}
