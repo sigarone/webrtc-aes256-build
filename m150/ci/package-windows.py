@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """package-windows.py - stage the Windows x64 M150 artifacts.
 
-usage: package-windows.py <webrtc_src> <build_dir> <stage_dir> <out_dir>
+usage: package-windows.py <webrtc_src> <build_dir> <stage_dir> <out_dir> [extra.lib ...]
 
   <webrtc_src>  the patched checkout (headers are taken from it)
   <build_dir>   the GN output dir, e.g. <src>/out/win-x64 (holds obj/webrtc.lib)
@@ -11,12 +11,17 @@ usage: package-windows.py <webrtc_src> <build_dir> <stage_dir> <out_dir>
 
 webrtc.lib is the `webrtc` rtc_static_library (complete_static_lib = true: it
 already contains BoringSSL, Opus, abseil, libyuv, ... - one file to link).
+The `webrtc` target does NOT depend on api/crypto:frame_crypto_transformer
+(P1/P3 code, only pulled in by the Android/iOS SDK targets), so that library
+is passed as an [extra.lib] (relative to <build_dir>) and merged into
+webrtc.lib with Chromium's llvm-lib.
 The header tree is the public include set a native client needs: WebRTC's own
 api/, rtc_base/, modules/, ... plus abseil, libyuv and BoringSSL headers.
 No absolute paths, timestamps or runner data are written into the archive.
 """
 import os
 import shutil
+import subprocess
 import sys
 import zipfile
 
@@ -54,20 +59,31 @@ def collect(src):
 
 
 def main():
-    if len(sys.argv) != 5:
+    if len(sys.argv) < 5:
         print(__doc__, file=sys.stderr)
         return 2
-    src, build, stage, out = sys.argv[1:]
+    src, build, stage, out = sys.argv[1:5]
+    extras = [os.path.join(build, e) for e in sys.argv[5:]]
     lib = os.path.join(build, "obj", "webrtc.lib")
     if not os.path.isfile(lib) or os.path.getsize(lib) < 10_000_000:
         print("::error::package-windows: %s missing or implausibly small" % lib, file=sys.stderr)
         return 1
+    if extras:
+        for e in extras:
+            if not os.path.isfile(e):
+                print("::error::package-windows: extra library %s missing" % e, file=sys.stderr)
+                return 1
+        llvm_lib = os.path.join(src, "third_party", "llvm-build", "Release+Asserts", "bin", "llvm-lib.exe")
+        merged = os.path.join(build, "obj", "webrtc-merged.lib")
+        subprocess.run([llvm_lib, "/OUT:" + merged, lib] + extras, check=True)
+        lib = merged
     files = collect(src)
     if len(files) < 1000:
         print("::error::package-windows: only %d headers found - wrong checkout?" % len(files), file=sys.stderr)
         return 1
     os.makedirs(stage, exist_ok=True)
     os.makedirs(out, exist_ok=True)
+    # NB: the file name is webrtc.lib whether or not extras were merged in.
     shutil.copyfile(lib, os.path.join(stage, "webrtc.lib"))
     shutil.copyfile(lib, os.path.join(out, "webrtc.lib"))
     inc = os.path.join(stage, "include")
