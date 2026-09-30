@@ -164,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           py=python; command -v python3 >/dev/null 2>&1 && py=python3
-          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out obj/api/crypto/frame_crypto_transformer.lib
+          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out obj/api/crypto/frame_crypto_transformer/frame_crypto_transformer.obj
 
       - name: Gate G1-G9 (windows)
         run: |

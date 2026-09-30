@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """package-windows.py - stage the Windows x64 M150 artifacts.
 
-usage: package-windows.py <webrtc_src> <build_dir> <stage_dir> <out_dir> [extra.lib ...]
+usage: package-windows.py <webrtc_src> <build_dir> <stage_dir> <out_dir> [extra.obj ...]
 
   <webrtc_src>  the patched checkout (headers are taken from it)
   <build_dir>   the GN output dir, e.g. <src>/out/win-x64 (holds obj/webrtc.lib)
@@ -13,7 +13,7 @@ webrtc.lib is the `webrtc` rtc_static_library (complete_static_lib = true: it
 already contains BoringSSL, Opus, abseil, libyuv, ... - one file to link).
 The `webrtc` target does NOT depend on api/crypto:frame_crypto_transformer
 (P1/P3 code, only pulled in by the Android/iOS SDK targets), so that library
-is passed as an [extra.lib] (relative to <build_dir>) and merged into
+is passed as an object file [extra] (relative to <build_dir>; its .lib is a thin archive, which lib.exe cannot read) and merged into
 webrtc.lib with the MSVC lib.exe.
 The header tree is the public include set a native client needs: WebRTC's own
 api/, rtc_base/, modules/, ... plus abseil, libyuv and BoringSSL headers.
