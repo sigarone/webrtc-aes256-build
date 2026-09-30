@@ -166,7 +166,19 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
   order is ascending, so a client that lists `l, m, h` MUST send `rid_order:"lmh"`, otherwise substream 0 would be the
   HIGHEST layer.
 - Subscriber: `join` with `ptype:"subscriber"`, `private_id` (required, 433 if wrong), `streams:[{feed,mid}]`; a feed that
-  is not publishing yet -> 428.
+  is not publishing yet -> 428. The reply is `{videoroom:"attached", streams:[...]}` plus a JSEP OFFER (`e2ee:true`);
+  the client answers with `{request:"start"}` + the JSEP answer (`started:"ok"`), then `webrtcup`. Each stream entry
+  carries its subscriber `mid`, `feed_id`, `feed_mid`, `feed_description`, and for simulcast video
+  `simulcast:{substream, substream-target, temporal-layer, temporal-layer-target}`.
+- Changing the subscription: `{request:"update",subscribe:[{feed,mid}...]}` or `{request:"unsubscribe",streams:[{feed}]}`
+  -> `{videoroom:"updated",streams:[all current entries]}` + a new JSEP offer (new mids are appended, unsubscribed
+  ones stay in the SDP as `active:false`); answer it with `start` + answer. Renegotiations are serialised by the client.
+- Layer selection: `{request:"configure",streams:[{mid,substream:0|1|2,temporal:0..2}]}` -> `configured:"ok"`, then the
+  plugin event `{mid,substream}` / `{mid,temporal}` when the switch happened. Verified with a 1280x720 source: substream
+  0/1/2 deliver exactly the l/m/h layer (320/640/1280 px) with E2EE frames.
+- Events without a transaction: `webrtcup`, `media` (`mid,type,receiving`), `slowlink` (`mid,media,uplink,lost`) and the
+  plugin event `slow_link` (`current-bitrate`), `hangup` (`reason`), plugin events `{publishers:[{id,display,streams}]}`
+  (new publisher), `{leaving:"<id>"}`, `{unpublished:"<id>"}`, `{kicked:"<id>"}`, `{videoroom:"destroyed"}`.
 - Kick order for the server (spec section 3): `allowed` remove, then `kick`; the kicked handle gets
   `{leaving:"ok",reason:"kicked"}`, the others `{kicked:"<id>"}`, and the publisher PeerConnection is hung up.
 
