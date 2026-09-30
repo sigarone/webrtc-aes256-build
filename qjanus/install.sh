@@ -183,8 +183,8 @@ systemctl enable qjanus.service > /dev/null 2>&1
 
 # ---- old releases: keep the newest N (the current one is always kept)
 cur=$(basename "$(readlink -f "$OPT/current")")
-ls -1t "$OPT/releases" | grep -vx "$cur" | tail -n +"$KEEP" | while read -r old; do
-  [ -n "$old" ] && { log "removing old release $old"; rm -rf "${OPT:?}/releases/$old"; }
+{ ls -1t "$OPT/releases" | grep -vx "$cur" || true; } | tail -n +"$KEEP" | while read -r old; do
+  if [ -n "$old" ]; then log "removing old release $old"; rm -rf "${OPT:?}/releases/$old"; fi
 done
 
 # ---- start / restart
