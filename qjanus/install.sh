@@ -218,9 +218,12 @@ if [ -z "$ICE_IFACE" ]; then
   } >&2
   die "the ICE interface is not set (--ice-iface or QJANUS_ICE_ENFORCE_IFACE)"
 fi
-# the settings the check depends on: from the environment, else from this node's env file
-: "${QJANUS_NAT_1_1:=$(get_env QJANUS_NAT_1_1)}"
-: "${QJANUS_ALLOW_PRIVATE_ICE_IFACE:=$(get_env QJANUS_ALLOW_PRIVATE_ICE_IFACE)}"
+# The check must see what the SERVICE will see: it only reads this node's env file. So the two settings it
+# depends on come from that file (QJANUS_NAT_1_1 is the operator's entry there), plus --allow-private-ice-iface,
+# which is stored below. An installer environment variable of the same name is ignored on purpose: it would pass
+# here and then fail at every start.
+QJANUS_NAT_1_1=$(get_env QJANUS_NAT_1_1)
+QJANUS_ALLOW_PRIVATE_ICE_IFACE=$(get_env QJANUS_ALLOW_PRIVATE_ICE_IFACE)
 [ "$ALLOW_PRIVATE_ICE" = 0 ] || QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes
 export QJANUS_NAT_1_1 QJANUS_ALLOW_PRIVATE_ICE_IFACE
 qjanus_check_ice_iface "$ICE_IFACE" || die "interface $ICE_IFACE cannot be the ICE interface of this node"
