@@ -73,9 +73,18 @@ def main():
             if not os.path.isfile(e):
                 print("::error::package-windows: extra library %s missing" % e, file=sys.stderr)
                 return 1
-        llvm_lib = os.path.join(src, "third_party", "llvm-build", "Release+Asserts", "bin", "llvm-lib.exe")
+        bindir = os.path.join(src, "third_party", "llvm-build", "Release+Asserts", "bin")
         merged = os.path.join(build, "obj", "webrtc-merged.lib")
-        subprocess.run([llvm_lib, "/OUT:" + merged, lib] + extras, check=True)
+        # llvm-lib.exe if the Chromium clang package ships it, else lld-link
+        # in its lib mode (same COFF archive writer).
+        llvm_lib = os.path.join(bindir, "llvm-lib.exe")
+        if os.path.isfile(llvm_lib):
+            cmd = [llvm_lib]
+        else:
+            print("package-windows: no llvm-lib.exe in %s (has: %s); using lld-link /lib" %
+                  (bindir, ", ".join(sorted(x for x in os.listdir(bindir) if "lib" in x or "lld" in x))))
+            cmd = [os.path.join(bindir, "lld-link.exe"), "/lib"]
+        subprocess.run(cmd + ["/OUT:" + merged, lib] + extras, check=True)
         lib = merged
     files = collect(src)
     if len(files) < 1000:
