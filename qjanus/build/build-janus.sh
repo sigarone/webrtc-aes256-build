@@ -76,7 +76,8 @@ make -j"$NPROC"
 make install
 
 # what got installed must be exactly the intended set of binaries and modules
-find "$PREFIX/lib/janus" -maxdepth 2 -type f -name "*.so" | sort | tee "$PREFIX/janus-modules.txt"
+# libtool installs libjanus_x.so.2.0.11 plus the symlinks libjanus_x.so.2 and libjanus_x.so (what Janus loads)
+find "$PREFIX/lib/janus" -maxdepth 2 \( -type f -o -type l \) -name "*.so" | sort | tee "$PREFIX/janus-modules.txt"
 diff <(sed "s#^$PREFIX/##" "$PREFIX/janus-modules.txt") - <<'LIST'
 lib/janus/plugins/libjanus_videoroom.so
 lib/janus/transports/libjanus_http.so
