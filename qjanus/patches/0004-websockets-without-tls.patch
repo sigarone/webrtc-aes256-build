@@ -1,0 +1,19 @@
+diff --git a/src/transports/janus_websockets.c b/src/transports/janus_websockets.c
+index c772133..2549124 100644
+--- a/src/transports/janus_websockets.c
++++ b/src/transports/janus_websockets.c
+@@ -485,10 +485,14 @@ static struct lws_vhost* janus_websockets_create_ws_server(
+ #endif
+ 	info.protocols = ws_protocols;
+ 	info.extensions = NULL;
++#if defined(LWS_WITH_TLS)
++	/* qjanus: libwebsockets is built without any TLS library (plain ws behind the reverse proxy):
++	 * these fields do not exist there */
+ 	info.ssl_cert_filepath = server_pem;
+ 	info.ssl_private_key_filepath = server_key;
+ 	info.ssl_private_key_password = password;
+ 	info.ssl_cipher_list = ciphers;
++#endif
+ 	info.gid = -1;
+ 	info.uid = -1;
+ 	info.options = 0;
