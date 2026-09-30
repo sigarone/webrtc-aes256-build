@@ -19,6 +19,7 @@ start_janus() { # $1 = install root, $2 = tag
   for f in "$PROBE"/conf/*.jcfg; do
     sed "s#@JROOT@#$jroot#g" "$f" > "$jroot/etc/janus/$(basename "$f")"
   done
+  if [ -n "${MTU:-}" ]; then sed -i "s/dtls_mtu = .*/dtls_mtu = $MTU/" "$jroot/etc/janus/janus.jcfg"; fi
   RAW="$OUT/janus-$tag.raw.log"; : > "$RAW"
   "$jroot/bin/janus" -F "$jroot/etc/janus" -L "$RAW" > "$OUT/janus-$tag.stdout.raw" 2>&1 &
   JPID=$!
@@ -55,7 +56,7 @@ run_suite() { # $1 = suite, $2 = install root, $3 = tag
   echo "################ suite=$suite janus=$tag"
   if start_janus "$jroot" "$tag"; then
     mkdir -p "$OUT/$tag"
-    (cd "$PROBE/client" && SUITE="$suite" JANUS_LOG="$RAW" OUT_DIR="$OUT/$tag" node probe.mjs)
+    (cd "$PROBE/client" && SUITE="$suite" JANUS_PID="$JPID" JANUS_LOG="$RAW" OUT_DIR="$OUT/$tag" node probe.mjs)
     rc=$?
   else
     rc=3
@@ -68,6 +69,7 @@ run_suite() { # $1 = suite, $2 = install root, $3 = tag
 
 RC=0
 run_suite main   "$PREFIX/janus"              main         || RC=1
+MTU=600 ONLY=A1,B1 run_suite main "$PREFIX/janus" mtu600 || RC=1
 run_suite soak   "$PREFIX/janus"              soak-fixed   || true
 if [ -x "$PREFIX/janus-legacy-timer/bin/janus" ]; then
   run_suite soak "$PREFIX/janus-legacy-timer" soak-legacy  || true
@@ -82,12 +84,15 @@ echo "=================== DTLS-POLICY lines (Janus side, main suite) ===========
 cat "$OUT/dtls-policy-summary.txt" || true
 echo "=================== main suite ==================="
 cat "$OUT/main/summary.txt" 2>/dev/null || echo "(no summary)"
+echo "=================== small DTLS MTU (600) ==================="
+cat "$OUT/mtu600/summary.txt" 2>/dev/null || true
 echo "=================== loss soak: patched (timer serviced after connect) ==================="
 grep SOAK "$OUT/soak-fixed/summary.txt" 2>/dev/null || true
 echo "=================== loss soak: legacy timer (stock janus_dtls_retry) ==================="
 grep SOAK "$OUT/soak-legacy/summary.txt" 2>/dev/null || true
 {
   echo "main suite"; cat "$OUT/main/summary.txt" 2>/dev/null
+  echo; echo "dtls_mtu=600"; cat "$OUT/mtu600/summary.txt" 2>/dev/null
   echo; echo "loss soak, patched"; grep SOAK "$OUT/soak-fixed/summary.txt" 2>/dev/null
   echo; echo "loss soak, legacy timer"; grep SOAK "$OUT/soak-legacy/summary.txt" 2>/dev/null
 } > "$OUT/summary.txt"

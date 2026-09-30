@@ -357,6 +357,84 @@ async function roomScenario(browser, spec) {
 }
 
 
+
+// ------------------------------------------------------------ fan-out (scaling)
+function janusCpu() {
+  const pid = process.env.JANUS_PID;
+  if (!pid) return null;
+  try {
+    const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1].split(' ');
+    const ticks = Number(st[11]) + Number(st[12]); // utime + stime
+    const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+    const rss = /VmRSS:\s+(\d+)/.exec(status);
+    return { ticks, rssMB: rss ? Math.round(Number(rss[1]) / 1024) : null, threads: (/Threads:\s+(\d+)/.exec(status) || [])[1] };
+  } catch (e) { return null; }
+}
+async function fanoutScenario(browser, spec) {
+  const { name, n, expect } = spec;
+  const t0 = Date.now(); const off = logSize();
+  const res = { name, expect, kind: 'fanout', n };
+  const ctx = await browser.newContext();
+  const janus = new JanusClient(JANUS);
+  try {
+    const pa = await newPage(ctx);
+    await janus.create();
+    const hp = await janus.attach('janus.plugin.videoroom');
+    janus.trickle[hp] = (c) => pa.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['pub', c]).catch(() => {});
+    await janus.send(hp, { request: 'join', ptype: 'publisher', room: 1234, display: 'pub' });
+    const joined = await janus.waitFor((e) => e.sender === hp && pluginData(e).videoroom === 'joined', 10000);
+    const feed = pluginData(joined).id;
+    const offer = await pa.evaluate((o) => window.probe.makeOffer('pub', o), { audio: true, video: true });
+    await janus.send(hp, { request: 'publish', audio: true, video: true }, { type: 'offer', sdp: offer });
+    const ans = await janus.waitFor((e) => e.sender === hp && e.jsep, 15000);
+    await pa.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['pub', ans.jsep.sdp]);
+    await waitConnected(pa, 'pub', 15000);
+    const pages = [];
+    for (let i = 0; i < n; i++) pages.push(await newPage(ctx));
+    const tJoin = Date.now();
+    const subs = await Promise.all(pages.map(async (page, i) => {
+      const id = 's' + i;
+      const hs = await janus.attach('janus.plugin.videoroom');
+      janus.trickle[hs] = (c) => page.evaluate(([x, cc]) => window.probe.addCandidate(x, cc), [id, c]).catch(() => {});
+      await janus.send(hs, { request: 'join', ptype: 'subscriber', room: 1234, streams: [{ feed }] });
+      const att = await janus.waitFor((e) => e.sender === hs && e.jsep, 30000);
+      const answer = await page.evaluate(([sdp, x]) => window.probe.makeAnswer(x, sdp, {}), [att.jsep.sdp, id]);
+      await janus.send(hs, { request: 'start', room: 1234 }, { type: 'answer', sdp: answer });
+      const st = await waitConnected(page, id, 30000);
+      return { page, id, st };
+    }));
+    res.allConnectedMs = Date.now() - tJoin;
+    await sleep(2000);
+    const cpu0 = janusCpu(); const w0 = Date.now();
+    const s1 = await Promise.all(subs.map((x) => x.page.evaluate((i) => window.probe.stats(i), x.id)));
+    await sleep(8000);
+    const s2 = await Promise.all(subs.map((x) => x.page.evaluate((i) => window.probe.stats(i), x.id)));
+    const cpu1 = janusCpu(); const w1 = Date.now();
+    const per = subs.map((x, i) => ({ transport: transportOf(s2[i]), flow: flow({ s1: s1[i], s2: s2[i] }, 'in') }));
+    res.subsLevelOk = per.filter((p) => levelOk(p.transport)).length;
+    res.subsWithMedia = per.filter((p) => hasMedia(p.flow)).length;
+    res.minVideoPackets = Math.min(...per.map((p) => p.flow.videoPackets));
+    res.minAudioPackets = Math.min(...per.map((p) => p.flow.audioPackets));
+    if (cpu0 && cpu1) {
+      res.janusCpuCoresBusy = Math.round(((cpu1.ticks - cpu0.ticks) / 100 / ((w1 - w0) / 1000)) * 1000) / 1000;
+      res.janusRssMB = cpu1.rssMB; res.janusThreads = cpu1.threads;
+    }
+    const wp = await statsWindow(pa, 'pub');
+    res.publisherOut = flow(wp, 'out');
+  } catch (e) { res.error = String(e.message || e); }
+  await janus.destroy();
+  await ctx.close();
+  await sleep(700);
+  res.janusLog = policyLines(logSince(off));
+  const okLines = res.janusLog.filter(isOkLine).length;
+  res.janusOkLines = okLines;
+  res.seconds = round1(Date.now() - t0);
+  res.accepted = res.subsLevelOk === n && res.subsWithMedia === n && okLines >= n + 1;
+  res.ok = res.accepted;
+  delete res.janusLog;
+  return res;
+}
+
 // ---------------------------------------------------------------- loss soak
 // Repeated publisher+subscriber handshakes under random UDP loss: how often do
 // both DTLS 1.3 handshakes complete (Janus is client for the publisher and
@@ -407,7 +485,7 @@ const median = (a) => { const b = a.filter((x) => x != null).sort((x, y) => x - 
 async function soakScenario(browser, spec) {
   const { name, loss, n } = spec;
   const res = { name, kind: 'soak', loss, n, runs: [] };
-  await withLoss(loss, async () => { for (let i = 0; i < n; i++) res.runs.push(await soakOnce(browser, 20000)); });
+  await withLoss(loss, async () => { for (let i = 0; i < n; i++) res.runs.push(await soakOnce(browser, 12000)); });
   const R = res.runs;
   res.bothDtlsConnected = R.filter((r) => r.pubLevelOk && r.subLevelOk).length;
   res.pubDtlsConnected = R.filter((r) => r.pubLevelOk).length;
@@ -441,8 +519,8 @@ try {
   const pqc = await launchChromium('WebRTC-EnableDtlsPqc/Enabled/');
   versions.chromium = pqc.version();
   if (SUITE === 'soak') {
-    await run(soakScenario, pqc, { name: 'SOAK-30pct-udp-loss', loss: 0.3, n: 10 });
-    await run(soakScenario, pqc, { name: 'SOAK-50pct-udp-loss', loss: 0.5, n: 8 });
+    await run(soakScenario, pqc, { name: 'SOAK-30pct-udp-loss', loss: 0.3, n: 24 });
+    await run(soakScenario, pqc, { name: 'SOAK-50pct-udp-loss', loss: 0.5, n: 12 });
     await pqc.close();
   } else {
   // Chromium (Playwright build) with the PQC field trial, as our apps run -----
@@ -451,6 +529,7 @@ try {
   await run(roomScenario, pqc, { name: 'B2-videoroom-sub=janus-client', roleS: 'passive', room: 1234, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'E1-videoroom-e2ee-xor', room: 2345, e2ee: true, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'S1-videoroom-simulcast', room: 1234, simulcast: true, expect: 'pass' });
+  await run(fanoutScenario, pqc, { name: 'F1-fanout-1pub-8subs', n: 8, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'S2-videoroom-simulcast+e2ee', room: 2345, e2ee: true, simulcast: true, expect: 'pass' });
   await run(echoScenario, pqc, { name: 'L1-echotest-30pct-udp-loss', loss: 0.3, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'L2-videoroom-30pct-udp-loss', room: 1234, loss: 0.3, expect: 'pass' });
@@ -493,6 +572,9 @@ fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 1
 // summary table
 const fmt = (x) => (x && x.tlsVersion ? `${x.tlsVersion} ${x.dtlsCipher || '-'} ${x.srtpCipher || '-'}` : '-');
 const rows = results.map((r) => {
+  if (r.kind === 'fanout') {
+    return `${r.ok === true ? 'PASS' : 'FAIL'} | ${r.name} | subs level-ok=${r.subsLevelOk}/${r.n} media=${r.subsWithMedia}/${r.n} min-a/v-pkts=${r.minAudioPackets}/${r.minVideoPackets} all-connected=${r.allConnectedMs}ms | janus cpu=${r.janusCpuCoresBusy} cores rss=${r.janusRssMB}MB threads=${r.janusThreads}${r.error ? ' | ERR ' + r.error : ''}`;
+  }
   if (r.kind === 'soak') {
     return `SOAK | ${r.name} | n=${r.n} both-dtls-connected=${r.bothDtlsConnected} pub(janus=client)=${r.pubDtlsConnected} sub(janus=server)=${r.subDtlsConnected} janus-ok-lines=${r.janusOkLines} timer-expired(connected)=${r.timerExpiredConnected} timer-expired(trying)=${r.timerExpiredTrying} median-connect-ms pub=${r.pubMedianMs} sub=${r.subMedianMs} errors=${r.errors}`;
   }
