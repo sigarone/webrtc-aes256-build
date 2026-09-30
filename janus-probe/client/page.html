@@ -1,0 +1,133 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>janus-probe</title>
+<script>
+'use strict';
+const pcs = {};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let worker = null;
+function getWorker() {
+  if (!worker) worker = new Worker('/worker.js');
+  return worker;
+}
+const hasScriptTransform = typeof RTCRtpScriptTransform !== 'undefined';
+
+async function gatherComplete(pc, timeoutMs = 8000) {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, timeoutMs);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); }
+    });
+  });
+}
+const munge = (sdp, role) => (role ? sdp.replace(/a=setup:\w+/g, 'a=setup:' + role) : sdp);
+const noTrickle = (sdp) => sdp.replace(/a=ice-options:trickle\r\n/g, '');
+
+function newPc(id, opts) {
+  const cfg = { iceServers: [], bundlePolicy: 'max-bundle' };
+  if (opts.e2ee && !hasScriptTransform) cfg.encodedInsertableStreams = true;
+  const pc = new RTCPeerConnection(cfg);
+  const rec = { pc, opts, timeline: [], remoteVideo: null };
+  const push = (what) => rec.timeline.push({ t: Math.round(performance.now()), what });
+  pc.addEventListener('connectionstatechange', () => push('connection:' + pc.connectionState));
+  pc.addEventListener('iceconnectionstatechange', () => push('ice:' + pc.iceConnectionState));
+  pc.addEventListener('track', (e) => {
+    push('track:' + e.track.kind);
+    if (opts.e2ee) applyTransform(e.receiver, e.track.kind, 'receiver');
+    if (e.track.kind === 'video') {
+      const v = document.createElement('video');
+      v.muted = true; v.autoplay = true; v.playsInline = true;
+      v.srcObject = new MediaStream([e.track]);
+      document.body.appendChild(v);
+      v.play().catch(() => {});
+      rec.remoteVideo = v;
+    } else {
+      // keep the audio track pulled so that the jitter buffer runs
+      const a = document.createElement('audio');
+      a.muted = true; a.autoplay = true;
+      a.srcObject = new MediaStream([e.track]);
+      document.body.appendChild(a);
+      a.play().catch(() => {});
+    }
+  });
+  pcs[id] = rec;
+  return rec;
+}
+
+function applyTransform(rtpObj, kind, role) {
+  if (hasScriptTransform) {
+    rtpObj.transform = new RTCRtpScriptTransform(getWorker(), { kind, role });
+  } else {
+    const streams = rtpObj.createEncodedStreams();
+    getWorker().postMessage({ readable: streams.readable, writable: streams.writable, options: { kind, role } },
+      [streams.readable, streams.writable]);
+  }
+}
+
+window.probe = {
+  info() {
+    return { ua: navigator.userAgent, scriptTransform: hasScriptTransform };
+  },
+  async makeOffer(id, opts) {
+    const rec = newPc(id, opts);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: !!opts.audio, video: !!opts.video });
+    for (const track of stream.getTracks()) {
+      const sender = rec.pc.addTrack(track, stream);
+      if (opts.e2ee) applyTransform(sender, track.kind, 'sender');
+    }
+    const offer = await rec.pc.createOffer();
+    await rec.pc.setLocalDescription({ type: 'offer', sdp: munge(offer.sdp, opts.setup) });
+    await gatherComplete(rec.pc);
+    return noTrickle(rec.pc.localDescription.sdp);
+  },
+  async setAnswer(id, sdp) {
+    await pcs[id].pc.setRemoteDescription({ type: 'answer', sdp });
+  },
+  async makeAnswer(id, offerSdp, opts) {
+    const rec = newPc(id, opts);
+    await rec.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const answer = await rec.pc.createAnswer();
+    await rec.pc.setLocalDescription({ type: 'answer', sdp: munge(answer.sdp, opts.setup) });
+    await gatherComplete(rec.pc);
+    return noTrickle(rec.pc.localDescription.sdp);
+  },
+  async addCandidate(id, cand) {
+    try {
+      if (!cand || cand.completed) await pcs[id].pc.addIceCandidate(null);
+      else await pcs[id].pc.addIceCandidate(cand);
+    } catch (e) { /* late/duplicate candidates are harmless */ }
+  },
+  state(id) {
+    const r = pcs[id];
+    return r ? { connection: r.pc.connectionState, ice: r.pc.iceConnectionState, timeline: r.timeline } : null;
+  },
+  async stats(id) {
+    const rep = await pcs[id].pc.getStats();
+    const out = { transport: [], inbound: [], outbound: [] };
+    const scrub = (s, keep) => {
+      const o = {};
+      for (const [k, v] of Object.entries(s)) {
+        if (keep.includes(k) || (typeof v !== 'object' && !/Id$/.test(k) && k !== 'id' && k !== 'timestamp'
+            && k !== 'type' && !/[Cc]ertificate/.test(k))) o[k] = v;
+      }
+      return o;
+    };
+    rep.forEach((s) => {
+      if (s.type === 'transport') out.transport.push(scrub(s, []));
+      if (s.type === 'inbound-rtp') out.inbound.push(scrub(s, ['kind']));
+      if (s.type === 'outbound-rtp') out.outbound.push(scrub(s, ['kind']));
+    });
+    return out;
+  },
+  async workerCounters() {
+    if (!worker) return null;
+    return await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 2000);
+      worker.onmessage = (e) => { clearTimeout(t); resolve(e.data.counters); };
+      worker.postMessage('counters');
+    });
+  },
+  close(id) { try { pcs[id].pc.close(); } catch (e) {} },
+};
+</script>

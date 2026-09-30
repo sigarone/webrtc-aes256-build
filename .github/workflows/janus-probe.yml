@@ -1,0 +1,107 @@
+name: janus-probe
+
+# Research probe: can Janus (VideoRoom SFU) built against the SAME BoringSSL as
+# our hardened WebRTC M150 terminate exactly our transport level (DTLS 1.3 only,
+# TLS_AES_256_GCM_SHA384, X25519MLKEM768, SRTP AEAD_AES_256_GCM only)?
+# Nothing here is a release artifact and nothing is published.
+
+on:
+  push:
+    branches: [janus-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      PREFIX: /opt/janus-probe
+      BSSL: /opt/boringssl
+      OUT: ${{ github.workspace }}/janus-probe-out
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build meson pkg-config git curl \
+            autoconf automake libtool gengetopt gettext \
+            libglib2.0-dev libjansson-dev libconfig-dev libmicrohttpd-dev \
+            libgnutls28-dev zlib1g-dev python3
+
+      - name: Prepare install dirs
+        run: |
+          sudo mkdir -p /opt/boringssl /opt/janus-probe
+          sudo chown -R "$USER" /opt/boringssl /opt/janus-probe
+
+      - name: Restore BoringSSL + libsrtp + libnice cache
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /opt/boringssl
+            /opt/janus-probe
+          key: janus-probe-deps-${{ hashFiles('janus-probe/scripts/build-deps.sh') }}
+
+      - name: Build BoringSSL f91f1447 + libsrtp (BoringSSL backend) + libnice
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: janus-probe/scripts/build-deps.sh
+
+      - name: Save deps cache
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/boringssl
+            /opt/janus-probe
+          key: janus-probe-deps-${{ hashFiles('janus-probe/scripts/build-deps.sh') }}
+
+      - name: Build janus-gateway (latest tag) with the DTLS 1.3 patch
+        run: |
+          janus-probe/scripts/build-janus.sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Playwright + Chromium
+        working-directory: janus-probe/client
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Run the probe
+        id: run
+        run: janus-probe/scripts/run-probe.sh
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Janus DTLS 1.3 / ML-KEM probe'
+            echo
+            echo '```'
+            cat "$OUT/versions.txt" 2>/dev/null || true
+            cat "$OUT/versions.json" 2>/dev/null || true
+            echo
+            cat "$OUT/summary.txt" 2>/dev/null || echo "(no summary)"
+            echo
+            echo '-- Janus DTLS-POLICY lines --'
+            cat "$OUT/dtls-policy-summary.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs and stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: janus-probe-out
+          path: |
+            janus-probe-out/
+            !janus-probe-out/*.raw
+          if-no-files-found: warn
+          retention-days: 30

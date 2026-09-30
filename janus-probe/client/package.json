@@ -1,0 +1,9 @@
+{
+  "name": "janus-probe-client",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}

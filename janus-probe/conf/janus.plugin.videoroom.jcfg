@@ -1,0 +1,17 @@
+room-1234: {
+	description = "plain room"
+	is_private = false
+	publishers = 6
+	audiocodec = "opus"
+	videocodec = "vp8"
+	fir_freq = 2
+}
+room-2345: {
+	description = "end-to-end encrypted room"
+	is_private = false
+	publishers = 6
+	audiocodec = "opus"
+	videocodec = "vp8"
+	fir_freq = 2
+	require_e2ee = true
+}
