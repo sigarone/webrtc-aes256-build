@@ -71,6 +71,14 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    admin key means updating the application server at the same time; running calls keep their PeerConnections but their
    WebSocket sessions need a fresh token.
 
+   `QJANUS_HTTP_BIND` must be an address that an interface of the node carries and that is UP when the service starts
+   (Janus compares it with the interface list; IPv6 as printed by `ip -6 addr`, compressed and lower case). Janus
+   would otherwise keep running without the HTTP transport, so the unit has an `ExecStartPost`
+   (`libexec/qjanus-wait-ready`) that fails the start, and lets systemd retry, until both APIs answer: a node is either
+   complete or not running. On a remote node whose address lives on the VPN interface, start the service after the
+   tunnel: `systemctl edit qjanus` and add `[Unit]` `After=wg-quick@<vpn-interface>.service`
+   `Wants=wg-quick@<vpn-interface>.service` (or the unit that brings your VPN interface up).
+
 4. Firewall. The media ports and nothing else:
 
    ```

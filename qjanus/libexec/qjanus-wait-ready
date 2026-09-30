@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# qjanus-wait-ready: ExecStartPost of qjanus.service. Fails the start (and so lets systemd restart the
+# service) unless the server-facing HTTP API answers on QJANUS_HTTP_BIND:8088 and the client-facing
+# WebSocket API accepts connections on 127.0.0.1:8188.
+# Why: Janus only binds its HTTP API to an address that belongs to an interface which is UP when it
+# starts (a VPN address that is not there yet), and it then keeps running WITHOUT that transport. The
+# node must never sit there half-working, with the WebSocket API up and the server API missing.
+#   qjanus-wait-ready [seconds]        (default 25)
+set -euo pipefail
+
+host=${QJANUS_HTTP_BIND:-127.0.0.1}
+case "$host" in 0.0.0.0|::|"") host=127.0.0.1 ;; esac
+deadline=$((SECONDS + ${1:-25}))
+
+http_ready() {
+  local resp
+  { exec 3<> "/dev/tcp/$host/8088"; } 2> /dev/null || return 1
+  printf 'GET /janus/info HTTP/1.0\r\nHost: qjanus\r\n\r\n' >&3
+  resp=$(timeout 3 cat <&3) || true
+  exec 3<&- 3>&-
+  case $resp in *'"server_info"'*) return 0 ;; esac
+  return 1
+}
+ws_ready() {
+  { exec 3<> "/dev/tcp/127.0.0.1/8188"; } 2> /dev/null || return 1
+  exec 3<&- 3>&-
+}
+
+until http_ready && ws_ready; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "qjanus-wait-ready: the APIs did not come up (server API on the configured address, port 8088; client API on 127.0.0.1:8188): is QJANUS_HTTP_BIND an address of an interface that is up?" >&2
+    exit 1
+  fi
+  sleep 0.5
+done

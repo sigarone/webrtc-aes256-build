@@ -49,6 +49,7 @@ fi
 # ---- files that ship with it
 install -m 0755 "$QJ/install.sh" "$STAGE/install.sh"
 install -m 0755 "$QJ/libexec/qjanus-render-config" "$STAGE/libexec/qjanus-render-config"
+install -m 0755 "$QJ/libexec/qjanus-wait-ready" "$STAGE/libexec/qjanus-wait-ready"
 install -m 0644 "$QJ"/conf/*.jcfg.tmpl "$STAGE/share/qjanus/conf/"
 install -m 0644 "$QJ/systemd/qjanus.service" "$STAGE/share/qjanus/systemd/qjanus.service"
 install -m 0644 "$QJ/conf/Caddyfile.example" "$STAGE/share/qjanus/Caddyfile.example"
@@ -118,7 +119,7 @@ cat "$OUT/janus-version.txt"
 for n in bin/janus lib/janus/plugins/libjanus_videoroom.so lib/janus/transports/libjanus_http.so lib/janus/transports/libjanus_websockets.so; do
   test -x "$STAGE/$n" || { echo "missing $n"; exit 1; }
 done
-bash -n "$STAGE/install.sh" && bash -n "$STAGE/libexec/qjanus-render-config"
+bash -n "$STAGE/install.sh" && bash -n "$STAGE/libexec/qjanus-render-config" && bash -n "$STAGE/libexec/qjanus-wait-ready"
 
 # ---- tarball: reproducible ordering/ownership, relocatable (top directory qjanus/)
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$QJ" log -1 --format=%ct 2> /dev/null || date +%s)}

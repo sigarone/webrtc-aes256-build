@@ -353,15 +353,27 @@ jobs:
           listening() { sudo ss -Hltn | awk -v a="$1" '$4 == a { f = 1 } END { exit !f }'; }
           FP1='${{ steps.install.outputs.fp }}'
           rel1=$(basename "$(readlink -f /opt/qjanus/current)")
-          # the address of the server-facing HTTP API is a node setting (the VPN address on a remote node): change it, check, put it back
-          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }; cat "$RUNNER_TEMP/bind.log"
+          # the address of the server-facing HTTP API is a node setting (the VPN address on a remote node).
+          # 1. an address that no interface carries: Janus cannot bind it, the node must FAIL CLOSED (no half-working node)
+          if (cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 > /dev/null 2> "$RUNNER_TEMP/bind-bad.log"); then
+            echo "::error::a HTTP bind that Janus cannot use must fail the start"; exit 1
+          fi
+          tail -3 "$RUNNER_TEMP/bind-bad.log"
+          if systemctl is-active --quiet qjanus; then echo "::error::qjanus is active although its HTTP API is not"; exit 1; fi
+          # 2. an address of a real interface (the runner's, standing in for the VPN address): only that address, not loopback
+          ADDR=$(ip -4 route get 192.0.2.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+          [ -n "$ADDR" ]
+          echo "::add-mask::$ADDR"
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind "$ADDR" 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
           [ "$FPB" = "$FP1" ]
-          listening 127.0.0.2:8088
+          listening "$ADDR:8088"
           if listening 127.0.0.1:8088; then echo "::error::the HTTP API still listens on 127.0.0.1"; exit 1; fi
           listening 127.0.0.1:8188
-          [ "$(curl -sf http://127.0.0.2:8088/janus/info | jq -r .janus)" = server_info ]
-          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }; cat "$RUNNER_TEMP/bind.log"
+          [ "$(curl -sf "http://$ADDR:8088/janus/info" | jq -r .janus)" = server_info ]
+          # 3. back to loopback
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
           listening 127.0.0.1:8088
+          systemctl is-active --quiet qjanus
           # a second release: the same tree with another VERSION
           sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
           echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null

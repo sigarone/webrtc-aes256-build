@@ -74,9 +74,13 @@ ok "info: VideoRoom + HTTP + WebSockets only, hardened core settings, dependenci
 # no libssl/libcrypto mapped into the running process
 if grep -E 'libssl|libcrypto' /proc/$JPID/maps; then fail "a system libssl/libcrypto is mapped into the process"; fi
 ok "no libssl/libcrypto mapped into the running process"
+QJANUS_HTTP_BIND=127.0.0.1 "$ROOT/libexec/qjanus-wait-ready" 5 || fail "qjanus-wait-ready must succeed against a running node"
+ok "qjanus-wait-ready accepts a running node"
 if grep -E 'FATAL' /tmp/node/janus.log; then fail "fatal errors at startup"; fi
 grep -E 'WARN|ERR' /tmp/node/janus.log || true
 stop_janus
+if QJANUS_HTTP_BIND=127.0.0.1 "$ROOT/libexec/qjanus-wait-ready" 2 2> /dev/null; then fail "qjanus-wait-ready must fail when nothing answers"; fi
+ok "qjanus-wait-ready fails closed when nothing answers"
 
 # the pinned dependency versions, visible only with hide_dependencies = false
 mkdir -p /tmp/node/etc2 && cp /tmp/node/etc/* /tmp/node/etc2/
