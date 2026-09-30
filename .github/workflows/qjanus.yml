@@ -348,27 +348,30 @@ jobs:
       - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README)
         run: |
           set -euo pipefail
+          trap 'rc=$?; echo "::error::lifecycle step failed (exit $rc) at: $BASH_COMMAND"; sudo journalctl -u qjanus -n 40 --no-pager -o cat || true' ERR
+          # awk reads all of ss's output (grep -q would end the pipe early: SIGPIPE + pipefail)
+          listening() { sudo ss -Hltn | awk -v a="$1" '$4 == a { f = 1 } END { exit !f }'; }
           FP1='${{ steps.install.outputs.fp }}'
           rel1=$(basename "$(readlink -f /opt/qjanus/current)")
           # the address of the server-facing HTTP API is a node setting (the VPN address on a remote node): change it, check, put it back
-          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 2> "$RUNNER_TEMP/bind.log"); cat "$RUNNER_TEMP/bind.log"
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }; cat "$RUNNER_TEMP/bind.log"
           [ "$FPB" = "$FP1" ]
-          sudo ss -Hltn | grep -q '127.0.0.2:8088'
-          if sudo ss -Hltn | grep -q '127.0.0.1:8088'; then echo "::error::the HTTP API still listens on 127.0.0.1"; exit 1; fi
-          sudo ss -Hltn | grep -q '127.0.0.1:8188'
-          curl -sf http://127.0.0.2:8088/janus/info | grep -q server_info
-          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log"); cat "$RUNNER_TEMP/bind.log"
-          sudo ss -Hltn | grep -q '127.0.0.1:8088'
+          listening 127.0.0.2:8088
+          if listening 127.0.0.1:8088; then echo "::error::the HTTP API still listens on 127.0.0.1"; exit 1; fi
+          listening 127.0.0.1:8188
+          [ "$(curl -sf http://127.0.0.2:8088/janus/info | jq -r .janus)" = server_info ]
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }; cat "$RUNNER_TEMP/bind.log"
+          listening 127.0.0.1:8088
           # a second release: the same tree with another VERSION
           sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
           echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null
           pid1=$(systemctl show -p MainPID --value qjanus)
-          FP2=$(cd /tmp/pkg2/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/up.log"); cat "$RUNNER_TEMP/up.log"
+          FP2=$(cd /tmp/pkg2/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/up.log") || { cat "$RUNNER_TEMP/up.log"; exit 1; }; cat "$RUNNER_TEMP/up.log"
           [ "$FP2" = "$FP1" ]
           [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "${rel1}-upgrade" ]
           [ "$(systemctl show -p MainPID --value qjanus)" != "$pid1" ]
           systemctl is-active --quiet qjanus
-          FP3=$(sudo /opt/qjanus/current/install.sh --rollback 2> "$RUNNER_TEMP/rb.log"); cat "$RUNNER_TEMP/rb.log"
+          FP3=$(sudo /opt/qjanus/current/install.sh --rollback 2> "$RUNNER_TEMP/rb.log") || { cat "$RUNNER_TEMP/rb.log"; exit 1; }; cat "$RUNNER_TEMP/rb.log"
           [ "$FP3" = "$FP1" ]
           [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
           systemctl is-active --quiet qjanus
@@ -377,7 +380,7 @@ jobs:
           [ ! -e /etc/systemd/system/qjanus.service ]
           if systemctl is-active --quiet qjanus; then echo "::error::qjanus still active after uninstall"; exit 1; fi
           sudo test -s /etc/qjanus/dtls.key
-          FP4=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/re.log"); cat "$RUNNER_TEMP/re.log"
+          FP4=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/re.log") || { cat "$RUNNER_TEMP/re.log"; exit 1; }; cat "$RUNNER_TEMP/re.log"
           [ "$FP4" = "$FP1" ]
           systemctl is-active --quiet qjanus
           sudo /opt/qjanus/current/install.sh --uninstall --purge
