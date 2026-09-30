@@ -31,7 +31,8 @@
 # missing/empty series file, an unsafe dir/filename, or a `--check` failure
 # all exit non-zero.
 #
-# usage: apply-series.sh <src_dir> <android|android-lk|ios|ios-lk>
+# usage: apply-series.sh <src_dir> <android|android-lk|ios|ios-lk|win>
+# ("win" = Windows x64 desktop: the plain series, no LiveKit patch.)
 # exit: 0 clean apply | 1 patch/context problem | 2 usage/contract problem
 set -eu
 
@@ -41,7 +42,7 @@ PATCH_DIR="$SELF_DIR/patches"
 LK_DIR="$SELF_DIR/lk"
 
 usage() {
-  echo "usage: $0 <src_dir> <android|android-lk|ios|ios-lk>" >&2
+  echo "usage: $0 <src_dir> <android|android-lk|ios|ios-lk|win>" >&2
   exit 2
 }
 
@@ -50,8 +51,8 @@ SRC=$1
 VARIANT=$2
 
 case "$VARIANT" in
-  android|android-lk|ios|ios-lk) ;;
-  *) echo "::error::apply-series: unknown variant '$VARIANT' (want android|android-lk|ios|ios-lk)" >&2; exit 2 ;;
+  android|android-lk|ios|ios-lk|win) ;;
+  *) echo "::error::apply-series: unknown variant '$VARIANT' (want android|android-lk|ios|ios-lk|win)" >&2; exit 2 ;;
 esac
 
 [ -d "$SRC" ] || { echo "::error::apply-series: src_dir '$SRC' does not exist" >&2; exit 2; }

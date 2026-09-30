@@ -4,11 +4,16 @@
 # same convention as ci/assert-no-key-strings.sh: an inconclusive check is a
 # failure, never a pass-by-default).
 #
-# usage: gates.sh <android|ios> <plain|lk> <artifact> <dnn_dir> <ssl_h>
-#   <platform>  android | ios
+# usage: gates.sh <android|ios|windows> <plain|lk> <artifact> <dnn_dir> <ssl_h>
+#   <platform>  android | ios | windows
 #   <variant>   plain | lk
 #   <artifact>  android: path to the built .aar
 #               ios:     path to the built .xcframework directory
+#               windows: path to the staged directory holding webrtc.lib (a
+#                        complete COFF static library, x64) and include/
+#                        (the public headers). variant must be plain. G5 and
+#                        G6 are re-expressed for a static library (no dynamic
+#                        export table to scan): see the windows branches.
 #   <dnn_dir>   third_party/opus/src/dnn from the SAME checkout the artifact
 #               was built from (G4 extracts its expected array names live
 #               from here, and reads it for G9's companion info line).
@@ -23,7 +28,7 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
 ASSERT_NO_KEY="$REPO_ROOT/ci/assert-no-key-strings.sh"
 
-usage() { echo "usage: $0 <android|ios> <plain|lk> <artifact> <dnn_dir> <ssl_h>" >&2; exit 2; }
+usage() { echo "usage: $0 <android|ios|windows> <plain|lk> <artifact> <dnn_dir> <ssl_h>" >&2; exit 2; }
 [ $# -eq 5 ] || usage
 PLATFORM=$1
 VARIANT=$2
@@ -31,7 +36,8 @@ ARTIFACT=$3
 DNN_DIR=$4
 SSL_H=$5
 
-case "$PLATFORM" in android|ios) ;; *) echo "::error::gates: platform must be android|ios" >&2; exit 2 ;; esac
+case "$PLATFORM" in android|ios|windows) ;; *) echo "::error::gates: platform must be android|ios|windows" >&2; exit 2 ;; esac
+[ "$PLATFORM" != windows ] || [ "$VARIANT" = plain ] || { echo "::error::gates: windows has only the plain (strict) variant" >&2; exit 2; }
 case "$VARIANT" in plain|lk) ;; *) echo "::error::gates: variant must be plain|lk" >&2; exit 2 ;; esac
 [ -e "$ARTIFACT" ] || { echo "::error::gates: artifact not found: $ARTIFACT" >&2; exit 2; }
 [ -f "$ASSERT_NO_KEY" ] || { echo "::error::gates: missing $ASSERT_NO_KEY" >&2; exit 2; }
@@ -69,8 +75,16 @@ esac
 # gate that matters).
 works() { [ -n "$1" ] && "$1" --version >/dev/null 2>&1; }
 resolve_nm() {
-  # $1 = android|ios
-  if [ "$1" = android ]; then
+  # $1 = android|ios|windows
+  if [ "$1" = windows ]; then
+    if [ -n "$SRC_GUESS" ]; then
+      c="$SRC_GUESS/third_party/llvm-build/Release+Asserts/bin/llvm-nm.exe"
+      works "$c" && { printf '%s\n' "$c"; return 0; }
+    fi
+    c=$(command -v llvm-nm 2>/dev/null || true)
+    works "$c" && { printf '%s\n' "$c"; return 0; }
+    return 1
+  elif [ "$1" = android ]; then
     if [ -n "$SRC_GUESS" ]; then
       for c in \
         "$SRC_GUESS/third_party/llvm-build/Release+Asserts/bin/llvm-nm" \
@@ -100,6 +114,11 @@ if [ "$PLATFORM" = android ]; then
   [ -d "$AAR_SCAN/jni" ] || gate_fail "G6 (no jni/ dir in AAR - is this a valid AAR?)"
   BINARIES=$(find "$AAR_SCAN/jni" -type f -name '*.so')
   [ -n "$BINARIES" ] || gate_fail "G1-G5 setup (no .so found under jni/)"
+elif [ "$PLATFORM" = windows ]; then
+  [ -d "$ARTIFACT" ] || { echo "::error::gates: windows artifact must be the staged directory" >&2; exit 2; }
+  BINARIES=$(find "$ARTIFACT" -maxdepth 1 -type f -name 'webrtc.lib')
+  [ -n "$BINARIES" ] || gate_fail "G1-G5 setup (no webrtc.lib in $ARTIFACT)"
+  [ "$(printf '%s\n' $BINARIES | wc -l | tr -d ' ')" -eq 1 ] || gate_fail "G1-G5 setup (more than one webrtc.lib)"
 else
   [ -d "$ARTIFACT" ] || { echo "::error::gates: ios artifact must be the .xcframework directory" >&2; exit 2; }
   # Mach-O slices only: the dSYM DWARF companions share the file name but
@@ -199,6 +218,20 @@ gate_ok G4
 # ---------------------------------------------------------------------------
 echo "::group::G5: no exported codec symbols"
 CODEC_RE='^(opus_|lpcnet_|fargan_|silk_|celt_)'
+if [ "$PLATFORM" = windows ]; then
+  # A static library has no dynamic symbol table: every opus_*/silk_*/celt_*
+  # symbol is (necessarily) defined inside webrtc.lib, so "no exported codec
+  # symbols" is checked where it can leak into a consumer's DLL export table:
+  # no /EXPORT: linker directive (.drectve) may name a codec symbol.
+  for f in $BINARIES; do
+    n_exp=$(grep -a -o -E '/EXPORT:[A-Za-z0-9_?@$]+' "$f" | wc -l | tr -d ' ')
+    bad=$(grep -a -o -E '/EXPORT:[A-Za-z0-9_?@$]+' "$f" | grep -c -E '/EXPORT:_?(opus_|lpcnet_|fargan_|silk_|celt_)' || true)
+    echo "G5: $f carries $n_exp /EXPORT: directive(s), $bad naming codec internals"
+    [ "${bad:-0}" -eq 0 ] 2>/dev/null || gate_fail "G5 ($f has $bad /EXPORT: directive(s) for codec-internal symbols)"
+  done
+  echo "::endgroup::"
+  gate_ok G5
+else
 NM5=$(resolve_nm "$PLATFORM" || true)
 [ -n "$NM5" ] || gate_fail "G5 (no llvm-nm/nm resolved - cannot verify absence of exported codec symbols, refusing to pass by default)"
 echo "G5: using nm binary: $NM5"
@@ -214,6 +247,7 @@ for f in $BINARIES; do
 done
 echo "::endgroup::"
 gate_ok G5
+fi
 
 # ---------------------------------------------------------------------------
 # G6 - ABI/slice allow-list.
@@ -222,7 +256,39 @@ gate_ok G5
 #        {ios-arm64, ios-arm64-simulator}.
 # ---------------------------------------------------------------------------
 echo "::group::G6: ABI allow-list"
-if [ "$PLATFORM" = android ]; then
+if [ "$PLATFORM" = windows ]; then
+  # Every COFF object in the archive must be x64 (IMAGE_FILE_MACHINE_AMD64,
+  # 0x8664); any i386/ARM/ARM64 member fails, and an archive with fewer than
+  # 100 x64 members is an empty/wrong build.
+  PYG6=""
+  for cand in python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'pass' >/dev/null 2>&1; then PYG6=$cand; break; fi
+  done
+  [ -n "$PYG6" ] || gate_fail "G6 (no working python to parse the COFF archive)"
+  for f in $BINARIES; do
+    "$PYG6" - "$f" <<'PYEOF' || gate_fail "G6 (webrtc.lib is not a pure x64 COFF archive)"
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+if data[:8] != b'!<arch>\n':
+    print("not an ar archive (thin archive?)"); sys.exit(1)
+pos, seen, order = 8, {}, 0
+while pos + 60 <= len(data):
+    name = data[pos:pos+16].decode('latin1').strip()
+    size = int(data[pos+48:pos+58].decode('latin1').strip())
+    body = pos + 60
+    if name not in ('/', '//') and size >= 20:
+        m = struct.unpack_from('<H', data, body)[0]
+        if m == 0 and struct.unpack_from('<H', data, body + 2)[0] == 0xFFFF:
+            m = struct.unpack_from('<H', data, body + 6)[0]
+        seen[m] = seen.get(m, 0) + 1
+    pos = body + size + (size & 1)
+print("machine types in webrtc.lib: " + ", ".join("0x%04x x%d" % kv for kv in sorted(seen.items())))
+bad = [m for m in seen if m in (0x14c, 0x1c0, 0x1c4, 0xaa64)]
+if bad or seen.get(0x8664, 0) < 100:
+    sys.exit(1)
+PYEOF
+  done
+elif [ "$PLATFORM" = android ]; then
   ABIS=$(find "$AAR_SCAN/jni" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort)
   [ "$ABIS" = "arm64-v8a" ] || gate_fail "G6 (jni/ ABI set is [$ABIS], want exactly arm64-v8a)"
 else
@@ -271,7 +337,21 @@ gate_ok G7
 # under Headers/ declares it, and the selector is in the binary.
 # ---------------------------------------------------------------------------
 echo "::group::G8: P8 tuning API present"
-if [ "$PLATFORM" = android ]; then
+if [ "$PLATFORM" = windows ]; then
+  # C++ API of P8 (rtc_base/qaudion_tuning.h): declared in the shipped headers
+  # AND defined in webrtc.lib (MSVC-ABI mangled name, e.g.
+  # ?SetOpusEncoderComplexity@qaudion@webrtc@@YAXH@Z - matched loosely).
+  QH="$ARTIFACT/include/rtc_base/qaudion_tuning.h"
+  [ -f "$QH" ] || gate_fail "G8 (rtc_base/qaudion_tuning.h missing from the staged headers)"
+  for fn in SetOpusEncoderComplexity SetOpusDecoderComplexity SetOpusMinPacketLossPercent SetRequireDtlsPqc RaiseTransportLevel TransportLevel; do
+    grep -q -F "$fn" "$QH" || gate_fail "G8 (qaudion_tuning.h does not declare $fn)"
+    found=0
+    for f in $BINARIES; do
+      grep -a -q -F "${fn}@qaudion" "$f" 2>/dev/null && found=1
+    done
+    [ "$found" -eq 1 ] || gate_fail "G8 (no ${fn}@qaudion symbol in webrtc.lib)"
+  done
+elif [ "$PLATFORM" = android ]; then
   CJ="$AAR_SCAN/classes.jar"
   [ -f "$CJ" ] || gate_fail "G8 (no classes.jar in AAR)"
   unzip -l "$CJ" | grep -qE '(livekit/)?org/webrtc/PeerConnectionFactory\.class' || gate_fail "G8 (PeerConnectionFactory.class not found in classes.jar)"

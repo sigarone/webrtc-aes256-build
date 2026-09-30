@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """buildinfo.py - emit BUILDINFO.json to stdout for one M150 build job.
 
-Usage: buildinfo.py <android|ios> <plain|lk>
+Usage: buildinfo.py <android|ios|windows> <plain|lk> [--pins]
+
+  --pins  print the plain-text PINS list (source/tool pins) instead of the JSON.
+  windows has only the plain variant (x64, strict transport).
 
 Written BEFORE SHA256SUMS is computed (finding #16: BUILDINFO.json must be
 generated before SHA256SUMS and included IN it, not the other way round -
@@ -122,11 +125,21 @@ def cross_check(env_name, pinned):
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] not in ("android", "ios") or sys.argv[2] not in ("plain", "lk"):
-        print("usage: %s <android|ios> <plain|lk>" % sys.argv[0], file=sys.stderr)
+    args = [a for a in sys.argv[1:] if a != "--pins"]
+    want_pins = len(args) != len(sys.argv) - 1
+    if len(args) != 2 or args[0] not in ("android", "ios", "windows") or args[1] not in ("plain", "lk")             or (args[0] == "windows" and args[1] != "plain"):
+        print("usage: %s <android|ios|windows> <plain|lk> [--pins]" % sys.argv[0], file=sys.stderr)
         return 2
 
-    platform, variant = sys.argv[1], sys.argv[2]
+    platform, variant = args[0], args[1]
+    if want_pins:
+        print("# Q-Audion m150 source pins (verified by m150/ci/sync.sh before every build)")
+        print("webrtc-sdk/webrtc %s" % cross_check("WEBRTC_SRC_SHA", WEBRTC_SRC_PIN))
+        print("chromium/src/third_party %s" % cross_check("THIRD_PARTY_SHA", THIRD_PARTY_PIN))
+        print("boringssl %s" % cross_check("BORINGSSL_SHA", BORINGSSL_PIN))
+        print("opus %s" % cross_check("OPUS_SHA", OPUS_PIN))
+        print("opus-dnn-weights-sha256 %s" % OPUS_WEIGHTS_SHA256)
+        return 0
     series = read_series()
 
     info = {
@@ -134,7 +147,8 @@ def main():
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platform": platform,
         "variant": variant,
-        "transport_strict": (platform in ("android", "ios")) and (variant == "plain"),
+        "transport_strict": (platform in ("android", "ios", "windows")) and (variant == "plain"),
+        "target": {"os": "win", "cpu": "x64"} if platform == "windows" else None,
         "source": {
             "webrtc_src_sha": cross_check("WEBRTC_SRC_SHA", WEBRTC_SRC_PIN),
             "boringssl_sha": cross_check("BORINGSSL_SHA", BORINGSSL_PIN),

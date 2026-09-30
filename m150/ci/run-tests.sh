@@ -1,0 +1,85 @@
+#!/bin/sh
+# run-tests.sh - run the T1-T6 unit-test filters (webrtc-plan.md v2 §6.1)
+# against already-built rtc_unittests / modules_unittests. Shared by
+# test-m150-patches.yml (Linux x64) and build-m150-windows.yml (Windows x64)
+# so the filters live in exactly one place.
+#
+# usage: run-tests.sh <out_dir> <strict|switchable> [exe_suffix]
+#   <out_dir>      GN output dir holding rtc_unittests and modules_unittests
+#   <config>       strict | switchable (rtc_qaudion_transport_strict)
+#   [exe_suffix]   ".exe" on Windows, empty elsewhere
+# exit: 0 all selected filters passed | 1 a test failed or a filter matched
+#       nothing (a filter that matches no test would silently pass) | 2 usage
+set -eu
+
+usage() { echo "usage: $0 <out_dir> <strict|switchable> [exe_suffix]" >&2; exit 2; }
+[ $# -ge 2 ] && [ $# -le 3 ] || usage
+OUT=$1
+CONFIG=$2
+EXE=${3:-}
+case "$CONFIG" in strict|switchable) ;; *) usage ;; esac
+[ -d "$OUT" ] || { echo "::error::run-tests: $OUT is not a directory" >&2; exit 2; }
+
+# T1 (SRTP): api/crypto/crypto_options_unittest.cc already covers exactly
+# the function P6 rewrites (CryptoOptions::GetSupportedDtlsSrtpCryptoSuites).
+T1_FILTER="CryptoOptionsTest.GetSupportedDtlsSrtpCryptoSuites*"
+# T2 (DTLS): rtc_base/ssl_stream_adapter_unittest.cc's value-parameterized
+# DTLS-version fixture, run across DTLS 1.2 x 1.3 (client x server) - covers
+# the version/cipher outcomes in the plan's §6.1 table, plus
+# TestGetSslGroupIdWithPqc (X25519MLKEM768 negotiation, P7's other half).
+# It does not cover the plan's stock-client/INCOMPATIBLE_CIPHERSUITE/
+# QaudionHandshakeMeetsPolicy rows - those need real cross-version fixtures
+# this file doesn't have; still open.
+T2_FILTER="*SSLStreamAdapterTestDTLSHandshakeVersion*"
+# T3 (FEC floor): closest existing coverage for the packet-loss-rate bound
+# P5's OpusMinPacketLossPercent() feeds into (0.2 = 20%, the same ceiling
+# P5 clamps its own floor to).
+T3_FILTER="*AudioEncoderOpusTest.PacketLossRateUpperBounded*"
+# T4 (decoder PLC): closest existing coverage that exercises the PLC/FEC
+# decode paths P4b's WebRtcOpus_Decode wraps (deep PLC/OSCE themselves are
+# only compiled in on arm64/x64, see P4a).
+T4_FILTER="*AudioDecoderOpusTest*Plc*:*AudioDecoderOpusTest*Fec*"
+# T5 (encoder complexity): direct existing coverage for
+# AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
+# sits next to (SetTargetBitrate must not clobber an active override).
+T5_FILTER="AudioEncoderOpusTest.ConfigComplexityAdaptation"
+# T6 (BuildInfo/transport markers): rtc_base/qaudion_tuning.{h,cc} (P8) is a
+# brand-new file with no existing unittest - still a genuine TODO for whoever
+# adds rtc_base/qaudion_tuning_unittest.cc.
+T6_FILTER=""
+
+any=0
+# <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
+# expectations that P6/P7 deliberately change (AES-128 / non-GCM SRTP suites,
+# DTLS 1.2 handshakes), so they are expected to fail there by design and are
+# run only in the switchable config, where level 0 must stay byte-for-byte
+# upstream (LiveKit default).
+for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
+            "T3:modules_unittests:$T3_FILTER" "T4:modules_unittests:$T4_FILTER" \
+            "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER"; do
+  name=${spec%%:*}
+  rest=${spec#*:}
+  bin=${rest%%:*}
+  filt=${rest#*:}
+  if [ -z "$filt" ]; then
+    echo "::warning::$name: no gtest filter set yet - skipped"
+    continue
+  fi
+  if [ "$CONFIG" = strict ] && { [ "$name" = T1 ] || [ "$name" = T2 ]; }; then
+    echo "::notice::$name: upstream-behaviour test, intentionally changed by P6/P7 in strict builds - run in the switchable config only"
+    continue
+  fi
+  n=$("$OUT/$bin$EXE" "--gtest_filter=$filt" --gtest_list_tests | grep -c '^  ' || true)
+  if [ "${n:-0}" -eq 0 ]; then
+    echo "::error::$name: filter '$filt' matches no test in $bin - the check would silently pass"
+    exit 1
+  fi
+  echo "::group::$name ($bin, $n tests, $filt)"
+  "$OUT/$bin$EXE" "--gtest_filter=$filt"
+  echo "::endgroup::"
+  any=$((any + 1))
+done
+if [ "$any" -eq 0 ]; then
+  echo "::warning::no T1-T6 filters ran - build-only smoke passed, no tests ran"
+fi
+echo "run-tests: $any filter group(s) passed ($CONFIG)"
