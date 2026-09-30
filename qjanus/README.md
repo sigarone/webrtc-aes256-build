@@ -160,6 +160,11 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
   (never added, or removed) -> 433, also after a kick. `joined` carries `private_id`. `publish` without `e2ee:true` in
   the JSEP is refused (433 "Room requires end-to-end encrypted media"); a handle whose publish was refused must not be
   reused (attach a new one).
+- Simulcast: Janus assumes the RIDs in the publisher's SDP are listed highest first (`hml`) unless the publish JSEP
+  carries `"rid_order":"lmh"`. Substream 0 is always the lowest layer, 2 the highest. libwebrtc encodes 3 simulcast
+  layers only from a source of about 720p or more (smaller sources lose the last layer of the list), and the native
+  order is ascending, so a client that lists `l, m, h` MUST send `rid_order:"lmh"`, otherwise substream 0 would be the
+  HIGHEST layer.
 - Subscriber: `join` with `ptype:"subscriber"`, `private_id` (required, 433 if wrong), `streams:[{feed,mid}]`; a feed that
   is not publishing yet -> 428.
 - Kick order for the server (spec section 3): `allowed` remove, then `kick`; the kicked handle gets

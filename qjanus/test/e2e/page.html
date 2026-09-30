@@ -71,6 +71,26 @@ async function gatherComplete(pc, ms = 8000) {
 }
 
 // ------------------------------------------------------------------------------ helpers
+async function syntheticCamera(w, h, fps) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const g = canvas.getContext('2d');
+  let n = 0;
+  const draw = () => {
+    n++;
+    g.fillStyle = `hsl(${(n * 3) % 360},60%,40%)`; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 48; i++) {          // moving texture: the encoder has real work to do
+      g.fillStyle = `hsl(${(n * 2 + i * 9) % 360},80%,${25 + (i % 30)}%)`;
+      g.fillRect((i * 97 + n * 13) % (w - 80), (i * 53 + n * 7) % (h - 80), 80, 80);
+    }
+    g.fillStyle = '#fff'; g.font = '72px monospace'; g.fillText(String(n), 40, 110);
+  };
+  draw();
+  setInterval(draw, Math.round(1000 / fps));
+  const video = canvas.captureStream(fps).getVideoTracks()[0];
+  const audio = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0];
+  return new MediaStream([audio, video]);
+}
 function applyTransform(rtpObj, kind, role, participant) {
   if (hasScriptTransform) {
     rtpObj.transform = new RTCRtpScriptTransform(worker, { kind, role, participant });
@@ -104,7 +124,10 @@ window.q = {
   // spec 4.2: FrameCryptors (here: transforms) on every sender BEFORE the offer is created
   async newPublisher(id, opts) {
     const rec = newPc(id, 'publisher', opts);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: opts.width || 640 }, height: { ideal: opts.height || 360 }, frameRate: { ideal: 25 } } });
+    // Chromium's fake camera delivers 640x480 whatever is asked: a 3 layer simulcast (l/m/h = 1/4, 1/2, 1) needs
+    // a 720p source (libwebrtc drops simulcast layers of small sources), so those peers draw their own camera
+    const stream = (opts.width || 0) >= 1280 ? await syntheticCamera(opts.width, opts.height || 720, 25)
+      : await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: opts.width || 640 }, height: { ideal: opts.height || 360 }, frameRate: { ideal: 25 } } });
     rec.capture = stream.getVideoTracks()[0].getSettings();
     const ta = rec.pc.addTransceiver(stream.getAudioTracks()[0], { direction: 'sendonly', streams: [stream] });
     // ascending quality l, m, h (libwebrtc's native order; the JSEP must then say rid_order "lmh": Janus assumes
