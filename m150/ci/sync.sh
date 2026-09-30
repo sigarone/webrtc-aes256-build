@@ -135,6 +135,14 @@ EOF
   cd "$WORKDIR"
   if [ "$IS_WIN" -eq 1 ]; then
     cmd //c "gclient.bat sync --no-history --shallow --nohooks"
+    # build/util/lastchange.py finds no Change-Id commit in the shallow
+    # checkout, falls back to commit time 0 and lld-link then fails with
+    # "invalid timestamp: -2142000" (/TIMESTAMP is derived from it). Give it
+    # the commit time of the pinned webrtc commit instead (reproducible).
+    COMMIT_CT=$(git -C "$WORKDIR/src" log -1 --format=%ct)
+    BASE_COMMIT_HASH=$(git -C "$WORKDIR/src" rev-parse HEAD)
+    BASE_COMMIT_SUBMISSION_MS=$((COMMIT_CT * 1000))
+    export BASE_COMMIT_HASH BASE_COMMIT_SUBMISSION_MS
     cmd //c "gclient.bat runhooks"
   else
     gclient sync --no-history --shallow --nohooks
