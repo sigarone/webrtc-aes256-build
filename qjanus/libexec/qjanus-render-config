@@ -6,7 +6,8 @@
 # /run/qjanus (service user, 0700); they are never on a command line.
 #   QJANUS_TOKEN_SECRET   HMAC key of the signed session tokens        (required, hex)
 #   QJANUS_ADMIN_KEY      VideoRoom admin_key                          (required, hex)
-#   QJANUS_HTTP_BIND      address of the server-facing HTTP API        (default 127.0.0.1)
+#   QJANUS_HTTP_BIND      address of the server-facing HTTP API        (default 127.0.0.1; loopback, private,
+#                         VPN (CGNAT) or unique-local only, QJANUS_ALLOW_NONPRIVATE_BIND=yes overrides)
 #   QJANUS_DTLS_CERT      DTLS certificate (PEM)                       (default /etc/qjanus/dtls.crt)
 #   QJANUS_DTLS_KEY       DTLS private key (PEM)                       (default $CREDENTIALS_DIRECTORY/dtls.key)
 #   QJANUS_NAT_1_1        public IPv4 to advertise when the node sits behind a 1:1 NAT (optional;
@@ -15,6 +16,8 @@ set -euo pipefail
 
 # the release directory as this script was reached: /opt/qjanus/current/... stays "current"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=qjanus-lib.sh
+. "$ROOT/libexec/qjanus-lib.sh"
 OUT=${1:-${RUNTIME_DIRECTORY:-/run/qjanus}/etc}
 TMPL=$ROOT/share/qjanus/conf
 
@@ -30,7 +33,8 @@ QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTO
 # the values end up inside sed programs and libconfig strings: strict charsets only
 [[ $QJANUS_TOKEN_SECRET =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_TOKEN_SECRET must be 32-128 lowercase hex characters"
 [[ $QJANUS_ADMIN_KEY =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_ADMIN_KEY must be 32-128 lowercase hex characters"
-[[ $QJANUS_HTTP_BIND =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || die "QJANUS_HTTP_BIND must be an IPv4 or IPv6 address"
+# the server API is plain HTTP for the application server only: never a public address
+qjanus_check_http_bind "$QJANUS_HTTP_BIND" || die "QJANUS_HTTP_BIND is not acceptable"
 QJANUS_NAT_1_1=${QJANUS_NAT_1_1:-}
 if [ -n "$QJANUS_NAT_1_1" ]; then
   [[ $QJANUS_NAT_1_1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "QJANUS_NAT_1_1 must be an IPv4 address"

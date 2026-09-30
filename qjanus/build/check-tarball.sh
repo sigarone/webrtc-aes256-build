@@ -48,6 +48,15 @@ if QJANUS_NAT_1_1='1.2.3.4"; x' "$ROOT/libexec/qjanus-render-config" /tmp/node/e
 if QJANUS_NAT_1_1=999.1.1.1 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an out-of-range QJANUS_NAT_1_1 must be refused"; fi
 if QJANUS_HTTP_BIND='1.2.3.4|x' "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an invalid QJANUS_HTTP_BIND must be refused"; fi
 ok "optional 1:1 NAT mapping renders, invalid settings are refused"
+# the server API (plain HTTP) must never be bound to a public or wildcard address, whatever the env file says
+for a in 8.8.8.8 203.0.113.9 0.0.0.0 :: 2a01:4f9::1 172.32.0.1 100.128.0.1; do
+  if QJANUS_HTTP_BIND=$a "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "QJANUS_HTTP_BIND=$a must be refused"; fi
+done
+for a in 127.0.0.1 10.8.0.1 172.16.5.4 192.168.0.9 100.64.1.2 fd00::1 ::1 fe80::1; do
+  QJANUS_HTTP_BIND=$a "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-good 2> /dev/null || fail "QJANUS_HTTP_BIND=$a must be accepted"
+done
+QJANUS_HTTP_BIND=8.8.8.8 QJANUS_ALLOW_NONPRIVATE_BIND=yes "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-good 2> /dev/null || fail "QJANUS_ALLOW_NONPRIVATE_BIND=yes must override"
+ok "the HTTP bind: loopback/private/VPN/unique-local accepted, public and wildcard addresses refused unless overridden"
 
 run_janus() { # $1 = config dir, $2 = log
   env -u LD_LIBRARY_PATH "$ROOT/bin/janus" -F "$1" > "$2" 2>&1 &
