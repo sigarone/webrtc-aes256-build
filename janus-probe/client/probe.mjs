@@ -15,6 +15,7 @@ const OUT = process.env.OUT_DIR || path.join(HERE, 'out');
 const PORT = 8199;
 const PAGE = `http://127.0.0.1:${PORT}/page.html`;
 const ONLY = (process.env.ONLY || '').split(',').filter(Boolean);
+const SUITE = process.env.SUITE || 'main';
 // JSON: [{"label":"130","path":"/path/to/chrome"}, ...]  older Chrome-for-Testing builds
 const OLD_CHROMES = JSON.parse(process.env.OLD_CHROMES || '[]');
 fs.mkdirSync(OUT, { recursive: true });
@@ -175,10 +176,12 @@ function flow(w, dir) {
 }
 const hasMedia = (f) => !!(f && f.audioPackets > 0 && f.videoPackets > 0);
 const transportOf = (s) => (s.transport && s.transport[0]) || {};
-const EXPECT = { tlsVersion: 'FEFC', dtlsCipher: 'TLS_AES_256_GCM_SHA384', srtpCipher: 'SRTP_AEAD_AES_256_GCM' };
+const EXPECT = { tlsVersion: 'FEFC', dtlsCipher: 'TLS_AES_256_GCM_SHA384' };
+// older Chrome builds report the SRTP profile as AEAD_AES_256_GCM, newer ones as SRTP_AEAD_AES_256_GCM
+const SRTP_OK = ['AEAD_AES_256_GCM', 'SRTP_AEAD_AES_256_GCM'];
 function levelOk(t) {
   return !!t && t.tlsVersion === EXPECT.tlsVersion && t.dtlsCipher === EXPECT.dtlsCipher &&
-    t.srtpCipher === EXPECT.srtpCipher && t.dtlsState === 'connected';
+    SRTP_OK.includes(t.srtpCipher) && t.dtlsState === 'connected';
 }
 const round1 = (ms) => Math.round(ms / 100) / 10;
 
@@ -229,7 +232,7 @@ async function echoScenario(browser, spec) {
   res.timerExpiredLines = res.janusLog.filter(isTimerLine).length;
   const okLines = res.janusLog.filter(isOkLine).length;
   const failLines = res.janusLog.filter(isFailLine).length;
-  const media = hasMedia(res.inbound);
+  const media = loss ? !!(res.inbound && res.inbound.audioPackets > 0) : hasMedia(res.inbound);
   res.accepted = !!(levelOk(res.transport) && media && okLines >= 1);
   res.refused = !media && okLines === 0;
   res.refusalLogged = failLines >= 1;
@@ -327,8 +330,9 @@ async function roomScenario(browser, spec) {
   // and the DTLS server for a subscriber that answers active (default)
   const okLines = res.janusLog.filter(isOkLine).length;
   const failLines = res.janusLog.filter(isFailLine).length;
-  const pubOk = levelOk(res.publisherTransport) && hasMedia(res.publisherOut);
-  const subMedia = !!(hasMedia(res.subscriberIn) && res.subscriberVideoDecoded > 0);
+  const pubOk = levelOk(res.publisherTransport) && (loss ? !!(res.publisherOut && res.publisherOut.audioPackets > 0) : hasMedia(res.publisherOut));
+  const subMedia = loss ? !!(res.subscriberIn && res.subscriberIn.audioPackets > 0)
+    : !!(hasMedia(res.subscriberIn) && res.subscriberVideoDecoded > 0);
   res.accepted = !!(pubOk && levelOk(res.subscriberTransport) && subMedia && okLines >= 2);
   res.refused = !!(pubOk && !subMedia && okLines === 1);
   res.refusalLogged = failLines >= 1;
@@ -352,6 +356,71 @@ async function roomScenario(browser, spec) {
   return res;
 }
 
+
+// ---------------------------------------------------------------- loss soak
+// Repeated publisher+subscriber handshakes under random UDP loss: how often do
+// both DTLS 1.3 handshakes complete (Janus is client for the publisher and
+// server for the subscriber), and how often did the retry timer have to act?
+async function soakOnce(browser, timeoutMs) {
+  const off = logSize(); const t0 = Date.now(); const r = {};
+  const ctx = await browser.newContext();
+  const janus = new JanusClient(JANUS);
+  try {
+    const pa = await newPage(ctx); const pb = await newPage(ctx);
+    await janus.create();
+    const hp = await janus.attach('janus.plugin.videoroom');
+    janus.trickle[hp] = (c) => pa.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['pub', c]).catch(() => {});
+    await janus.send(hp, { request: 'join', ptype: 'publisher', room: 1234, display: 'pub' });
+    const joined = await janus.waitFor((e) => e.sender === hp && pluginData(e).videoroom === 'joined', 10000);
+    const offer = await pa.evaluate((o) => window.probe.makeOffer('pub', o), { audio: true, video: true });
+    await janus.send(hp, { request: 'publish', audio: true, video: true }, { type: 'offer', sdp: offer });
+    const ans = await janus.waitFor((e) => e.sender === hp && e.jsep, 15000);
+    await pa.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['pub', ans.jsep.sdp]);
+    const hs = await janus.attach('janus.plugin.videoroom');
+    janus.trickle[hs] = (c) => pb.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['sub', c]).catch(() => {});
+    await janus.send(hs, { request: 'join', ptype: 'subscriber', room: 1234, streams: [{ feed: pluginData(joined).id }] });
+    const att = await janus.waitFor((e) => e.sender === hs && e.jsep, 15000);
+    const answer = await pb.evaluate(([s, o]) => window.probe.makeAnswer('sub', s, o), [att.jsep.sdp, {}]);
+    await janus.send(hs, { request: 'start', room: 1234 }, { type: 'answer', sdp: answer });
+    const [sp, ss] = await Promise.all([waitConnected(pa, 'pub', timeoutMs), waitConnected(pb, 'sub', timeoutMs)]);
+    await sleep(1500);
+    const tp = transportOf(await pa.evaluate(() => window.probe.stats('pub')));
+    const ts = transportOf(await pb.evaluate(() => window.probe.stats('sub')));
+    r.pubDtls = tp.dtlsState; r.subDtls = ts.dtlsState;
+    r.pubLevelOk = levelOk(tp); r.subLevelOk = levelOk(ts);
+    r.pubMs = connectMs(await pa.evaluate(() => window.probe.state('pub')));
+    r.subMs = connectMs(await pb.evaluate(() => window.probe.state('sub')));
+    r.pubConn = sp && sp.connection; r.subConn = ss && ss.connection;
+  } catch (e) { r.error = String(e.message || e); }
+  await janus.destroy();
+  await ctx.close();
+  await sleep(500);
+  const lines = policyLines(logSince(off));
+  r.okLines = lines.filter(isOkLine).length;
+  r.timerConnected = lines.filter((l) => isTimerLine(l) && /state=connected/.test(l)).length;
+  r.timerTrying = lines.filter((l) => isTimerLine(l) && /state=trying/.test(l)).length;
+  r.seconds = round1(Date.now() - t0);
+  return r;
+}
+const median = (a) => { const b = a.filter((x) => x != null).sort((x, y) => x - y); return b.length ? b[Math.floor(b.length / 2)] : null; };
+async function soakScenario(browser, spec) {
+  const { name, loss, n } = spec;
+  const res = { name, kind: 'soak', loss, n, runs: [] };
+  await withLoss(loss, async () => { for (let i = 0; i < n; i++) res.runs.push(await soakOnce(browser, 20000)); });
+  const R = res.runs;
+  res.bothDtlsConnected = R.filter((r) => r.pubLevelOk && r.subLevelOk).length;
+  res.pubDtlsConnected = R.filter((r) => r.pubLevelOk).length;
+  res.subDtlsConnected = R.filter((r) => r.subLevelOk).length;
+  res.janusOkLines = R.reduce((a, r) => a + r.okLines, 0);
+  res.timerExpiredConnected = R.reduce((a, r) => a + r.timerConnected, 0);
+  res.timerExpiredTrying = R.reduce((a, r) => a + r.timerTrying, 0);
+  res.pubMedianMs = median(R.map((r) => r.pubMs));
+  res.subMedianMs = median(R.map((r) => r.subMs));
+  res.errors = R.filter((r) => r.error).length;
+  res.ok = true; // informational
+  return res;
+}
+
 // ------------------------------------------------------------------------ main
 const results = [];
 const want = (n) => ONLY.length === 0 || ONLY.some((o) => n.startsWith(o));
@@ -368,9 +437,14 @@ async function run(fn, browser, spec) {
 const srv = await startServer();
 const versions = {};
 try {
-  // Chromium (Playwright build) with the PQC field trial, as our apps run -----
   const pqc = await launchChromium('WebRTC-EnableDtlsPqc/Enabled/');
   versions.chromium = pqc.version();
+  if (SUITE === 'soak') {
+    await run(soakScenario, pqc, { name: 'SOAK-30pct-udp-loss', loss: 0.3, n: 10 });
+    await run(soakScenario, pqc, { name: 'SOAK-50pct-udp-loss', loss: 0.5, n: 8 });
+    await pqc.close();
+  } else {
+  // Chromium (Playwright build) with the PQC field trial, as our apps run -----
   await run(echoScenario, pqc, { name: 'A1-echotest', expect: 'pass' });
   await run(roomScenario, pqc, { name: 'B1-videoroom-pub=janus-client,sub=janus-server', room: 1234, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'B2-videoroom-sub=janus-client', roleS: 'passive', room: 1234, expect: 'pass' });
@@ -405,6 +479,7 @@ try {
     await ff.close();
   }
   await pqc.close();
+  }
 } catch (e) {
   console.error('FATAL', e);
   results.push({ name: 'fatal', ok: false, error: String((e && e.stack) || e) });
@@ -416,6 +491,9 @@ fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 1
 // summary table
 const fmt = (x) => (x && x.tlsVersion ? `${x.tlsVersion} ${x.dtlsCipher || '-'} ${x.srtpCipher || '-'}` : '-');
 const rows = results.map((r) => {
+  if (r.kind === 'soak') {
+    return `SOAK | ${r.name} | n=${r.n} both-dtls-connected=${r.bothDtlsConnected} pub(janus=client)=${r.pubDtlsConnected} sub(janus=server)=${r.subDtlsConnected} janus-ok-lines=${r.janusOkLines} timer-expired(connected)=${r.timerExpiredConnected} timer-expired(trying)=${r.timerExpiredTrying} median-connect-ms pub=${r.pubMedianMs} sub=${r.subMedianMs} errors=${r.errors}`;
+  }
   const t = r.transport || r.subscriberTransport || null;
   let med = '-';
   if (r.inbound) med = `a${r.inbound.audioPackets}/v${r.inbound.videoPackets}`;

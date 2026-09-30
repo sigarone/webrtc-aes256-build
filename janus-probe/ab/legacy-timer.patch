@@ -1,0 +1,22 @@
+diff --git a/src/dtls.c b/src/dtls.c
+index d727c47..59ed31b 100644
+--- a/src/dtls.c
++++ b/src/dtls.c
+@@ -1176,15 +1176,8 @@ gboolean janus_dtls_retry(gpointer stack) {
+ 	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP))
+ 		goto stoptimer;
+ 	if(dtls->dtls_state == JANUS_DTLS_STATE_CONNECTED) {
+-		/* DTLS 1.3 (BoringSSL): the ACK of the peer's last flight, or our own
+-		 * final flight's retransmission, may still be pending after the
+-		 * handshake: keep servicing the timers for a few seconds */
+-		struct timeval pending = {0};
+-		if(DTLSv1_get_timeout(dtls->ssl, &pending) == 0 ||
+-				janus_get_monotonic_time() - dtls->dtls_connected >= 10*G_USEC_PER_SEC) {
+-			JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS already set up, disabling retransmission timer!\n", handle->handle_id);
+-			goto stoptimer;
+-		}
++		JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS already set up, disabling retransmission timer!\n", handle->handle_id);
++		goto stoptimer;
+ 	}
+ 	if(janus_get_monotonic_time() - dtls->dtls_started >= 20*G_USEC_PER_SEC) {
+ 		/* FIXME Should we really give up after 20 seconds waiting for DTLS? */

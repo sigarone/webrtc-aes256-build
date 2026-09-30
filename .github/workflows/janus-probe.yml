@@ -64,6 +64,9 @@ jobs:
         run: |
           janus-probe/scripts/build-janus.sh
 
+      - name: Build the A/B baseline (same patch, stock post-handshake DTLS timer)
+        run: VARIANT=legacy-timer janus-probe/scripts/build-janus.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
