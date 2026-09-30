@@ -1,0 +1,18 @@
+# Smoke-test WebSockets transport TEMPLATE: the client-facing API the browsers
+# use. Plain WebSocket on the loopback interface only (the production node puts a
+# TLS-terminating reverse proxy in front of it); libwebsockets has no TLS here.
+# Janus 1.4 ignores the URL path of the WebSocket handshake and selects the API by
+# the "janus-protocol" subprotocol, so ws://127.0.0.1:8188/janus and
+# ws://127.0.0.1:8188/ both work; the smoke test uses the first, like production.
+general: {
+	json = "compact"
+	events = false
+	ws = true
+	ws_port = 8188
+	ws_ip = "127.0.0.1"
+	wss = false
+}
+admin: {
+	admin_ws = false
+	admin_wss = false
+}

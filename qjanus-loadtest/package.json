@@ -1,0 +1,23 @@
+{
+  "name": "qjanus-loadtest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Load-test harness for the patched Janus VideoRoom SFU (qjanus): Playwright/Chromium bots, room admin helper, node sampler.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": {
+    "qjanus-load": "bin/qjanus-load.mjs",
+    "qjanus-admin": "bin/qjanus-admin.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\"",
+    "load": "node bin/qjanus-load.mjs",
+    "admin": "node bin/qjanus-admin.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0"
+  }
+}

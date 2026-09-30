@@ -1,0 +1,16 @@
+# Smoke-test HTTP transport TEMPLATE: the server-facing API used by the
+# room-admin helper (create, allowed, kick, destroy). Loopback only, no HTTPS,
+# no Admin API. Clients are told the base URL http://127.0.0.1:8088/janus.
+general: {
+	json = "compact"
+	events = false
+	base_path = "/janus"
+	http = true
+	port = 8088
+	ip = "127.0.0.1"
+	https = false
+}
+admin: {
+	admin_http = false
+	admin_https = false
+}

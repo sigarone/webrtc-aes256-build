@@ -1,0 +1,431 @@
+name: qjanus-loadtest
+
+# Load-test harness for the patched Janus VideoRoom SFU (qjanus): Playwright /
+# Chromium bots, room admin helper, node sampler. See qjanus-loadtest/README.md.
+#
+#   push to branch `qjanus-loadtest`  -> unit tests + shell checks + the local SMOKE run
+#   workflow_dispatch mode=smoke      -> the same
+#   workflow_dispatch mode=remote     -> the real load test against a running qjanus node,
+#                                        S parallel shards, then one merged report
+#
+# The smoke run builds a Janus like production (same pinned BoringSSL, libsrtp,
+# libnice, Janus v1.4.2 and DTLS 1.3 policy patch; libwebsockets without any TLS
+# library), starts it on the runner with fresh random secrets and drives it with the
+# real harness (see qjanus-loadtest/scripts/smoke.sh).
+#
+# SECRETS used by mode=remote (repository or environment secrets; this workflow
+# never creates or prints any of them, they are masked in logs):
+#   QJANUS_WS_URL           wss:// URL of the Janus WebSocket endpoint under test
+#   QJANUS_TOKEN_SECRET     the node's core token_auth_secret (HMAC key of the session tokens)
+#   QJANUS_LOADTEST_SEED    seed for the deterministic room / participant ids; the rooms
+#                           of that seed must already exist on the node (create them with
+#                           `qjanus-admin create-rooms` on the node: the Janus HTTP API is
+#                           node-local, so --manage-rooms is NOT used here)
+# The secret NAMES are workflow inputs (defaults above), so other targets can use
+# other secrets. WARNING: workflow inputs are visible in public run logs. Prefer
+# the WS URL secret over the target_ws_url input; if the secret is empty the input
+# is used, masked from then on, but it has already been shown in the run header.
+
+on:
+  push:
+    branches: [qjanus-loadtest]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'smoke = build Janus on the runner and test the harness against it; remote = load test a running qjanus'
+        type: choice
+        options: [smoke, remote]
+        default: smoke
+      target_ws_url:
+        description: 'WARNING: inputs are visible in public run logs. Prefer the secret named below. Used only when that secret is empty.'
+        type: string
+        default: ''
+      ws_url_secret_name:
+        description: 'Name of the secret holding the Janus WebSocket URL (wins over target_ws_url when non-empty)'
+        type: string
+        default: 'QJANUS_WS_URL'
+      token_secret_name:
+        description: 'Name of the secret holding the core token secret'
+        type: string
+        default: 'QJANUS_TOKEN_SECRET'
+      seed_secret_name:
+        description: 'Name of the secret holding the id seed'
+        type: string
+        default: 'QJANUS_LOADTEST_SEED'
+      scenario:
+        description: 'audio8 = rooms of 8 audio bots, video4 = 4 video bots, video8 = 8 video bots'
+        type: choice
+        options: [audio8, video4, video8]
+        default: audio8
+      run_mode:
+        description: 'run = fixed number of rooms, ramp = grow until a stop condition'
+        type: choice
+        options: [run, ramp]
+        default: ramp
+      rooms:
+        description: 'run mode: number of rooms (all shards together)'
+        type: string
+        default: '4'
+      ramp_start:
+        description: 'ramp mode: rooms in the first step'
+        type: string
+        default: '1'
+      ramp_step:
+        description: 'ramp mode: rooms added per step'
+        type: string
+        default: '1'
+      ramp_max:
+        description: 'ramp mode: last step (rooms)'
+        type: string
+        default: '20'
+      hold_sec:
+        description: 'Measurement window per step, seconds'
+        type: string
+        default: '60'
+      join_rate:
+        description: 'Bots started per second per shard'
+        type: string
+        default: '2'
+      video_profile:
+        description: 'spec = spec 4.4 simulcast, lite = 1/4 sizes for small machines, tiny = one 160x90 layer'
+        type: choice
+        options: [spec, lite, tiny]
+        default: spec
+      shards:
+        description: 'Number of parallel runner jobs (1-20); room k belongs to shard k mod S'
+        type: string
+        default: '1'
+      bots_per_browser:
+        description: 'Bots per Chromium process'
+        type: string
+        default: '16'
+      start_delay_sec:
+        description: 'Seconds from the plan job until all shards start their first step (runner startup must fit in)'
+        type: string
+        default: '240'
+
+permissions:
+  contents: read
+
+# A newer push replaces a running smoke; a manual remote run is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  # --------------------------------------------------------------------- unit
+  unit:
+    name: unit tests and shell checks
+    if: github.event_name == 'push' || inputs.mode != 'remote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: qjanus-loadtest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: qjanus-loadtest/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('qjanus-loadtest/package-lock.json') }}
+
+      # the browser loopback test drives a real Chromium
+      - name: Install Chromium and its system libraries
+        run: npx playwright install --with-deps chromium
+
+      - name: Node tests
+        run: npm test
+
+      - name: Sampler tests (fake /proc and /sys trees)
+        run: bash test/sampler.test.sh
+
+      - name: Shell scripts (syntax and shellcheck)
+        run: |
+          files=(scripts/*.sh test/sampler.test.sh)
+          for f in "${files[@]}"; do bash -n "$f"; done
+          command -v shellcheck >/dev/null || sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck -S warning -x "${files[@]}"
+
+  # -------------------------------------------------------------------- smoke
+  smoke:
+    name: smoke (local Janus build)
+    if: github.event_name == 'push' || inputs.mode == 'smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PREFIX: /opt/qjanus-loadtest
+      BSSL: /opt/boringssl
+      OUT: ${{ github.workspace }}/qjanus-loadtest/out/smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: apt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build meson pkg-config git curl binutils \
+            autoconf automake libtool gengetopt gettext \
+            libglib2.0-dev libjansson-dev libconfig-dev libmicrohttpd-dev \
+            libgnutls28-dev zlib1g-dev python3
+
+      - name: Prepare install dirs
+        run: |
+          sudo mkdir -p "$BSSL" "$PREFIX"
+          sudo chown -R "$USER" "$BSSL" "$PREFIX"
+
+      # BoringSSL, libsrtp, libnice, libwebsockets and the patched Janus, keyed by
+      # the build scripts (which hold every pinned commit) and the patches
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus-loadtest
+          key: qjanus-loadtest-build-${{ hashFiles('qjanus-loadtest/scripts/build-*.sh', 'qjanus-loadtest/smoke/patches/**') }}
+
+      - name: Build BoringSSL, libsrtp, libnice, libwebsockets (pinned)
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: bash qjanus-loadtest/scripts/build-deps.sh
+
+      - name: Build Janus v1.4.2 (DTLS 1.3 policy patch, no-TLS websockets patch)
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: bash qjanus-loadtest/scripts/build-janus.sh
+
+      - name: Save build cache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus-loadtest
+          key: qjanus-loadtest-build-${{ hashFiles('qjanus-loadtest/scripts/build-*.sh', 'qjanus-loadtest/smoke/patches/**') }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: qjanus-loadtest/package-lock.json
+
+      - name: Install dependencies
+        working-directory: qjanus-loadtest
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('qjanus-loadtest/package-lock.json') }}
+
+      - name: Install Chromium and its system libraries
+        working-directory: qjanus-loadtest
+        run: npx playwright install --with-deps chromium
+
+      # secrets are generated inside the script; nothing here is secret
+      - name: Run the smoke test
+        run: bash qjanus-loadtest/scripts/smoke.sh
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$OUT/SUMMARY.md" ]; then cat "$OUT/SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"; else echo 'No smoke summary was written.' >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload smoke output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qjanus-loadtest-smoke
+          path: qjanus-loadtest/out/smoke/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+  # --------------------------------------------------------------------- plan
+  plan:
+    name: plan shards
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'remote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      start_at: ${{ steps.plan.outputs.start_at }}
+    steps:
+      - id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+          START_DELAY_SEC: ${{ inputs.start_delay_sec }}
+        run: |
+          case "$SHARDS" in ''|*[!0-9]*) echo "::error::shards must be a whole number"; exit 1 ;; esac
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 20 ]; then echo "::error::shards must be between 1 and 20"; exit 1; fi
+          case "$START_DELAY_SEC" in ''|*[!0-9]*) echo "::error::start_delay_sec must be a whole number"; exit 1 ;; esac
+          matrix=$(jq -cn --argjson n "$SHARDS" '[range(0; $n)]')
+          start_at=$(( $(date +%s) + START_DELAY_SEC ))
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "start_at=$start_at" >> "$GITHUB_OUTPUT"
+          echo "shards: $matrix, all shards start their first step at epoch $start_at"
+
+  # -------------------------------------------------------------------- shard
+  shard:
+    name: shard ${{ matrix.shard }}
+    needs: plan
+    if: needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix || '[0]') }}
+    defaults:
+      run:
+        working-directory: qjanus-loadtest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: qjanus-loadtest/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('qjanus-loadtest/package-lock.json') }}
+
+      - name: Install Chromium and its system libraries
+        run: npx playwright install --with-deps chromium
+
+      # qjanus-load reads the three secrets from these environment variables and
+      # never prints or writes them; the summary carries only a hash of the URL.
+      - name: Run the load test (shard ${{ matrix.shard }} of ${{ inputs.shards }})
+        env:
+          QJANUS_TOKEN_SECRET: ${{ secrets[inputs.token_secret_name] }}
+          QJANUS_LOADTEST_SEED: ${{ secrets[inputs.seed_secret_name] }}
+          WS_URL_SECRET: ${{ secrets[inputs.ws_url_secret_name] }}
+          WS_URL_INPUT: ${{ inputs.target_ws_url }}
+          WS_URL_SECRET_NAME: ${{ inputs.ws_url_secret_name }}
+          TOKEN_SECRET_NAME: ${{ inputs.token_secret_name }}
+          SEED_SECRET_NAME: ${{ inputs.seed_secret_name }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          START_AT: ${{ needs.plan.outputs.start_at }}
+          RUN_ID: remote-${{ github.run_id }}-${{ github.run_attempt }}
+          SCENARIO: ${{ inputs.scenario }}
+          RUN_MODE: ${{ inputs.run_mode }}
+          ROOMS: ${{ inputs.rooms }}
+          RAMP_START: ${{ inputs.ramp_start }}
+          RAMP_STEP: ${{ inputs.ramp_step }}
+          RAMP_MAX: ${{ inputs.ramp_max }}
+          HOLD_SEC: ${{ inputs.hold_sec }}
+          JOIN_RATE: ${{ inputs.join_rate }}
+          VIDEO_PROFILE: ${{ inputs.video_profile }}
+          BOTS_PER_BROWSER: ${{ inputs.bots_per_browser }}
+        run: |
+          set -euo pipefail
+          # the Janus URL: the secret wins, the input is the (public-log) fallback
+          if [ -n "$WS_URL_SECRET" ]; then
+            export QJANUS_WS_URL=$WS_URL_SECRET
+          elif [ -n "$WS_URL_INPUT" ]; then
+            echo "::add-mask::$WS_URL_INPUT"
+            echo "::warning::The Janus URL was taken from the target_ws_url input, which is visible in the public run log. Store it in the secret '$WS_URL_SECRET_NAME' instead."
+            export QJANUS_WS_URL=$WS_URL_INPUT
+          else
+            echo "::error::No Janus URL: the secret '$WS_URL_SECRET_NAME' is empty or missing and target_ws_url is empty."
+            exit 1
+          fi
+          missing=0
+          if [ -z "$QJANUS_TOKEN_SECRET" ]; then echo "::error::The secret '$TOKEN_SECRET_NAME' (core token secret) is empty or missing."; missing=1; fi
+          if [ -z "$QJANUS_LOADTEST_SEED" ]; then echo "::error::The secret '$SEED_SECRET_NAME' (id seed) is empty or missing."; missing=1; fi
+          [ "$missing" = 0 ] || exit 1
+
+          # every value is passed as its own quoted argument; qjanus-load validates it
+          args=("$RUN_MODE" --scenario "$SCENARIO" --shard "$SHARD/$SHARDS" --start-at "$START_AT"
+                --hold-sec "$HOLD_SEC" --join-rate "$JOIN_RATE" --video-profile "$VIDEO_PROFILE"
+                --bots-per-browser "$BOTS_PER_BROWSER" --run-id "$RUN_ID" --out "out/shard-$SHARD"
+                --expect-transport strict)
+          if [ "$RUN_MODE" = run ]; then
+            args+=(--rooms "$ROOMS")
+          else
+            args+=(--ramp-start "$RAMP_START" --ramp-step "$RAMP_STEP" --ramp-max "$RAMP_MAX")
+          fi
+          # No --manage-rooms: the Janus HTTP API is node-local, the rooms must exist already.
+          node bin/qjanus-load.mjs "${args[@]}"
+
+      - name: Upload shard output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: qjanus-loadtest/out/shard-${{ matrix.shard }}/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # ------------------------------------------------------------------- report
+  report:
+    name: merged report
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: qjanus-loadtest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: qjanus-loadtest/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # one sub directory per shard artifact: shards/shard-0, shards/shard-1, ...
+      - name: Download all shard outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: qjanus-loadtest/shards
+
+      - name: Merge the shards
+        run: |
+          args=()
+          for d in shards/shard-*/; do args+=(--in "${d%/}"); done
+          if [ "${#args[@]}" -eq 0 ]; then echo "::error::no shard output was uploaded"; exit 1; fi
+          node bin/qjanus-load.mjs report "${args[@]}" --out out/report
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f out/report/report.md ]; then cat out/report/report.md >> "$GITHUB_STEP_SUMMARY"; else echo 'No report was produced.' >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: |
+            qjanus-loadtest/out/report/report.md
+            qjanus-loadtest/out/report/report.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 90

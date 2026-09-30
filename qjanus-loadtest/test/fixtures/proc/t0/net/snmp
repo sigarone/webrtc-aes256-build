@@ -1,0 +1,8 @@
+Ip: Forwarding DefaultTTL InReceives
+Ip: 1 64 12345
+Icmp: InMsgs InErrors
+Icmp: 10 0
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 1000000 5 2 900000 1 0 0 3 0
+UdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+UdpLite: 0 0 0 0 0 0 0 0 0

@@ -1,0 +1,13 @@
+# Smoke-test VideoRoom configuration TEMPLATE (see janus.jcfg.tmpl).
+# Rooms are NEVER configured here: they are created and destroyed through the
+# HTTP transport (create with admin_key + a per-room secret), like in production.
+#   ADMIN_KEY  (between at-signs, below) is the random plugin admin key of this run
+general: {
+	# only requests carrying this key can create rooms (and use rtp_forward)
+	admin_key = "@ADMIN_KEY@"
+	lock_rtp_forward = true
+	# no event handlers exist in this build
+	events = false
+	# room ids and participant ids (the per-call pseudonyms) are strings
+	string_ids = true
+}

@@ -1,0 +1,10 @@
+Name:	janus
+Umask:	0022
+State:	S (sleeping)
+Tgid:	4242
+Pid:	4242
+VmPeak:	  400000 kB
+VmSize:	  390000 kB
+VmRSS:	  262144 kB
+RssAnon:	  190000 kB
+Threads:	31
