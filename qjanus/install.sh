@@ -177,9 +177,9 @@ if [ -f "$SELF/apt-deps.txt" ]; then
   if [ -n "$missing" ]; then
     if [ "$INSTALL_DEPS" = 1 ]; then
       log "installing runtime packages:$missing"
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq >&2
       # shellcheck disable=SC2086
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $missing >&2
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq --no-install-recommends $missing >&2
     else
       die "missing runtime packages:$missing   (re-run with --install-deps, or: apt-get install$missing)"
     fi

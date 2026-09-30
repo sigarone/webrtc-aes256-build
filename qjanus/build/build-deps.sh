@@ -92,13 +92,17 @@ ninja -C build install
 fetch_pinned https://github.com/warmcat/libwebsockets.git "$LWS_SHA" "$SRC/libwebsockets"
 echo "libwebsockets $LWS_TAG $LWS_SHA" >> "$VERS"
 cd "$SRC/libwebsockets"
+# LWS_IPV6 is the real option (it defines LWS_WITH_IPV6, which the Janus WebSockets transport checks; the socket is
+# bound to 127.0.0.1 only, but the transport warns about a build without it). CMAKE_POLICY_VERSION_MINIMUM lets this
+# tag's old cmake_minimum_required configure with CMake >= 4, so that a newer runner image cannot break the pinned build.
 cmake -GNinja -B build -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_LIBDIR=lib \
   -DLWS_WITH_SSL=OFF -DLWS_WITH_SHARED=ON -DLWS_WITH_STATIC=OFF \
   -DLWS_WITHOUT_TESTAPPS=ON -DLWS_WITHOUT_TEST_SERVER=ON -DLWS_WITHOUT_TEST_SERVER_EXTPOLL=ON \
   -DLWS_WITHOUT_TEST_PING=ON -DLWS_WITHOUT_TEST_CLIENT=ON -DLWS_WITH_MINIMAL_EXAMPLES=OFF \
   -DLWS_WITH_LIBUV=OFF -DLWS_WITH_LIBEVENT=OFF -DLWS_WITH_LIBEV=OFF -DLWS_WITH_GLIB=OFF \
-  -DLWS_WITH_ZLIB=OFF -DLWS_WITH_HTTP2=OFF -DLWS_WITH_IPV6=ON -DDISABLE_WERROR=ON
+  -DLWS_WITH_ZLIB=OFF -DLWS_WITH_HTTP2=OFF -DLWS_IPV6=ON -DDISABLE_WERROR=ON \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 ninja -C build install
 ls -l "$PREFIX/lib" | grep -i websockets
 

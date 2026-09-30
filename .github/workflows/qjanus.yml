@@ -222,6 +222,7 @@ jobs:
         run: sha256sum -c SHA256SUMS
 
       - name: Install like a node does (install.sh, systemd unit, DTLS key generated here)
+        timeout-minutes: 10
         id: install
         run: |
           set -euo pipefail
@@ -238,6 +239,7 @@ jobs:
           sudo journalctl -u qjanus -o cat --no-pager | head -60
 
       - name: install.sh is idempotent (same fingerprint and secrets, no restart when nothing changed)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           env_before=$(sudo sha256sum /etc/qjanus/qjanus.env | cut -d' ' -f1)
@@ -274,6 +276,7 @@ jobs:
           systemd-analyze security --no-pager qjanus.service | tail -25 || true
 
       - name: The sandbox and the limits are in effect (what systemd applies and what the process sees, not what the unit says)
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           PID=$(systemctl show -p MainPID --value qjanus)
@@ -352,6 +355,7 @@ jobs:
           sudo bash qjanus/test/e2e/netem.sh off
 
       - name: API conformance (server calls of spec section 3 over HTTP, client calls over WebSockets)
+        timeout-minutes: 10
         working-directory: qjanus/test/conformance
         run: |
           set -euo pipefail
@@ -361,11 +365,13 @@ jobs:
           OUT_DIR="$OUT_DIR/conformance" SECRETS_FILE="$RUNNER_TEMP/secrets-conformance.json" node conformance.mjs 2>&1 | tee "$OUT_DIR/conformance.log"
 
       - name: Caddy in front of the WebSocket API (qjanus/conf/Caddyfile.example, the block the README tells to add)
+        timeout-minutes: 10
         env:
           QJANUS_FINGERPRINT: ${{ steps.install.outputs.fp }}
         run: bash qjanus/test/caddy-check.sh
 
       - name: E2E - Chromium (PQC trial) group calls with E2EE frames, simulcast, netem loss/reorder, refused peers
+        timeout-minutes: 30
         working-directory: qjanus/test/e2e
         run: |
           set -euo pipefail
@@ -396,6 +402,7 @@ jobs:
           sudo ss -Hltnp | grep janus | awk '{print $4}' | sort
 
       - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README), and every way an install can go wrong
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           trap 'rc=$?; echo "::error::lifecycle step failed (exit $rc) at: $BASH_COMMAND"; sudo journalctl -u qjanus -n 40 --no-pager -o cat || true' ERR
