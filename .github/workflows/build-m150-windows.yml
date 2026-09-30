@@ -18,9 +18,9 @@ name: build-webrtc-windows-m150-hardened
 #                                            dispatch with publish=true and
 #                                            only when build AND test are green
 #
-# The push trigger below (branch feat/m150-windows only) exists because a
-# new workflow cannot be dispatched before it reaches the default branch; it
-# runs precheck + build + test and never publishes. Remove it when merging.
+# No cache on purpose: the pinned checkout (gclient src + toolchains) is tens
+# of GB, far above the 10 GB per-repo Actions cache limit, so sync (~17 min)
+# runs every time.
 #
 # All dispatch inputs reach the shell ONLY via env (never interpolated into
 # a run: block) and are charset-validated in `precheck` first.
@@ -41,11 +41,6 @@ on:
         description: "publish the release when build, gates and tests are green"
         type: boolean
         default: true
-  push:
-    branches: [feat/m150-windows]
-    paths:
-      - '.github/workflows/build-m150-windows.yml'
-      - 'm150/**'
 
 env:
   IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref || 'ba469aa2093b-qaudion-m150' }}
