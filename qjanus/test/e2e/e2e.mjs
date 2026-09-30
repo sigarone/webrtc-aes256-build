@@ -175,7 +175,7 @@ class Peer {
     await evalIn(this, ([k, i]) => window.q.setSendKey(k, i), [this.key, this.keyIndex]);
     const offer = await evalIn(this, ([i, o]) => window.q.newPublisher(i, o), [this.pubPc, { e2ee: true, simulcast: this.simulcast, ...(this.video || {}) }]);
     const m = await this.c.message(this.pubHandle, { request: 'publish', audio: true, video: true, descriptions: [{ mid: '0', description: 'mic' }, { mid: '1', description: 'camera' }] },
-      { type: 'offer', sdp: offer, e2ee: true });
+      { type: 'offer', sdp: offer, e2ee: true, ...(this.simulcast ? { rid_order: 'lmh' } : {}) });
     assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 300));
     assert.equal(m.jsep.type, 'answer');
     this.pubAnswer = m.jsep.sdp;
@@ -356,7 +356,7 @@ try {
       assert.ok(c.subMidMap && Object.keys(c.subMidMap).length === 4, 'C subscribes to 2 streams of each of 2 publishers');
     });
 
-    await check('simulcast: the publisher sends 3 layers of 320/640/1280 px, the subscriber selects each substream (0 < 1 < 2) and gets exactly that size, with E2EE frames', async () => {
+    await check('simulcast: the publisher sends 3 layers (rid_order lmh), the subscriber selects each substream (0 < 1 < 2) and gets exactly that layer, with E2EE frames', async () => {
       const [A, B] = peers;
       let out = {}; let layers = [];
       for (let i = 0; i < 20; i++) {
@@ -365,7 +365,8 @@ try {
         if (out.l > 0 && out.m > 0 && out.h > 0) break;
         await sleep(500);
       }
-      const diag = JSON.stringify(layers.map((x) => ({ rid: x.rid, w: x.frameWidth, h: x.frameHeight, frames: x.framesEncoded, pkts: x.packetsSent, kbps: Math.round((x.targetBitrate || 0) / 1000), limit: x.qualityLimitationReason })));
+      const cap = await evalIn(B, (i) => window.q.captureSettings(i), B.pubPc);
+      const diag = JSON.stringify({ capture: cap, layers: layers.map((x) => ({ rid: x.rid, w: x.frameWidth, h: x.frameHeight, frames: x.framesEncoded, pkts: x.packetsSent, kbps: Math.round((x.targetBitrate || 0) / 1000), limit: x.qualityLimitationReason })) });
       assert.deepEqual(layers.filter((x) => x.packetsSent > 0).map((x) => x.rid).sort(), ['h', 'l', 'm'], `B sends all three simulcast layers: ${diag}`);
       assert.ok(out.l > 0 && out.l < out.m && out.m < out.h, `three distinct layer sizes: ${diag}`);
       const vs = (await A.stats(A.subPc)).inbound.find((x) => x.kind === 'video' && A.subMidMap[x.mid] === B.id);

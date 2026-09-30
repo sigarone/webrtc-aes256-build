@@ -104,12 +104,15 @@ window.q = {
   // spec 4.2: FrameCryptors (here: transforms) on every sender BEFORE the offer is created
   async newPublisher(id, opts) {
     const rec = newPc(id, 'publisher', opts);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: opts.width || 640, height: opts.height || 360, frameRate: 25 } });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: opts.width || 640 }, height: { ideal: opts.height || 360 }, frameRate: { ideal: 25 } } });
+    rec.capture = stream.getVideoTracks()[0].getSettings();
     const ta = rec.pc.addTransceiver(stream.getAudioTracks()[0], { direction: 'sendonly', streams: [stream] });
+    // ascending quality l, m, h (libwebrtc's native order; the JSEP must then say rid_order "lmh": Janus assumes
+    // the RIDs of the SDP are listed highest first unless told otherwise)
     const encs = opts.simulcast ? [
-      { rid: 'h', maxBitrate: 1200000, maxFramerate: 25 },
-      { rid: 'm', scaleResolutionDownBy: 2, maxBitrate: 450000, maxFramerate: 20 },
       { rid: 'l', scaleResolutionDownBy: 4, maxBitrate: 150000, maxFramerate: 15 },
+      { rid: 'm', scaleResolutionDownBy: 2, maxBitrate: 450000, maxFramerate: 20 },
+      { rid: 'h', maxBitrate: 1200000, maxFramerate: 25 },
     ] : null;
     const tv = rec.pc.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly', streams: [stream], ...(encs ? { sendEncodings: encs } : {}) });
     if (opts.e2ee) { applyTransform(ta.sender, 'audio', 'sender'); applyTransform(tv.sender, 'video', 'sender'); }
@@ -118,6 +121,7 @@ window.q = {
     await gatherComplete(rec.pc);
     return noTrickle(rec.pc.localDescription.sdp);
   },
+  captureSettings(id) { const c = pcs[id] && pcs[id].capture; return c ? { w: c.width, h: c.height, fps: c.frameRate } : null; },
   async setAnswer(id, sdp) { await pcs[id].pc.setRemoteDescription({ type: 'answer', sdp }); },
 
   // the sender key (index = epoch mod 16) and receiver keys (per remote participant) of section 5
