@@ -1,0 +1,214 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>qjanus-e2e</title>
+<script>
+'use strict';
+// The RTCPeerConnection side of a group call participant (GROUP_CALLS_V2 section 4): a publisher PC
+// (send-only) and a multistream subscriber PC (receive-only), E2EE frame crypto in a worker,
+// the SDP rules of section 4.4 and the transport self-check of section 4.5. Signalling lives in Node.
+const pcs = {};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const hasScriptTransform = typeof RTCRtpScriptTransform !== 'undefined';
+const worker = new Worker('/worker.js');
+const acks = new Map();
+let msgId = 0;
+let statsWaiter = null;
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'ack') { const r = acks.get(m.id); if (r) { acks.delete(m.id); r(); } }
+  else if (m.type === 'stats' && statsWaiter) statsWaiter(m.counters);
+};
+const post = (m) => new Promise((resolve) => { const id = ++msgId; acks.set(id, resolve); worker.postMessage({ ...m, id }); });
+
+// ------------------------------------------------------------------ SDP rules (section 4.4)
+const REMOVED_EXTMAPS = [
+  'urn:ietf:params:rtp-hdrext:ssrc-audio-level',
+  'http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time',
+  'urn:3gpp:video-orientation',
+];
+const OPUS_FMTP = 'minptime=60;useinbandfec=1;usedtx=0;cbr=1;stereo=0;maxaveragebitrate=32000';
+function stripExtmaps(sdp) {
+  return sdp.split('\r\n').filter((l) => !(l.startsWith('a=extmap:') && REMOVED_EXTMAPS.some((u) => l.includes(u)))).join('\r\n');
+}
+function opusProfile(sdp) {
+  const lines = sdp.split('\r\n');
+  const out = [];
+  let section = [];
+  const flush = () => {
+    const rtpmap = section.find((l) => /^a=rtpmap:\d+ opus\/48000/i.test(l));
+    if (!rtpmap) { out.push(...section); section = []; return; }
+    const pt = /^a=rtpmap:(\d+) /.exec(rtpmap)[1];
+    let hasFmtp = false; let hasPtime = false;
+    const res = [];
+    for (const l of section) {
+      if (l.startsWith(`a=fmtp:${pt} `)) { res.push(`a=fmtp:${pt} ${OPUS_FMTP}`); hasFmtp = true; }
+      else if (l.startsWith('a=ptime:')) { res.push('a=ptime:60'); hasPtime = true; }
+      else res.push(l);
+      if (l === rtpmap) {
+        if (!hasFmtp && !section.some((x) => x.startsWith(`a=fmtp:${pt} `))) { res.push(`a=fmtp:${pt} ${OPUS_FMTP}`); hasFmtp = true; }
+      }
+    }
+    if (!hasPtime) res.push('a=ptime:60');
+    out.push(...res);
+    section = [];
+  };
+  for (const l of lines) {
+    if (l.startsWith('m=')) { flush(); }
+    section.push(l);
+  }
+  flush();
+  return out.join('\r\n');
+}
+const munge = (sdp) => opusProfile(stripExtmaps(sdp));
+const withSetup = (sdp, role) => (role ? sdp.replace(/a=setup:\w+/g, `a=setup:${role}`) : sdp);
+const noTrickle = (sdp) => sdp.replace(/a=ice-options:trickle\r\n/g, '');
+async function gatherComplete(pc, ms = 8000) {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); } });
+  });
+}
+
+// ------------------------------------------------------------------------------ helpers
+async function syntheticCamera(w, h, fps) {
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const g = canvas.getContext('2d');
+  let n = 0;
+  const draw = () => {
+    n++;
+    g.fillStyle = `hsl(${(n * 3) % 360},60%,40%)`; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 48; i++) {          // moving texture: the encoder has real work to do
+      g.fillStyle = `hsl(${(n * 2 + i * 9) % 360},80%,${25 + (i % 30)}%)`;
+      g.fillRect((i * 97 + n * 13) % (w - 80), (i * 53 + n * 7) % (h - 80), 80, 80);
+    }
+    g.fillStyle = '#fff'; g.font = '72px monospace'; g.fillText(String(n), 40, 110);
+  };
+  draw();
+  setInterval(draw, Math.round(1000 / fps));
+  const video = canvas.captureStream(fps).getVideoTracks()[0];
+  const audio = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0];
+  return new MediaStream([audio, video]);
+}
+function applyTransform(rtpObj, kind, role, participant) {
+  if (hasScriptTransform) {
+    rtpObj.transform = new RTCRtpScriptTransform(worker, { kind, role, participant });
+  } else {
+    const s = rtpObj.createEncodedStreams();
+    worker.postMessage({ readable: s.readable, writable: s.writable, options: { kind, role, participant } }, [s.readable, s.writable]);
+  }
+}
+function newPc(id, role, opts) {
+  const cfg = { iceServers: [], bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
+  if (opts.e2ee && !hasScriptTransform) cfg.encodedInsertableStreams = true;
+  const pc = new RTCPeerConnection(cfg);
+  const rec = { pc, role, opts, midMap: {}, timeline: [] };
+  const push = (what) => rec.timeline.push({ t: Math.round(performance.now()), what });
+  pc.addEventListener('connectionstatechange', () => push('connection:' + pc.connectionState));
+  pc.addEventListener('iceconnectionstatechange', () => push('ice:' + pc.iceConnectionState));
+  pcs[id] = rec;
+  return rec;
+}
+const SCRUB = (s) => {
+  const o = {};
+  for (const [k, v] of Object.entries(s)) {
+    if (typeof v !== 'object' && !/Id$/.test(k) && k !== 'id' && k !== 'timestamp' && !/[Cc]ertificate/.test(k)) o[k] = v;
+  }
+  return o;
+};
+
+window.q = {
+  info() { return { ua: navigator.userAgent, scriptTransform: hasScriptTransform }; },
+
+  // spec 4.2: FrameCryptors (here: transforms) on every sender BEFORE the offer is created
+  async newPublisher(id, opts) {
+    const rec = newPc(id, 'publisher', opts);
+    // Chromium's fake camera delivers 640x480 whatever is asked: a 3 layer simulcast (l/m/h = 1/4, 1/2, 1) needs
+    // a 720p source (libwebrtc drops simulcast layers of small sources), so those peers draw their own camera
+    const stream = (opts.width || 0) >= 1280 ? await syntheticCamera(opts.width, opts.height || 720, 25)
+      : await navigator.mediaDevices.getUserMedia({ audio: true, video: { width: { ideal: opts.width || 640 }, height: { ideal: opts.height || 360 }, frameRate: { ideal: 25 } } });
+    rec.capture = stream.getVideoTracks()[0].getSettings();
+    const ta = rec.pc.addTransceiver(stream.getAudioTracks()[0], { direction: 'sendonly', streams: [stream] });
+    // ascending quality l, m, h (libwebrtc's native order; the JSEP must then say rid_order "lmh": Janus assumes
+    // the RIDs of the SDP are listed highest first unless told otherwise)
+    const encs = opts.simulcast ? [
+      { rid: 'l', scaleResolutionDownBy: 4, maxBitrate: 150000, maxFramerate: 15 },
+      { rid: 'm', scaleResolutionDownBy: 2, maxBitrate: 450000, maxFramerate: 20 },
+      { rid: 'h', maxBitrate: 1200000, maxFramerate: 25 },
+    ] : null;
+    const tv = rec.pc.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly', streams: [stream], ...(encs ? { sendEncodings: encs } : {}) });
+    if (opts.e2ee) { applyTransform(ta.sender, 'audio', 'sender'); applyTransform(tv.sender, 'video', 'sender'); }
+    const offer = await rec.pc.createOffer();
+    await rec.pc.setLocalDescription({ type: 'offer', sdp: opts.noMunge ? offer.sdp : munge(offer.sdp) });
+    await gatherComplete(rec.pc);
+    return noTrickle(rec.pc.localDescription.sdp);
+  },
+  captureSettings(id) { const c = pcs[id] && pcs[id].capture; return c ? { w: c.width, h: c.height, fps: c.frameRate } : null; },
+  async setAnswer(id, sdp) { await pcs[id].pc.setRemoteDescription({ type: 'answer', sdp }); },
+
+  // the sender key (index = epoch mod 16) and receiver keys (per remote participant) of section 5
+  async setSendKey(keyHex, index) { await post({ type: 'sendKey', keyHex, index }); },
+  async setRecvKey(participant, index, keyHex) { await post({ type: 'recvKey', participant, index, keyHex }); },
+
+  // spec 4.3: Janus sends the offer, the client answers; the answer applies the same extmap removals.
+  // midMap: subscriber mid -> publisher pseudonym, so that every remote track gets its FrameCryptor
+  // (participantId = pseudonym) BEFORE it is rendered.
+  async answer(id, offerSdp, midMap, opts) {
+    let rec = pcs[id];
+    if (!rec) {
+      rec = newPc(id, 'subscriber', opts || {});
+      rec.pc.addEventListener('track', (e) => {
+        const mid = e.transceiver.mid;
+        const participant = rec.midMap[mid];
+        if (rec.opts.e2ee) applyTransform(e.receiver, e.track.kind, 'receiver', participant);
+        const el = document.createElement(e.track.kind === 'video' ? 'video' : 'audio');
+        el.muted = true; el.autoplay = true; el.playsInline = true;
+        el.srcObject = new MediaStream([e.track]);
+        document.body.appendChild(el);
+        el.play().catch(() => {});
+      });
+    }
+    Object.assign(rec.midMap, midMap || {});
+    await rec.pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const ans = await rec.pc.createAnswer();
+    await rec.pc.setLocalDescription({ type: 'answer', sdp: withSetup(opts && opts.noMunge ? ans.sdp : stripExtmaps(ans.sdp), (opts && opts.setup) || null) });
+    await gatherComplete(rec.pc);
+    return noTrickle(rec.pc.localDescription.sdp);
+  },
+  async addCandidate(id, cand) {
+    try { await pcs[id].pc.addIceCandidate(cand && !cand.completed ? cand : null); } catch (e) { /* late or duplicate */ }
+  },
+  state(id) {
+    const r = pcs[id];
+    return r ? { connection: r.pc.connectionState, ice: r.pc.iceConnectionState, timeline: r.timeline, signaling: r.pc.signalingState } : null;
+  },
+  // spec 4.5: transport self-check values
+  async transport(id) {
+    const rep = await pcs[id].pc.getStats();
+    let t = null;
+    rep.forEach((s) => { if (s.type === 'transport' && !t) t = SCRUB(s); });
+    return t;
+  },
+  // per mid statistics of the receivers / the senders
+  async stats(id) {
+    const rec = pcs[id];
+    const out = { inbound: [], outbound: [] };
+    for (const tr of rec.pc.getTransceivers()) {
+      const mid = tr.mid;
+      if (rec.role === 'subscriber') {
+        const rep = await tr.receiver.getStats();
+        rep.forEach((s) => { if (s.type === 'inbound-rtp') out.inbound.push({ mid, ...SCRUB(s) }); });
+      } else {
+        const rep = await tr.sender.getStats();
+        rep.forEach((s) => { if (s.type === 'outbound-rtp') out.outbound.push({ mid, ...SCRUB(s) }); });
+      }
+    }
+    return out;
+  },
+  async workerStats() {
+    return new Promise((resolve) => { statsWaiter = resolve; worker.postMessage({ type: 'stats' }); setTimeout(() => resolve(null), 3000); });
+  },
+  close(id) { try { pcs[id].pc.close(); } catch (e) { /* closed */ } },
+};
+</script>

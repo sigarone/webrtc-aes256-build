@@ -1,0 +1,683 @@
+name: qjanus
+
+# Builds qjanus, the patched Janus VideoRoom SFU of the Q-Audion group calls v2
+# (qjanus/, spec GROUP_CALLS_V2 section 6): Janus v1.4.2 + BoringSSL f91f1447 (the
+# commit the hardened WebRTC M150 builds pin) + libsrtp 2.8.1 on the BoringSSL backend +
+# libnice 0.1.24 + libwebsockets, only VideoRoom + HTTP + WebSockets, DTLS 1.3 /
+# X25519MLKEM768 / TLS_AES_256_GCM_SHA384 / SRTP AEAD_AES_256_GCM only (fail closed).
+#
+#   precheck   (contents: read)     - validate the release tag input, refuse if it exists
+#   build      (contents: read)     - deps (cached), Janus, unit tests, relocatable tarball
+#   clean-install (contents: read)  - the tarball on a CLEAN ubuntu:24.04 container: apt-deps.txt
+#                                     is complete, relocation works, no system libssl, module set
+#   integration (contents: read)    - the tarball installed with install.sh under systemd (the
+#                                     real unit + sandbox), API conformance over HTTP+WebSockets,
+#                                     Chromium (PQC) publisher/subscriber with E2EE frames,
+#                                     simulcast, netem loss/reorder, negative peers refused, and the
+#                                     ICE candidates of every SDP (only the enforced interface, with
+#                                     decoy VPN/private interfaces on the host that must never show up)
+#   release    (contents: write, id-token, attestations) - only on workflow_dispatch with a
+#                                     release_tag: SHA256SUMS re-verified, attested, published
+#
+# Every input reaches the shell only through env. PUBLIC REPO: nothing private may land here.
+
+on:
+  push:
+    branches: [feat/group-calls-v2, main]
+    paths:
+      - 'qjanus/**'
+      - '.github/workflows/qjanus.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "publish a GitHub release with this tag (qjanus-<version>, must not exist yet); empty = build and test only"
+        required: false
+        default: ""
+
+env:
+  IN_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  # per event type: an incidental push to the branch must never cancel a release run in progress
+  group: qjanus-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  precheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      release: ${{ steps.id.outputs.release }}
+    steps:
+      - name: Validate the release tag input (charset allow-list, fail closed) and compute the build id
+        id: id
+        run: |
+          set -euo pipefail
+          if [ -n "$IN_RELEASE_TAG" ]; then
+            printf %s "$IN_RELEASE_TAG" | grep -Eq '^qjanus-[0-9A-Za-z][0-9A-Za-z._-]{0,40}$' \
+              || { echo "::error::release_tag must look like qjanus-<version> ([0-9A-Za-z._-])"; exit 1; }
+            echo "build_id=${IN_RELEASE_TAG#qjanus-}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_id=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse if the release or git tag already exists (never overwrite a shipped asset)
+        if: ${{ github.event.inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release '$IN_RELEASE_TAG' already exists - use a new release_tag"; exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$IN_RELEASE_TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$IN_RELEASE_TAG' already exists - use a new release_tag"; exit 1
+          fi
+
+  build:
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      BSSL: /opt/boringssl
+      PREFIX: /opt/qjanus
+      SRC: /home/runner/qjanus-src
+      OUT: ${{ github.workspace }}/qjanus-out
+      BUILD_ID: ${{ needs.precheck.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Unit tests - ICE interface selection (fake ip + sysfs) and the ICE candidate helpers
+        run: |
+          set -euo pipefail
+          bash qjanus/test/ice-iface.sh
+          node --test qjanus/test/lib/ice.test.mjs
+          bash -n qjanus/install.sh && bash -n qjanus/libexec/qjanus-lib.sh && bash -n qjanus/libexec/qjanus-render-config && bash -n qjanus/libexec/qjanus-wait-ready && bash -n qjanus/test/ice-iface.sh
+          python3 -m py_compile qjanus/test/node-ice-check.py
+
+      - name: apt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build meson pkg-config git curl ca-certificates \
+            autoconf automake libtool gengetopt gettext patchelf python3 \
+            libglib2.0-dev libjansson-dev libconfig-dev libmicrohttpd-dev libgnutls28-dev zlib1g-dev
+
+      - name: Prepare install dirs
+        run: |
+          sudo mkdir -p "$BSSL" "$PREFIX"
+          sudo chown -R "$USER" "$BSSL" "$PREFIX"
+
+      # A release is built from the pinned sources only: a cache entry is not verified against anything
+      - name: Restore the dependency cache (BoringSSL, libsrtp, libnice, libwebsockets) - never for a release
+        id: deps-cache
+        if: ${{ needs.precheck.outputs.release != 'true' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus
+          key: qjanus-deps-${{ hashFiles('qjanus/build/build-deps.sh', 'qjanus/build/pins.env') }}
+
+      - name: Build the dependencies from the pinned sources
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: qjanus/build/build-deps.sh
+
+      - name: Save the dependency cache
+        if: ${{ needs.precheck.outputs.release != 'true' && steps.deps-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus
+          key: qjanus-deps-${{ hashFiles('qjanus/build/build-deps.sh', 'qjanus/build/pins.env') }}
+
+      - name: Build Janus (patched, VideoRoom + HTTP + WebSockets only)
+        run: qjanus/build/build-janus.sh
+
+      - name: Unit test - log scrubber (ASan + UBSan)
+        run: |
+          set -euo pipefail
+          cc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I"$SRC/janus/src" qjanus/test/log-scrub/test_scrub.c -o "$RUNNER_TEMP/test_scrub"
+          "$RUNNER_TEMP/test_scrub"
+
+      - name: Package the relocatable tarball
+        run: qjanus/build/package.sh
+
+      - name: Upload the tarball, SHA256SUMS and BUILDINFO.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-tarball
+          path: |
+            qjanus-out/qjanus-*.tar.gz
+            qjanus-out/SHA256SUMS
+            qjanus-out/BUILDINFO.json
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-build-logs
+          path: |
+            /opt/qjanus/versions.txt
+            /opt/qjanus/janus-configure.log
+            /opt/qjanus/janus-modules.txt
+            qjanus-out/janus-version.txt
+            qjanus-out/apt-deps.raw
+          if-no-files-found: warn
+          retention-days: 30
+
+  clean-install:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: The tarball on a clean ubuntu:24.04 (apt-deps.txt only, relocated, no system libssl)
+        run: |
+          set -euo pipefail
+          tb=$(ls out/qjanus-*.tar.gz)
+          docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out:ro" ubuntu:24.04 \
+            bash /repo/qjanus/build/check-tarball.sh "/out/$(basename "$tb")" /repo/qjanus/build
+
+  integration:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      OUT_DIR: ${{ github.workspace }}/integration-out
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      # Interfaces that carry private addresses next to the runner's own: a VPN (tailscale0, qvpn0) and two
+      # other private networks (lan0, corp0). Janus v1.4.2 would offer their addresses as ICE candidates unless
+      # the enforce list (QJANUS_ICE_ENFORCE_IFACE) restricts it to one interface. Two of the names are on the
+      # ignore list, two are not: the enforce list, not the list of names, is what has to keep them out.
+      - name: Decoy interfaces with private addresses (never to be offered as ICE candidates)
+        run: |
+          set -euo pipefail
+          sudo modprobe dummy 2> /dev/null || sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" > /dev/null 2>&1 || true
+          sudo modprobe dummy 2> /dev/null || true
+          decoy() {   # name address/len: a dummy interface, or a veth pair when the dummy driver is not there
+            if sudo ip link add "$1" type dummy 2> /dev/null; then :
+            else sudo ip link add "$1" type veth peer name "${1}p"; sudo ip link set "${1}p" up; fi
+            sudo ip addr add "$2" dev "$1"
+            sudo ip link set "$1" up
+          }
+          decoy tailscale0 100.101.102.103/32
+          decoy qvpn0 10.66.6.1/24
+          decoy lan0 172.20.9.1/24
+          decoy corp0 192.168.77.1/24
+          ip -br addr
+          echo "QJANUS_DECOYS=100.101.102.103,10.66.6.1,172.20.9.1,192.168.77.1" >> "$GITHUB_ENV"
+
+      - name: Install like a node does (install.sh, systemd unit, DTLS key generated here)
+        timeout-minutes: 10
+        id: install
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          sudo mkdir -p /tmp/pkg
+          sudo tar -xzf out/qjanus-*.tar.gz -C /tmp/pkg
+          cd /tmp/pkg/qjanus
+          # the ICE interface of this node = the runner's primary interface (the one with the default route)
+          ICE_IF=$(ip -o -4 route get 192.0.2.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+          ICE_ADDR=$(ip -o -4 route get 192.0.2.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+          [ -n "$ICE_IF" ] && [ -n "$ICE_ADDR" ]
+          echo "::add-mask::$ICE_ADDR"
+          echo "ICE_IF=$ICE_IF" >> "$GITHUB_ENV"
+          # a hosted runner has a private address only: accepting that is what an operator does on purpose
+          PRIV=""
+          if bash -c '. ./libexec/qjanus-lib.sh; qjanus_private_addr "$1"' _ "$ICE_ADDR"; then PRIV=--allow-private-ice-iface; fi
+          # the ICE interface is REQUIRED and checked before anything on the node is touched:
+          # 1. none given: refused, the interface of the default route is named, nothing is created
+          if sudo ./install.sh --install-deps --http-bind 127.0.0.1 > /dev/null 2> "$RUNNER_TEMP/ice-none.log"; then echo "::error::an install without the ICE interface must be refused"; exit 1; fi
+          tail -8 "$RUNNER_TEMP/ice-none.log"
+          grep -q -- "--ice-iface $ICE_IF" "$RUNNER_TEMP/ice-none.log"
+          # 2. a VPN / tailscale / missing interface is refused, even when the operator names it
+          for bad in tailscale0 qvpn0 docker0 lo nonexistent0; do
+            if sudo ./install.sh --http-bind 127.0.0.1 --ice-iface "$bad" $PRIV > /dev/null 2> "$RUNNER_TEMP/ice-bad.log"; then echo "::error::--ice-iface $bad must be refused"; exit 1; fi
+            tail -2 "$RUNNER_TEMP/ice-bad.log"
+          done
+          # 3. private addresses only (the decoy lan0 is not on the ignore list): refused unless allowed on purpose
+          if sudo ./install.sh --http-bind 127.0.0.1 --ice-iface lan0 > /dev/null 2> "$RUNNER_TEMP/ice-priv.log"; then echo "::error::an interface with private addresses only must be refused"; exit 1; fi
+          grep -q 'private addresses only' "$RUNNER_TEMP/ice-priv.log"
+          # nothing was created by any refusal
+          [ ! -e /etc/qjanus ] && [ ! -e /opt/qjanus/current ] && [ ! -e /etc/systemd/system/qjanus.service ]
+          FP=$(sudo ./install.sh --install-deps --http-bind 127.0.0.1 --ice-iface "$ICE_IF" $PRIV 2> "$RUNNER_TEMP/install.log") || { cat "$RUNNER_TEMP/install.log"; exit 1; }
+          cat "$RUNNER_TEMP/install.log"
+          echo "stdout of install.sh: $FP"
+          printf '%s\n' "$FP" | grep -Eq '^sha-256 ([0-9A-F]{2}:){31}[0-9A-F]{2}$' || { echo "::error::install.sh must print exactly one sha-256 fingerprint"; exit 1; }
+          [ "$(printf '%s\n' "$FP" | wc -l)" = 1 ]
+          echo "fp=$FP" >> "$GITHUB_OUTPUT"
+          sudo journalctl -u qjanus -o cat --no-pager | head -60
+
+      - name: install.sh is idempotent (same fingerprint and secrets, no restart when nothing changed)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          env_before=$(sudo sha256sum /etc/qjanus/qjanus.env | cut -d' ' -f1)
+          key_before=$(sudo sha256sum /etc/qjanus/dtls.key | cut -d' ' -f1)
+          pid_before=$(systemctl show -p MainPID --value qjanus)
+          FP2=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/install2.log")
+          cat "$RUNNER_TEMP/install2.log"
+          [ "$FP2" = "${{ steps.install.outputs.fp }}" ]
+          [ "$(sudo sha256sum /etc/qjanus/qjanus.env | cut -d' ' -f1)" = "$env_before" ]
+          [ "$(sudo sha256sum /etc/qjanus/dtls.key | cut -d' ' -f1)" = "$key_before" ]
+          [ "$(systemctl show -p MainPID --value qjanus)" = "$pid_before" ]
+          echo "idempotent"
+
+      - name: The running node - files, sandbox, listeners, no system OpenSSL, no secret on a command line
+        run: |
+          set -euo pipefail
+          sudo ls -l /etc/qjanus /opt/qjanus /opt/qjanus/releases
+          [ "$(sudo stat -c %a /etc/qjanus/qjanus.env)" = 600 ]
+          [ "$(sudo stat -c %a /etc/qjanus/dtls.key)" = 600 ]
+          [ "$(sudo grep '^QJANUS_ICE_ENFORCE_IFACE=' /etc/qjanus/qjanus.env | cut -d= -f2-)" = "$ICE_IF" ]
+          sudo grep -Eq '^[[:space:]]+ice_enforce_list = "'"$ICE_IF"'"$' /run/qjanus/etc/janus.jcfg
+          sudo grep -Eq '^[[:space:]]+ice_ignore_list = "vmnet,docker,veth,br-,virbr,lxc,wg,tailscale,qvpn,lo"$' /run/qjanus/etc/janus.jcfg
+          systemctl is-active --quiet qjanus
+          PID=$(systemctl show -p MainPID --value qjanus)
+          grep -E '^(Uid|NoNewPrivs|CapEff|CapBnd|Seccomp):' /proc/$PID/status
+          [ "$(awk '/^Uid:/ {print $2}' /proc/$PID/status)" != 0 ]
+          [ "$(awk '/^CapEff:/ {print $2}' /proc/$PID/status)" = 0000000000000000 ]
+          [ "$(awk '/^CapBnd:/ {print $2}' /proc/$PID/status)" = 0000000000000000 ]
+          [ "$(awk '/^NoNewPrivs:/ {print $2}' /proc/$PID/status)" = 1 ]
+          [ "$(awk '/^Seccomp:/ {print $2}' /proc/$PID/status)" = 2 ]
+          if sudo tr '\0' ' ' < /proc/$PID/cmdline | grep -Eq '[0-9a-f]{32}'; then echo "::error::a secret-looking value is on the command line"; exit 1; fi
+          if sudo grep -E 'libssl|libcrypto' /proc/$PID/maps; then echo "::error::a system libssl/libcrypto is mapped"; exit 1; fi
+          sudo ss -Hltnp | grep janus | tee "$RUNNER_TEMP/tcp.txt"
+          [ "$(wc -l < "$RUNNER_TEMP/tcp.txt")" = 2 ]
+          grep -q '127.0.0.1:8088' "$RUNNER_TEMP/tcp.txt"
+          grep -q '127.0.0.1:8188' "$RUNNER_TEMP/tcp.txt"
+          systemd-analyze security --no-pager qjanus.service | tail -25 || true
+
+      - name: The sandbox and the limits are in effect (what systemd applies and what the process sees, not what the unit says)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PID=$(systemctl show -p MainPID --value qjanus)
+          bad=0
+          # 1. the properties systemd applies (a misspelled directive is dropped with only a warning)
+          for kv in DynamicUser=yes NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes PrivateTmp=yes PrivateDevices=yes \
+                    ProtectProc=invisible ProtectKernelTunables=yes ProtectKernelModules=yes ProtectKernelLogs=yes \
+                    ProtectControlGroups=yes ProtectClock=yes ProtectHostname=yes RestrictNamespaces=yes RestrictRealtime=yes \
+                    RestrictSUIDSGID=yes LockPersonality=yes MemoryMax=2147483648 CPUQuotaPerSecUSec=2s CPUWeight=50 \
+                    TasksMax=4096 LimitNOFILE=65536 UMask=0077; do
+            k=${kv%%=*}; v=${kv#*=}
+            got=$(systemctl show -p "$k" --value qjanus)
+            [ "$got" = "$v" ] || { echo "::error::unit property $k is '$got', the spec wants '$v'"; bad=1; }
+          done
+          for af in AF_INET AF_INET6 AF_UNIX AF_NETLINK; do
+            systemctl show -p RestrictAddressFamilies --value qjanus | grep -qw "$af" || { echo "::error::RestrictAddressFamilies lacks $af"; bad=1; }
+          done
+          if systemctl show -p RestrictAddressFamilies --value qjanus | grep -qE 'AF_PACKET|AF_BLUETOOTH'; then echo "::error::RestrictAddressFamilies allows more than the spec"; bad=1; fi
+          # the filter itself: systemd expands @system-service, so the value is only shown; that it is a seccomp filter in force
+          # (mode 2, no new privileges) is what the previous step asserted from /proc
+          echo "SystemCallFilter: $(systemctl show -p SystemCallFilter --value qjanus | cut -c1-120)"
+          [ -n "$(systemctl show -p SystemCallFilter --value qjanus)" ] || { echo "::error::the unit has no SystemCallFilter"; bad=1; }
+          for path in /opt/bcrypto /root /etc/bcrypto /var/lib/bcrypto; do
+            systemctl show -p InaccessiblePaths --value qjanus | grep -qF "$path" || { echo "::error::InaccessiblePaths lacks $path"; bad=1; }
+          done
+          # 2. what the running process sees: read-only system, no home, a private /tmp and /dev
+          ns() { sudo nsenter -t "$PID" -m -- "$@"; }
+          for f in /usr/qjanus-write-probe /etc/qjanus-write-probe /opt/qjanus-write-probe /var/lib/qjanus-write-probe; do
+            if ns sh -c ": > $f" 2> /dev/null; then echo "::error::the service can write $f (ProtectSystem=strict is not in effect)"; ns rm -f "$f"; bad=1; fi
+          done
+          for d in /home /root; do
+            [ -z "$(ns ls -A "$d" 2> /dev/null)" ] || { echo "::error::$d is visible to the service"; ns ls -A "$d" | head -3; bad=1; }
+          done
+          sudo touch /tmp/qjanus-host-marker
+          if ns test -e /tmp/qjanus-host-marker; then echo "::error::the service shares the host /tmp"; bad=1; fi
+          sudo rm -f /tmp/qjanus-host-marker
+          if ns test -e /dev/kmsg; then echo "::error::the service sees the host /dev (/dev/kmsg)"; bad=1; fi
+          # 3. an overall exposure level, so that a dropped directive shows up as a number
+          score=$(systemd-analyze security --no-pager qjanus.service | sed -n 's/.*Overall exposure level for qjanus.service: \([0-9.]*\).*/\1/p')
+          echo "systemd-analyze exposure level: ${score:-?}"
+          awk -v s="$score" 'BEGIN { exit !(s != "" && s + 0 <= 2.5) }' || { echo "::error::exposure level '$score' is above 2.5"; bad=1; }
+          [ "$bad" = 0 ]
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Playwright + Chromium + Firefox
+        working-directory: qjanus/test/e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium firefox
+
+      - name: Older Chrome-for-Testing builds (weaker peers for the negative tests)
+        working-directory: qjanus/test/e2e
+        run: |
+          json='['
+          for m in 130 142 148; do
+            out=$(./node_modules/.bin/browsers install "chrome@$m" --path "$HOME/cft" 2>&1 | tail -1) || true
+            p=$(echo "$out" | awk '{print $2}')
+            echo "chrome@$m -> $out"
+            if [ -n "$p" ] && [ -x "$p" ]; then json="$json{\"label\":\"$m\",\"path\":\"$p\"},"; fi
+          done
+          json="${json%,}]"
+          # a missing build would silently shrink the negative peer matrix: fail instead
+          [ "$(printf '%s' "$json" | grep -o '"label"' | wc -l)" = 3 ] \
+            || { echo "::error::an older Chrome-for-Testing build could not be installed (the refused-peer tests need 130, 142 and 148)"; exit 1; }
+          echo "OLD_CHROMES=$json" >> "$GITHUB_ENV"
+
+      - name: netem is available (tc, sch_netem)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends iproute2 > /dev/null
+          sudo modprobe sch_netem || sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          sudo bash qjanus/test/e2e/netem.sh on
+          sudo bash qjanus/test/e2e/netem.sh off
+
+      - name: API conformance (server calls of spec section 3 over HTTP, client calls over WebSockets)
+        timeout-minutes: 10
+        working-directory: qjanus/test/conformance
+        run: |
+          set -euo pipefail
+          set -a; . <(sudo cat /etc/qjanus/qjanus.env); set +a
+          echo "::add-mask::$QJANUS_TOKEN_SECRET"; echo "::add-mask::$QJANUS_ADMIN_KEY"
+          export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
+          OUT_DIR="$OUT_DIR/conformance" SECRETS_FILE="$RUNNER_TEMP/secrets-conformance.json" node conformance.mjs 2>&1 | tee "$OUT_DIR/conformance.log"
+
+      - name: ICE candidates seen by an independent client (qjanus/test/node-ice-check.py, the tool used on the real nodes)
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo python3 qjanus/test/node-ice-check.py --ws ws://127.0.0.1:8188 | tee "$OUT_DIR/node-ice-check.log"
+          grep -q '^PASS ' "$OUT_DIR/node-ice-check.log"
+          # the decoys really exist on this host (otherwise the check above proved less than it says)
+          for a in 100.101.102.103 10.66.6.1 172.20.9.1 192.168.77.1; do ip -o addr | grep -q "inet $a/"; done
+
+      - name: Caddy in front of the WebSocket API (qjanus/conf/Caddyfile.example, the block the README tells to add)
+        timeout-minutes: 10
+        env:
+          QJANUS_FINGERPRINT: ${{ steps.install.outputs.fp }}
+        run: bash qjanus/test/caddy-check.sh
+
+      - name: E2E - Chromium (PQC trial) group calls with E2EE frames, simulcast, netem loss/reorder, refused peers
+        timeout-minutes: 30
+        working-directory: qjanus/test/e2e
+        run: |
+          set -euo pipefail
+          set -a; . <(sudo cat /etc/qjanus/qjanus.env); set +a
+          echo "::add-mask::$QJANUS_TOKEN_SECRET"; echo "::add-mask::$QJANUS_ADMIN_KEY"
+          export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
+          SUITE=all REQUIRE_ALL_NEGATIVES=1 NETEM="$PWD/netem.sh" OUT_DIR="$OUT_DIR/e2e" SECRETS_FILE="$RUNNER_TEMP/secrets-e2e.json" node e2e.mjs 2>&1 | tee "$OUT_DIR/e2e.log"
+
+      - name: Log hygiene - no identifiers, addresses, fingerprints or secrets in the service journal
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo journalctl -u qjanus -o cat --no-pager > "$OUT_DIR/journal.txt"
+          grep -q "to the ICE enforce list" "$OUT_DIR/journal.txt" || { echo "::error::Janus did not log loading the ICE enforce list"; exit 1; }
+          files=""
+          for f in "$RUNNER_TEMP"/secrets-conformance.json "$RUNNER_TEMP"/secrets-caddy.json "$RUNNER_TEMP"/secrets-e2e.json; do [ -f "$f" ] && files="$files $f"; done
+          # shellcheck disable=SC2086
+          node qjanus/test/lib/check-logs.mjs "$OUT_DIR/journal.txt" $files
+
+      - name: Listeners after the run - only the two loopback TCP ports, UDP only inside 20000-20999
+        run: |
+          set -euo pipefail
+          sudo ss -Hlunp | grep janus | awk '{print $4}' | tee "$RUNNER_TEMP/udp.txt" || true
+          while read -r a; do
+            [ -n "$a" ] || continue
+            port=${a##*:}
+            if [ "$port" -lt 20000 ] || [ "$port" -gt 20999 ]; then echo "::error::UDP listener outside the rtp_port_range: $a"; exit 1; fi
+          done < "$RUNNER_TEMP/udp.txt"
+          sudo ss -Hltnp | grep janus | awk '{print $4}' | sort
+
+      - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README), and every way an install can go wrong
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          trap 'rc=$?; echo "::error::lifecycle step failed (exit $rc) at: $BASH_COMMAND"; sudo journalctl -u qjanus -n 40 --no-pager -o cat || true' ERR
+          # awk reads all of ss's output (grep -q would end the pipe early: SIGPIPE + pipefail)
+          listening() { sudo ss -Hltn | awk -v a="$1" '$4 == a { f = 1 } END { exit !f }'; }
+          envval() { sudo grep "^$1=" /etc/qjanus/qjanus.env | head -1 | cut -d= -f2-; }
+          FP1='${{ steps.install.outputs.fp }}'
+          rel1=$(basename "$(readlink -f /opt/qjanus/current)")
+          sudo test -e "/opt/qjanus/releases/$rel1/.healthy"
+          # 0. the server API (plain HTTP) is never bound to a public or wildcard address: refused before anything is touched
+          for bad in 8.8.8.8 203.0.113.9 0.0.0.0 ::; do
+            if (cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind "$bad" > /dev/null 2> "$RUNNER_TEMP/bind-public.log"); then
+              echo "::error::--http-bind $bad must be refused"; exit 1
+            fi
+            grep -q 'not acceptable' "$RUNNER_TEMP/bind-public.log"
+          done
+          [ "$(envval QJANUS_HTTP_BIND)" = 127.0.0.1 ]
+          systemctl is-active --quiet qjanus
+          # 0b. the ICE interface on an upgrade. A node from before qjanus 1.4.2-q2 has none in its env file: the
+          #     upgrade is refused (nothing is touched) until the operator names the interface, then it is stored
+          [ "$(envval QJANUS_ICE_ENFORCE_IFACE)" = "$ICE_IF" ]
+          sudo cp -p /etc/qjanus/qjanus.env "$RUNNER_TEMP/env.with-ice"
+          sudo sed -i '/^QJANUS_ICE_ENFORCE_IFACE=/d' /etc/qjanus/qjanus.env
+          if (cd /tmp/pkg/qjanus && sudo ./install.sh > /dev/null 2> "$RUNNER_TEMP/ice-old.log"); then echo "::error::an upgrade of a node without an ICE interface must be refused"; exit 1; fi
+          tail -3 "$RUNNER_TEMP/ice-old.log"
+          grep -q -- "--ice-iface $ICE_IF" "$RUNNER_TEMP/ice-old.log"
+          [ -z "$(envval QJANUS_ICE_ENFORCE_IFACE)" ]
+          systemctl is-active --quiet qjanus
+          FPI=$(cd /tmp/pkg/qjanus && sudo env QJANUS_ICE_ENFORCE_IFACE="$ICE_IF" ./install.sh 2> "$RUNNER_TEMP/ice-up.log") || { cat "$RUNNER_TEMP/ice-up.log"; exit 1; }
+          [ "$FPI" = "$FP1" ]
+          [ "$(envval QJANUS_ICE_ENFORCE_IFACE)" = "$ICE_IF" ]
+          systemctl is-active --quiet qjanus
+          # a VPN interface on the command line wins over what is stored, is refused, and changes nothing
+          if (cd /tmp/pkg/qjanus && sudo ./install.sh --ice-iface tailscale0 > /dev/null 2> "$RUNNER_TEMP/ice-vpn.log"); then echo "::error::--ice-iface tailscale0 must be refused on an upgrade"; exit 1; fi
+          [ "$(envval QJANUS_ICE_ENFORCE_IFACE)" = "$ICE_IF" ]
+          systemctl is-active --quiet qjanus
+          # the service itself fails closed: a VPN interface in the env file keeps it from starting (the renderer
+          # runs as the unit's ExecStartPre in the sandbox), and the installer brings the node back
+          sudo sed -i 's|^QJANUS_ICE_ENFORCE_IFACE=.*|QJANUS_ICE_ENFORCE_IFACE=tailscale0|' /etc/qjanus/qjanus.env
+          sudo systemctl reset-failed qjanus.service || true
+          if sudo systemctl restart qjanus.service; then echo "::error::the service must not start with a VPN interface as ICE interface"; exit 1; fi
+          sudo journalctl -u qjanus -n 6 --no-pager -o cat | tail -4
+          sudo systemctl stop qjanus.service || true
+          sudo install -m 0600 -o root -g root "$RUNNER_TEMP/env.with-ice" /etc/qjanus/qjanus.env
+          FPI=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/ice-back.log") || { cat "$RUNNER_TEMP/ice-back.log"; exit 1; }
+          [ "$FPI" = "$FP1" ]
+          systemctl is-active --quiet qjanus
+          listening 127.0.0.1:8088
+          # 1. an address that no interface carries: Janus cannot bind it. The start fails (no half-working node),
+          #    the installer puts the previous settings back, the node keeps serving on its old address
+          if (cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.2 > /dev/null 2> "$RUNNER_TEMP/bind-bad.log"); then
+            echo "::error::a HTTP bind that Janus cannot use must fail the install"; exit 1
+          fi
+          tail -4 "$RUNNER_TEMP/bind-bad.log"
+          grep -q 'putting back the previous' "$RUNNER_TEMP/bind-bad.log"
+          [ "$(envval QJANUS_HTTP_BIND)" = 127.0.0.1 ]
+          systemctl is-active --quiet qjanus
+          listening 127.0.0.1:8088
+          # 2. an address of a real interface (the runner's, standing in for the VPN address): only that address, not loopback
+          ADDR=$(ip -4 route get 192.0.2.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+          [ -n "$ADDR" ]
+          echo "::add-mask::$ADDR"
+          # a hosted runner may carry a public address: the override is what an operator with such a node would set
+          if ! bash -c '. /tmp/pkg/qjanus/libexec/qjanus-lib.sh; qjanus_private_addr "$1"' _ "$ADDR"; then
+            echo "QJANUS_ALLOW_NONPRIVATE_BIND=yes" | sudo tee -a /etc/qjanus/qjanus.env > /dev/null
+          fi
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind "$ADDR" 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
+          [ "$FPB" = "$FP1" ]
+          listening "$ADDR:8088"
+          if listening 127.0.0.1:8088; then echo "::error::the HTTP API still listens on 127.0.0.1"; exit 1; fi
+          listening 127.0.0.1:8188
+          [ "$(curl -sf "http://$ADDR:8088/janus/info" | jq -r .janus)" = server_info ]
+          # 3. back to loopback
+          FPB=$(cd /tmp/pkg/qjanus && sudo ./install.sh --http-bind 127.0.0.1 2> "$RUNNER_TEMP/bind.log") || { cat "$RUNNER_TEMP/bind.log"; exit 1; }
+          listening 127.0.0.1:8088
+          systemctl is-active --quiet qjanus
+          # 4. the same version name with different content is refused (never keep running an old tree silently)
+          sudo rm -rf /tmp/pkg4 && sudo mkdir /tmp/pkg4 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg4/qjanus
+          echo '{"tampered":true}' | sudo tee /tmp/pkg4/qjanus/BUILDINFO.json > /dev/null
+          if (cd /tmp/pkg4/qjanus && sudo ./install.sh > /dev/null 2> "$RUNNER_TEMP/same.log"); then
+            echo "::error::an install of the same version with other content must be refused"; exit 1
+          fi
+          grep -q 'different content' "$RUNNER_TEMP/same.log"
+          # 5. a release that installs but cannot start (its ExecStartPost fails): the installer puts the previous release
+          #    back by itself, exits with an error and prints no fingerprint; the broken release is never a rollback target
+          sudo rm -rf /tmp/pkg3 && sudo mkdir /tmp/pkg3 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg3/qjanus
+          echo "${rel1}-broken" | sudo tee /tmp/pkg3/qjanus/VERSION > /dev/null
+          printf '#!/bin/sh\necho broken release >&2\nexit 1\n' | sudo tee /tmp/pkg3/qjanus/libexec/qjanus-wait-ready > /dev/null
+          if FPX=$(cd /tmp/pkg3/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/broken.log"); then
+            echo "::error::a release that cannot start must fail the install"; exit 1
+          fi
+          tail -5 "$RUNNER_TEMP/broken.log"
+          [ -z "${FPX:-}" ]
+          grep -q "putting back $rel1" "$RUNNER_TEMP/broken.log"
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
+          systemctl is-active --quiet qjanus
+          listening 127.0.0.1:8088
+          sudo test ! -e "/opt/qjanus/releases/${rel1}-broken/.healthy"
+          # 6. a second release: the same tree with another VERSION
+          sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
+          echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null
+          pid1=$(systemctl show -p MainPID --value qjanus)
+          FP2=$(cd /tmp/pkg2/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/up.log") || { cat "$RUNNER_TEMP/up.log"; exit 1; }; cat "$RUNNER_TEMP/up.log"
+          [ "$FP2" = "$FP1" ]
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "${rel1}-upgrade" ]
+          [ "$(systemctl show -p MainPID --value qjanus)" != "$pid1" ]
+          [ "$(envval QJANUS_ICE_ENFORCE_IFACE)" = "$ICE_IF" ]   # an upgrade keeps the node's ICE interface
+          systemctl is-active --quiet qjanus
+          # 7. rollback goes to the last release that ever ran (not to the broken one, not to an interrupted install)
+          sudo mkdir -p /opt/qjanus/releases/zz-interrupted.tmp
+          FP3=$(sudo /opt/qjanus/current/install.sh --rollback 2> "$RUNNER_TEMP/rb.log") || { cat "$RUNNER_TEMP/rb.log"; exit 1; }; cat "$RUNNER_TEMP/rb.log"
+          [ "$FP3" = "$FP1" ]
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
+          systemctl is-active --quiet qjanus
+          # 8. uninstall keeps the node's key and secrets, a reinstall reuses them, --purge removes them
+          sudo /opt/qjanus/current/install.sh --uninstall
+          [ ! -e /opt/qjanus ]
+          [ ! -e /etc/systemd/system/qjanus.service ]
+          if systemctl is-active --quiet qjanus; then echo "::error::qjanus still active after uninstall"; exit 1; fi
+          sudo test -s /etc/qjanus/dtls.key
+          FP4=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/re.log") || { cat "$RUNNER_TEMP/re.log"; exit 1; }; cat "$RUNNER_TEMP/re.log"
+          [ "$FP4" = "$FP1" ]
+          systemctl is-active --quiet qjanus
+          sudo /opt/qjanus/current/install.sh --uninstall --purge
+          [ ! -e /etc/qjanus ]
+          [ ! -e /opt/qjanus ]
+          echo "lifecycle ok"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-integration-out
+          path: |
+            integration-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  release:
+    needs: [precheck, build, clean-install, integration]
+    if: ${{ !cancelled() && needs.precheck.outputs.release == 'true' && needs.build.result == 'success' && needs.clean-install.result == 'success' && needs.integration.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            qjanus/CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release '$IN_RELEASE_TAG' now exists - refusing to publish over it"; exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$IN_RELEASE_TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$IN_RELEASE_TAG' now exists - refusing to attach a release to it"; exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            out/qjanus-*.tar.gz
+            out/SHA256SUMS
+            out/BUILDINFO.json
+
+      - name: Compose the release notes (the section of qjanus/CHANGELOG.md for this version; a release without one is refused)
+        run: |
+          set -euo pipefail
+          ver=${IN_RELEASE_TAG#qjanus-}
+          awk -v v="$ver" '$0 == "## " v { on = 1; next } /^## / { on = 0 } on' qjanus/CHANGELOG.md > "$RUNNER_TEMP/notes-body.md"
+          [ -s "$RUNNER_TEMP/notes-body.md" ] || { echo "::error::qjanus/CHANGELOG.md has no '## $ver' section"; exit 1; }
+          {
+            cat "$RUNNER_TEMP/notes-body.md"
+            printf '\n---\n%s -R %s\n' "qjanus: Janus v1.4.2 VideoRoom SFU on BoringSSL f91f1447 (DTLS 1.3, X25519MLKEM768, TLS_AES_256_GCM_SHA384, SRTP AEAD_AES_256_GCM only, fail closed). Ubuntu 24.04 x86_64 relocatable tarball: unpack and run install.sh (see qjanus/README.md). Sources, pins and patches: BUILDINFO.json. Verify with: gh attestation verify <tarball>" "$GITHUB_REPOSITORY"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$IN_RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            out/* \
+            || echo "::warning::GITHUB_TOKEN could not create release $IN_RELEASE_TAG (HTTP 403 seen on this repository 2026-09-29, same as the m150 workflows). The assets are attested and sha256-verified in this run (artifact qjanus-tarball); the maintainer publishes them from here with a personal token."

@@ -1,0 +1,10 @@
+{
+  "name": "qjanus-e2e",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "dependencies": {
+    "@puppeteer/browsers": "3.2.3",
+    "playwright": "1.63.0"
+  }
+}

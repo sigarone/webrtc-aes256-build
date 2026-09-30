@@ -1,0 +1,160 @@
+diff --git a/src/log-scrub.h b/src/log-scrub.h
+new file mode 100644
+index 0000000..1de0a3e
+--- /dev/null
++++ b/src/log-scrub.h
+@@ -0,0 +1,119 @@
++/*! \file     log-scrub.h
++ * \brief     Redaction of identifying material in log lines (qjanus)
++ * \details   Every log line passes through janus_log_scrub() before it is
++ * queued: pseudonyms, room ids, join tokens and similar long identifiers
++ * (12 or more hex digits, which also covers plain decimal counters of that
++ * size), IPv4 addresses, IPv6 addresses and colon separated fingerprints
++ * are overwritten IN PLACE (the length never changes), so that no plugin or
++ * core log statement, at any debug level, can leak more than 8 characters of
++ * an identifier. Ports, versions and timestamps are left alone.
++ */
++
++#ifndef JANUS_LOG_SCRUB_H
++#define JANUS_LOG_SCRUB_H
++
++#include <stddef.h>
++
++static inline int janus_scrub_isdigit(char c) {
++	return c >= '0' && c <= '9';
++}
++static inline int janus_scrub_isxdigit(char c) {
++	return janus_scrub_isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
++}
++static inline int janus_scrub_isalnum_(char c) {
++	return janus_scrub_isxdigit(c) || (c >= 'g' && c <= 'z') || (c >= 'G' && c <= 'Z') || c == '_';
++}
++
++/* Overwrites the digits of dotted quads (1.2.3.4) with 'x' */
++static inline void janus_scrub_ipv4(char *s) {
++	size_t i = 0;
++	while(s[i]) {
++		if(!janus_scrub_isdigit(s[i]) || (i > 0 && (janus_scrub_isalnum_(s[i-1]) || s[i-1] == '.'))) {
++			i++;
++			continue;
++		}
++		size_t p = i;
++		int groups = 0;
++		while(groups < 4) {
++			size_t d = 0;
++			while(d < 4 && janus_scrub_isdigit(s[p + d]))
++				d++;
++			if(d == 0 || d > 3)
++				break;
++			p += d;
++			groups++;
++			if(groups < 4) {
++				if(s[p] != '.')
++					break;
++				p++;
++			}
++		}
++		if(groups == 4 && !janus_scrub_isalnum_(s[p]) && !(s[p] == '.' && janus_scrub_isdigit(s[p+1]))) {
++			for(size_t k = i; k < p; k++) {
++				if(s[k] != '.')
++					s[k] = 'x';
++			}
++			i = p;
++		} else {
++			while(janus_scrub_isdigit(s[i]))
++				i++;
++		}
++	}
++}
++
++/* Overwrites runs of hex digits and colons that look like an IPv6 address or
++ * a fingerprint (3+ colons, or 2+ colons with a "::") with 'x', keeping the colons */
++static inline void janus_scrub_colons(char *s) {
++	size_t i = 0;
++	while(s[i]) {
++		if(!janus_scrub_isxdigit(s[i]) && s[i] != ':') {
++			i++;
++			continue;
++		}
++		size_t b = i;
++		int colons = 0, dbl = 0;
++		while(janus_scrub_isxdigit(s[i]) || s[i] == ':') {
++			if(s[i] == ':') {
++				colons++;
++				if(i > b && s[i-1] == ':')
++					dbl = 1;
++			}
++			i++;
++		}
++		if(colons >= 3 || (colons >= 2 && dbl)) {
++			for(size_t k = b; k < i; k++) {
++				if(s[k] != ':')
++					s[k] = 'x';
++			}
++		}
++	}
++}
++
++/* Keeps the first 8 characters of every run of 12+ hex digits, overwrites the rest with '*' */
++static inline void janus_scrub_hex(char *s) {
++	size_t i = 0;
++	while(s[i]) {
++		if(!janus_scrub_isxdigit(s[i])) {
++			i++;
++			continue;
++		}
++		size_t b = i;
++		while(janus_scrub_isxdigit(s[i]))
++			i++;
++		if(i - b >= 12) {
++			for(size_t k = b + 8; k < i; k++)
++				s[k] = '*';
++		}
++	}
++}
++
++/* Redacts a NUL terminated log line in place */
++static inline void janus_log_scrub(char *s) {
++	if(s == NULL)
++		return;
++	janus_scrub_ipv4(s);
++	janus_scrub_colons(s);
++	janus_scrub_hex(s);
++}
++
++#endif
+diff --git a/src/log.c b/src/log.c
+index 3f07616..8a8357a 100644
+--- a/src/log.c
++++ b/src/log.c
+@@ -20,6 +20,7 @@
+ #include "debug.h"
+ #include "utils.h"
+ #include "loggers/logger.h"
++#include "log-scrub.h"
+ 
+ #define THREAD_NAME "log"
+ 
+@@ -150,6 +151,8 @@ void janus_vprintf(const char *format, ...) {
+ 	va_end(ap);
+ 	if(len < 0 || str == NULL)
+ 		return;
++	/* qjanus: never let identifiers, addresses or fingerprints reach the logs */
++	janus_log_scrub(str);
+ 	/* Queue the new log buffer */
+ 	janus_log_buffer *b = g_malloc(sizeof(janus_log_buffer));
+ 	b->timestamp = janus_get_real_time();
+diff --git a/src/janus.c b/src/janus.c
+index 028ffe4..5a039d7 100644
+--- a/src/janus.c
++++ b/src/janus.c
+@@ -1256,7 +1256,8 @@ int janus_process_incoming_request(janus_request *request) {
+ 			if(token != NULL) {
+ 				token_value = json_string_value(token);
+ 				if(token_value && !janus_auth_check_plugin(token_value, plugin_t)) {
+-					JANUS_LOG(LOG_ERR, "Token '%s' can't access plugin '%s'\n", token_value, plugin_text);
++					/* qjanus: a signed token is a bearer credential, it is never logged */
++					JANUS_LOG(LOG_ERR, "The token of this request can't access plugin '%s'\n", plugin_text);
+ 					ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNAUTHORIZED_PLUGIN, "Provided token can't access plugin '%s'", plugin_text);
+ 					goto jsondone;
+ 				}

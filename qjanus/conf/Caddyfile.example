@@ -1,0 +1,15 @@
+# Caddy block that publishes the qjanus client API (WebSocket) of a node. Caddy terminates TLS
+# (its own certificate for the node's host name) and proxies the WebSocket upgrade to qjanus,
+# which listens on 127.0.0.1:8188 only. Put the `handle /janus` block INSIDE the site block that
+# already serves the node's host name (the application server lives there too); the address of the site block
+# is what the server sends to the clients as ws_url ("wss://<host>/janus").
+#
+# The server-facing HTTP API (port 8088) is never proxied and never opened in the firewall.
+sfu.example.invalid {
+	handle /janus {
+		reverse_proxy 127.0.0.1:8188
+	}
+	handle {
+		respond 404
+	}
+}

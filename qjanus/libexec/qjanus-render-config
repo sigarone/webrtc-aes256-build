@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# qjanus-render-config: renders share/qjanus/conf/*.jcfg.tmpl into <out>/ (default
+# $RUNTIME_DIRECTORY/etc, i.e. /run/qjanus/etc when started by systemd), replacing the @KEYS@
+# from the environment. Runs as ExecStartPre (unprivileged, EnvironmentFile already applied),
+# so the secrets exist only in /etc/qjanus/qjanus.env (root, 0600) and in the private tmpfs
+# /run/qjanus (service user, 0700); they are never on a command line.
+#   QJANUS_TOKEN_SECRET   HMAC key of the signed session tokens        (required, hex)
+#   QJANUS_ADMIN_KEY      VideoRoom admin_key                          (required, hex)
+#   QJANUS_HTTP_BIND      address of the server-facing HTTP API        (default 127.0.0.1; loopback, private,
+#                         VPN (CGNAT) or unique-local only, QJANUS_ALLOW_NONPRIVATE_BIND=yes overrides)
+#   QJANUS_DTLS_CERT      DTLS certificate (PEM)                       (default /etc/qjanus/dtls.crt)
+#   QJANUS_DTLS_KEY       DTLS private key (PEM)                       (default $CREDENTIALS_DIRECTORY/dtls.key)
+#   QJANUS_ICE_ENFORCE_IFACE  the ONE interface whose addresses are offered as ICE candidates (required;
+#                         the interface that carries the public address: eth0, enx3, ...). Refused: a
+#                         missing, down, loopback/VPN/bridge interface, a name that is the prefix of
+#                         another interface, an interface with private addresses only (unless
+#                         QJANUS_NAT_1_1 is set or QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes)
+#   QJANUS_NAT_1_1        public IPv4 to advertise when the node sits behind a 1:1 NAT (optional;
+#                         nodes that carry their public address on an interface need nothing)
+set -euo pipefail
+
+# the release directory as this script was reached: /opt/qjanus/current/... stays "current"
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=qjanus-lib.sh
+. "$ROOT/libexec/qjanus-lib.sh"
+OUT=${1:-${RUNTIME_DIRECTORY:-/run/qjanus}/etc}
+TMPL=$ROOT/share/qjanus/conf
+
+die() { echo "qjanus-render-config: $*" >&2; exit 1; }
+
+: "${QJANUS_TOKEN_SECRET:?QJANUS_TOKEN_SECRET is not set (see /etc/qjanus/qjanus.env)}"
+: "${QJANUS_ADMIN_KEY:?QJANUS_ADMIN_KEY is not set (see /etc/qjanus/qjanus.env)}"
+QJANUS_HTTP_BIND=${QJANUS_HTTP_BIND:-127.0.0.1}
+QJANUS_DTLS_CERT=${QJANUS_DTLS_CERT:-/etc/qjanus/dtls.crt}
+QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTORY/dtls.key}}
+[ -n "$QJANUS_DTLS_KEY" ] || die "QJANUS_DTLS_KEY is not set and there is no credentials directory"
+
+# the values end up inside sed programs and libconfig strings: strict charsets only
+[[ $QJANUS_TOKEN_SECRET =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_TOKEN_SECRET must be 32-128 lowercase hex characters"
+[[ $QJANUS_ADMIN_KEY =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_ADMIN_KEY must be 32-128 lowercase hex characters"
+# the server API is plain HTTP for the application server only: never a public address
+qjanus_check_http_bind "$QJANUS_HTTP_BIND" || die "QJANUS_HTTP_BIND is not acceptable"
+QJANUS_NAT_1_1=${QJANUS_NAT_1_1:-}
+if [ -n "$QJANUS_NAT_1_1" ]; then
+  [[ $QJANUS_NAT_1_1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "QJANUS_NAT_1_1 must be an IPv4 address"
+  IFS=. read -r o1 o2 o3 o4 <<< "$QJANUS_NAT_1_1"
+  for o in "$o1" "$o2" "$o3" "$o4"; do [ "$((10#$o))" -le 255 ] || die "QJANUS_NAT_1_1 must be an IPv4 address"; done
+  NAT_LINE="nat_1_1_mapping = \"$QJANUS_NAT_1_1\""
+else
+  NAT_LINE="# nat_1_1_mapping is not set (QJANUS_NAT_1_1 is empty)"
+fi
+# the ICE interface: fail closed. Without a checked interface Janus would offer the addresses of
+# every interface (VPN, bridges, ...), or none at all when the name is wrong
+QJANUS_ICE_ENFORCE_IFACE=${QJANUS_ICE_ENFORCE_IFACE:-}
+[ -n "$QJANUS_ICE_ENFORCE_IFACE" ] || die "QJANUS_ICE_ENFORCE_IFACE is not set (the interface that carries the public address; see /etc/qjanus/qjanus.env and install.sh --ice-iface)"
+command -v ip > /dev/null || die "the ip command (iproute2) is needed to check QJANUS_ICE_ENFORCE_IFACE"
+qjanus_check_ice_iface "$QJANUS_ICE_ENFORCE_IFACE" || die "QJANUS_ICE_ENFORCE_IFACE=$QJANUS_ICE_ENFORCE_IFACE is not acceptable"
+[[ $QJANUS_DTLS_CERT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_CERT must be an absolute path"
+[[ $QJANUS_DTLS_KEY =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_KEY must be an absolute path"
+[[ $ROOT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the release directory path has unsupported characters"
+[[ $OUT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the output directory path has unsupported characters"
+[ -r "$QJANUS_DTLS_CERT" ] || die "cannot read the DTLS certificate $QJANUS_DTLS_CERT"
+[ -r "$QJANUS_DTLS_KEY" ] || die "cannot read the DTLS private key (systemd credential dtls.key)"
+compgen -G "$TMPL/*.jcfg.tmpl" > /dev/null || die "no config templates in $TMPL"
+
+umask 077
+mkdir -p "$OUT"
+for t in "$TMPL"/*.jcfg.tmpl; do
+  f=$OUT/$(basename "${t%.tmpl}")
+  sed \
+    -e "s|@QJANUS_ROOT@|$ROOT|g" \
+    -e "s|@QJANUS_CONFDIR@|$OUT|g" \
+    -e "s|@QJANUS_TOKEN_SECRET@|$QJANUS_TOKEN_SECRET|g" \
+    -e "s|@QJANUS_ADMIN_KEY@|$QJANUS_ADMIN_KEY|g" \
+    -e "s|@QJANUS_HTTP_BIND@|$QJANUS_HTTP_BIND|g" \
+    -e "s|@QJANUS_DTLS_CERT@|$QJANUS_DTLS_CERT|g" \
+    -e "s|@QJANUS_DTLS_KEY@|$QJANUS_DTLS_KEY|g" \
+    -e "s|@QJANUS_NAT_1_1_LINE@|$NAT_LINE|g" \
+    -e "s|@QJANUS_ICE_ENFORCE_IFACE@|$QJANUS_ICE_ENFORCE_IFACE|g" \
+    -e "s|@QJANUS_ICE_IGNORE_LIST@|$QJANUS_ICE_IGNORE_LIST|g" \
+    "$t" > "$f.tmp"
+  if grep -q '@QJANUS_' "$f.tmp"; then
+    rm -f "$f.tmp"; die "unreplaced placeholder in $(basename "$t")"
+  fi
+  mv -f "$f.tmp" "$f"
+done
+echo "qjanus-render-config: rendered $(ls "$OUT" | wc -l) files into $OUT" >&2
