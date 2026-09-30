@@ -529,7 +529,7 @@ try {
   await run(roomScenario, pqc, { name: 'B2-videoroom-sub=janus-client', roleS: 'passive', room: 1234, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'E1-videoroom-e2ee-xor', room: 2345, e2ee: true, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'S1-videoroom-simulcast', room: 1234, simulcast: true, expect: 'pass' });
-  await run(fanoutScenario, pqc, { name: 'F1-fanout-1pub-8subs', n: 8, expect: 'pass' });
+  await run(fanoutScenario, pqc, { name: 'F1-fanout-1pub-12subs', n: 12, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'S2-videoroom-simulcast+e2ee', room: 2345, e2ee: true, simulcast: true, expect: 'pass' });
   await run(echoScenario, pqc, { name: 'L1-echotest-30pct-udp-loss', loss: 0.3, expect: 'pass' });
   await run(roomScenario, pqc, { name: 'L2-videoroom-30pct-udp-loss', room: 1234, loss: 0.3, expect: 'pass' });

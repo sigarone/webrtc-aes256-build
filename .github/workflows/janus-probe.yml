@@ -102,7 +102,7 @@ jobs:
             echo
             echo '```'
             cat "$OUT/versions.txt" 2>/dev/null || true
-            cat "$OUT/versions.json" 2>/dev/null || true
+            cat "$OUT/main/versions.json" 2>/dev/null || true
             echo
             cat "$OUT/summary.txt" 2>/dev/null || echo "(no summary)"
             echo

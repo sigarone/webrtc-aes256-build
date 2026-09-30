@@ -30,10 +30,14 @@ start_janus() { # $1 = install root, $2 = tag
     sleep 1
   done
   if [ "$up" != 1 ]; then echo "Janus ($tag) did not come up"; tail -80 "$OUT/janus-$tag.stdout.raw" || true; return 1; fi
+  # keep only non-identifying fields (the raw reply contains the runner's local IP and paths)
   python3 - "$OUT/janus-info-$tag.json" <<'PY' || true
 import json,sys
-d=json.load(open(sys.argv[1]))
-print("janus info:", json.dumps({k:d.get(k) for k in ('name','version_string','dtls-mtu','ice-lite','ipv6')}))
+p=sys.argv[1]
+d=json.load(open(p))
+keep={k:d.get(k) for k in ('name','version_string','commit-hash','dtls-mtu','ice-lite','ipv6','dependencies','plugins','transports')}
+json.dump(keep,open(p,'w'),indent=1)
+print("janus info:", json.dumps({k:d.get(k) for k in ('name','version_string','dtls-mtu','dependencies')}))
 PY
   return 0
 }
