@@ -73,7 +73,16 @@ window.probe = {
     const rec = newPc(id, opts);
     const stream = await navigator.mediaDevices.getUserMedia({ audio: !!opts.audio, video: !!opts.video });
     for (const track of stream.getTracks()) {
-      const sender = rec.pc.addTrack(track, stream);
+      let sender;
+      if (opts.simulcast && track.kind === 'video') {
+        const tr = rec.pc.addTransceiver(track, {
+          direction: 'sendonly', streams: [stream],
+          sendEncodings: [{ rid: 'h' }, { rid: 'm', scaleResolutionDownBy: 2 }, { rid: 'l', scaleResolutionDownBy: 4 }],
+        });
+        sender = tr.sender;
+      } else {
+        sender = rec.pc.addTrack(track, stream);
+      }
       if (opts.e2ee) applyTransform(sender, track.kind, 'sender');
     }
     const offer = await rec.pc.createOffer();

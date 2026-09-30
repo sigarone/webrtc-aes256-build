@@ -1,8 +1,8 @@
 diff --git a/src/dtls.c b/src/dtls.c
-index 2020e01..195ebfc 100644
+index 2020e01..d727c47 100644
 --- a/src/dtls.c
 +++ b/src/dtls.c
-@@ -101,6 +101,35 @@ gboolean janus_is_dtls(char *buf) {
+@@ -101,6 +101,39 @@ gboolean janus_is_dtls(char *buf) {
  	return ((*buf >= 20) && (*buf <= 64));
  }
  
@@ -29,16 +29,20 @@ index 2020e01..195ebfc 100644
 +		cipher_id == JANUS_DTLS_TLS_AES_256_GCM_SHA384 &&
 +		srtp_id == SRTP_AEAD_AES_256_GCM &&
 +		group_id == SSL_GROUP_X25519_MLKEM768);
-+	JANUS_LOG(LOG_INFO, "[%"SCNu64"] DTLS-POLICY version=0x%04x cipher=0x%04x srtp=0x%04x group=0x%04x role=%s ok=%d\n",
++	janus_ice_peerconnection *pc = (janus_ice_peerconnection *)dtls->pc;
++	JANUS_LOG(LOG_INFO, "[%"SCNu64"] DTLS-POLICY version=0x%04x cipher=0x%04x srtp=0x%04x group=0x%04x role=%s ok=%d"
++		" dtls_in=%"SCNu64"pkts/%"SCNu64"B dtls_out=%"SCNu64"pkts/%"SCNu64"B\n",
 +		handle_id, version, cipher_id, srtp_id, group_id,
-+		dtls->dtls_role == JANUS_DTLS_ROLE_CLIENT ? "client" : "server", ok ? 1 : 0);
++		dtls->dtls_role == JANUS_DTLS_ROLE_CLIENT ? "client" : "server", ok ? 1 : 0,
++		pc ? (guint64)pc->dtls_in_stats.info[0].packets : 0, pc ? (guint64)pc->dtls_in_stats.info[0].bytes : 0,
++		pc ? (guint64)pc->dtls_out_stats.info[0].packets : 0, pc ? (guint64)pc->dtls_out_stats.info[0].bytes : 0);
 +	return ok;
 +}
 +
  /* DTLS stuff */
  #define DTLS_DEFAULT_CIPHERS	"DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK"
  static const char *dtls_ciphers = DTLS_DEFAULT_CIPHERS;
-@@ -438,12 +467,16 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
+@@ -438,12 +471,16 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
  		return -1;
  	}
  	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, janus_dtls_verify_callback);
@@ -61,7 +65,7 @@ index 2020e01..195ebfc 100644
  
  	if(!server_pem && !server_key) {
  		JANUS_LOG(LOG_INFO, "No cert/key specified, autogenerating some...\n");
-@@ -492,6 +525,12 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
+@@ -492,6 +529,12 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
  		JANUS_LOG(LOG_FATAL, "Error setting cipher list (%s)\n", ERR_reason_error_string(ERR_get_error()));
  		return -8;
  	}
@@ -74,7 +78,7 @@ index 2020e01..195ebfc 100644
  
  	if(janus_dtls_bio_agent_init() < 0) {
  		JANUS_LOG(LOG_FATAL, "Error initializing BIO agent\n");
-@@ -630,6 +669,15 @@ janus_dtls_srtp *janus_dtls_srtp_create(void *ice_pc, janus_dtls_role role) {
+@@ -630,6 +673,15 @@ janus_dtls_srtp *janus_dtls_srtp_create(void *ice_pc, janus_dtls_role role) {
  	int grp_list[1] = { NID_X9_62_prime256v1 };
  	SSL_set1_groups(dtls->ssl, grp_list, 1);
  #endif
@@ -90,7 +94,7 @@ index 2020e01..195ebfc 100644
  	const long flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION | SSL_OP_SINGLE_ECDH_USE;
  	SSL_set_options(dtls->ssl, flags);
  #ifdef HAVE_DTLS_SETTIMEOUT
-@@ -734,6 +782,10 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+@@ -734,6 +786,10 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
  			char error[200];
  			ERR_error_string_n(ERR_get_error(), error, 200);
  			JANUS_LOG(LOG_ERR, "[%"SCNu64"] Handshake error: %s\n", handle->handle_id, error);
@@ -101,7 +105,7 @@ index 2020e01..195ebfc 100644
  			return;
  		}
  	}
-@@ -762,6 +814,16 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+@@ -762,6 +818,16 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
  #endif
  	} else {
  		JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS established, yay!\n", handle->handle_id);
@@ -118,7 +122,7 @@ index 2020e01..195ebfc 100644
  		/* Check the remote fingerprint */
  		X509 *rcert = SSL_get_peer_certificate(dtls->ssl);
  		if(!rcert) {
-@@ -1110,8 +1172,15 @@ gboolean janus_dtls_retry(gpointer stack) {
+@@ -1110,8 +1176,15 @@ gboolean janus_dtls_retry(gpointer stack) {
  	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP))
  		goto stoptimer;
  	if(dtls->dtls_state == JANUS_DTLS_STATE_CONNECTED) {
@@ -136,7 +140,7 @@ index 2020e01..195ebfc 100644
  	}
  	if(janus_get_monotonic_time() - dtls->dtls_started >= 20*G_USEC_PER_SEC) {
  		/* FIXME Should we really give up after 20 seconds waiting for DTLS? */
-@@ -1129,7 +1198,8 @@ gboolean janus_dtls_retry(gpointer stack) {
+@@ -1129,7 +1202,8 @@ gboolean janus_dtls_retry(gpointer stack) {
  	JANUS_LOG(LOG_HUGE, "[%"SCNu64"] DTLSv1_get_timeout: %"SCNu64"\n", handle->handle_id, timeout_value);
  	if(timeout_value == 0) {
  		dtls->retransmissions++;

@@ -1,10 +1,11 @@
 // Drives headless browsers against a local, patched Janus and records what
 // transport level was really negotiated. Signalling is done here in Node
 // (Janus HTTP API); the pages only hold the RTCPeerConnections.
-import { chromium } from 'playwright';
+import { chromium, firefox } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +15,8 @@ const OUT = process.env.OUT_DIR || path.join(HERE, 'out');
 const PORT = 8199;
 const PAGE = `http://127.0.0.1:${PORT}/page.html`;
 const ONLY = (process.env.ONLY || '').split(',').filter(Boolean);
+// JSON: [{"label":"130","path":"/path/to/chrome"}, ...]  older Chrome-for-Testing builds
+const OLD_CHROMES = JSON.parse(process.env.OLD_CHROMES || '[]');
 fs.mkdirSync(OUT, { recursive: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -93,16 +96,16 @@ function startServer() {
 // --------------------------------------------------------------- Janus log
 function logSize() { try { return fs.statSync(JANUS_LOG).size; } catch (e) { return 0; } }
 function logSince(off) {
-  try {
-    const buf = fs.readFileSync(JANUS_LOG);
-    return buf.subarray(off).toString('utf8');
-  } catch (e) { return ''; }
+  try { return fs.readFileSync(JANUS_LOG).subarray(off).toString('utf8'); } catch (e) { return ''; }
 }
 function policyLines(text) {
   return text.split('\n')
-    .filter((l) => /DTLS-POLICY|Handshake error|DTLS timer expired|DTLS handshake failure|DTLS alert|DTLS timeout|Fingerprint is NOT/.test(l))
-    .map((l) => l.replace(/\[\d+\]/g, '[h]').replace(/\d{1,3}(\.\d{1,3}){3}/g, '<ip>').trim());
+    .filter((l) => /DTLS-POLICY|Handshake error|DTLS timer expired|DTLS handshake failure|DTLS timeout|taking too much time|Fingerprint is NOT/.test(l))
+    .map((l) => l.replace(/\[\d+\]/g, '[h]').replace(/\d{1,3}(\.\d{1,3}){3}/g, '<ip>').replace(/^\[[^\]]*\] /, '').trim());
 }
+const isOkLine = (l) => /DTLS-POLICY/.test(l) && /version=0xfefc cipher=0x1302 srtp=0x0008 group=0x11ec/.test(l) && /ok=1/.test(l);
+const isFailLine = (l) => /ok=0|Handshake error|DTLS handshake failure|taking too much time|DTLS timeout/.test(l);
+const isTimerLine = (l) => /DTLS timer expired/.test(l);
 
 // ------------------------------------------------------------ browser helpers
 const BASE_ARGS = [
@@ -111,10 +114,21 @@ const BASE_ARGS = [
   '--allow-loopback-in-peer-connection', '--no-sandbox',
   '--autoplay-policy=no-user-gesture-required',
 ];
-async function launchChromium(fieldTrials) {
+async function launchChromium(fieldTrials, executablePath) {
   const args = [...BASE_ARGS];
   if (fieldTrials) args.push(`--force-fieldtrials=${fieldTrials}`);
-  return chromium.launch({ headless: true, args });
+  return chromium.launch({ headless: true, args, ...(executablePath ? { executablePath } : {}) });
+}
+async function launchFirefox() {
+  return firefox.launch({
+    headless: true,
+    firefoxUserPrefs: {
+      'media.navigator.streams.fake': true,
+      'media.navigator.permission.disabled': true,
+      'media.peerconnection.ice.loopback': true,
+      'media.peerconnection.ice.obfuscate_host_addresses': false,
+    },
+  });
 }
 async function newPage(ctx) {
   const page = await ctx.newPage();
@@ -130,6 +144,12 @@ async function waitConnected(page, id, ms = 15000) {
     await sleep(250);
   }
   return last;
+}
+function connectMs(state) {
+  if (!state || !state.timeline) return null;
+  const a = state.timeline.find((x) => /^ice:checking/.test(x.what));
+  const b = state.timeline.find((x) => x.what === 'connection:connected');
+  return a && b ? b.t - a.t : null;
 }
 const sumIn = (s, kind, f) => s.inbound.filter((x) => x.kind === kind).reduce((a, x) => a + (x[f] || 0), 0);
 const sumOut = (s, kind, f) => s.outbound.filter((x) => x.kind === kind).reduce((a, x) => a + (x[f] || 0), 0);
@@ -153,22 +173,30 @@ function flow(w, dir) {
     audioSamples: dir === 'in' ? sumIn(w.s2, 'audio', 'totalSamplesReceived') : undefined,
   };
 }
+const hasMedia = (f) => !!(f && f.audioPackets > 0 && f.videoPackets > 0);
 const transportOf = (s) => (s.transport && s.transport[0]) || {};
-const EXPECT = { tlsVersion: 'FEFC', dtlsCipher: 'TLS_AES_256_GCM_SHA384', srtpCipher: 'AEAD_AES_256_GCM' };
+const EXPECT = { tlsVersion: 'FEFC', dtlsCipher: 'TLS_AES_256_GCM_SHA384', srtpCipher: 'SRTP_AEAD_AES_256_GCM' };
 function levelOk(t) {
-  return t.tlsVersion === EXPECT.tlsVersion && t.dtlsCipher === EXPECT.dtlsCipher &&
+  return !!t && t.tlsVersion === EXPECT.tlsVersion && t.dtlsCipher === EXPECT.dtlsCipher &&
     t.srtpCipher === EXPECT.srtpCipher && t.dtlsState === 'connected';
 }
-function janusLevelOk(lines, n) {
-  const ok = lines.filter((l) => /DTLS-POLICY/.test(l) &&
-    /version=0xfefc cipher=0x1302 srtp=0x0008 group=0x11ec/.test(l) && /ok=1/.test(l));
-  return ok.length >= n;
+const round1 = (ms) => Math.round(ms / 100) / 10;
+
+// firewall helper: drop a fraction of the UDP packets delivered over loopback
+// (same-host test: the browser <-> Janus datagrams all cross lo)
+async function withLoss(prob, fn) {
+  if (!prob) return fn();
+  const rule = `INPUT -i lo -p udp -m statistic --mode random --probability ${prob} -j DROP`;
+  execSync(`sudo iptables -I ${rule}`);
+  try { return await fn(); } finally { execSync(`sudo iptables -D ${rule}`); }
 }
 
 // ------------------------------------------------------------------- scenarios
-async function echoScenario(browser, { name, setup, expect }) {
+// Janus is the DTLS client when the browser is the offerer (echotest / publisher)
+async function echoScenario(browser, spec) {
+  const { name, expect, loss } = spec;
   const t0 = Date.now(); const off = logSize();
-  const res = { name, expect, kind: 'echotest', chromiumRole: setup === 'active' ? 'client' : 'server (default)' };
+  const res = { name, expect, kind: 'echotest', janusRole: 'client', loss: loss || 0 };
   const ctx = await browser.newContext();
   const janus = new JanusClient(JANUS);
   try {
@@ -177,101 +205,149 @@ async function echoScenario(browser, { name, setup, expect }) {
     await janus.create();
     const h = await janus.attach('janus.plugin.echotest');
     janus.trickle[h] = (c) => page.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['p', c]).catch(() => {});
-    const offer = await page.evaluate((o) => window.probe.makeOffer('p', o), { audio: true, video: true, setup });
-    await janus.send(h, { audio: true, video: true }, { type: 'offer', sdp: offer });
-    const ev = await janus.waitFor((e) => e.sender === h && e.jsep, 15000);
-    await page.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['p', ev.jsep.sdp]);
-    res.state = await waitConnected(page, 'p', 15000);
-    await sleep(3000);
+    await withLoss(loss, async () => {
+      const offer = await page.evaluate((o) => window.probe.makeOffer('p', o), { audio: true, video: true });
+      await janus.send(h, { audio: true, video: true }, { type: 'offer', sdp: offer });
+      const ev = await janus.waitFor((e) => e.sender === h && e.jsep, 15000);
+      await page.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['p', ev.jsep.sdp]);
+      res.state = await waitConnected(page, 'p', loss ? 25000 : 15000);
+      await sleep(3000);
+    });
     const w = await statsWindow(page, 'p');
     res.transport = transportOf(w.s2);
     res.inbound = flow(w, 'in');
     res.outbound = flow(w, 'out');
     res.state = await page.evaluate(() => window.probe.state('p'));
+    res.connectMs = connectMs(res.state);
     await janus.send(h, { request: 'leave' }).catch(() => {});
   } catch (e) { res.error = String(e.message || e); }
   await janus.destroy();
   await ctx.close();
-  await sleep(500);
+  await sleep(700);
   res.janusLog = policyLines(logSince(off));
-  res.seconds = Math.round((Date.now() - t0) / 100) / 10;
-  const media = !!(res.inbound && res.inbound.audioPackets > 0 && res.inbound.videoPackets > 0);
-  if (expect === 'pass') {
-    res.ok = !!(res.transport && levelOk(res.transport) && media && janusLevelOk(res.janusLog, 1));
-  } else if (expect === 'fail') {
-    // fail-closed: no media may flow, Janus must not report an ok=1 handshake,
-    // and it must have logged the refusal
-    res.ok = !media && !janusLevelOk(res.janusLog, 1) &&
-      res.janusLog.some((l) => /ok=0|Handshake error|handshake failure|DTLS alert/.test(l));
-  } else {
-    res.ok = null;
-  }
+  res.seconds = round1(Date.now() - t0);
+  res.timerExpiredLines = res.janusLog.filter(isTimerLine).length;
+  const okLines = res.janusLog.filter(isOkLine).length;
+  const failLines = res.janusLog.filter(isFailLine).length;
+  const media = hasMedia(res.inbound);
+  res.accepted = !!(levelOk(res.transport) && media && okLines >= 1);
+  res.refused = !media && okLines === 0;
+  res.refusalLogged = failLines >= 1;
+  res.consistent = res.accepted || res.refused;
+  res.outcome = res.accepted ? 'accepted' : (res.refused ? 'refused' : 'INCONSISTENT');
+  res.ok = expect === 'pass' ? res.accepted : expect === 'fail' ? res.refused : res.consistent;
   return res;
 }
 
-async function roomScenario(browser, { name, roleP, roleS, room, e2ee }) {
+// publisher in `browser`, subscriber in `subBrowser` (default: same browser)
+async function roomScenario(browser, spec) {
+  const { name, roleS, room, e2ee, simulcast, expect, loss, subBrowser } = spec;
   const t0 = Date.now(); const off = logSize();
   const res = {
-    name, expect: 'pass', kind: 'videoroom', room: room === 2345 ? 'e2ee-required' : 'plain',
-    publisherChromiumRole: roleP === 'active' ? 'client' : 'server (default)',
-    subscriberChromiumRole: roleS === 'passive' ? 'server' : 'client (default)', e2ee: !!e2ee,
+    name, expect, kind: 'videoroom', room: room === 2345 ? 'e2ee-required' : 'plain', e2ee: !!e2ee,
+    simulcast: !!simulcast, loss: loss || 0,
+    subscriberChromiumRole: roleS === 'passive' ? 'server (janus client)' : 'client (janus server)',
   };
-  const ctx = await browser.newContext();
+  const ctxP = await browser.newContext();
+  const ctxS = subBrowser ? await subBrowser.newContext() : ctxP;
   const janus = new JanusClient(JANUS);
   try {
-    const pa = await newPage(ctx); const pb = await newPage(ctx);
+    const pa = await newPage(ctxP); const pb = await newPage(ctxS);
     res.pageInfo = await pa.evaluate(() => window.probe.info());
+    if (subBrowser) res.subPageInfo = await pb.evaluate(() => window.probe.info());
     await janus.create();
-    // publisher
-    const hp = await janus.attach('janus.plugin.videoroom');
-    janus.trickle[hp] = (c) => pa.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['pub', c]).catch(() => {});
-    await janus.send(hp, { request: 'join', ptype: 'publisher', room, display: 'pub' });
-    const joined = await janus.waitFor((e) => e.sender === hp && pluginData(e).videoroom === 'joined', 10000);
-    const feed = pluginData(joined).id;
-    const offer = await pa.evaluate((o) => window.probe.makeOffer('pub', o),
-      { audio: true, video: true, setup: roleP, e2ee });
-    await janus.send(hp, { request: 'publish', audio: true, video: true },
-      { type: 'offer', sdp: offer, ...(e2ee ? { e2ee: true } : {}) });
-    const ans = await janus.waitFor((e) => e.sender === hp && e.jsep, 15000);
-    await pa.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['pub', ans.jsep.sdp]);
-    res.publisherState = await waitConnected(pa, 'pub', 15000);
-    // subscriber
-    const hs = await janus.attach('janus.plugin.videoroom');
-    janus.trickle[hs] = (c) => pb.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['sub', c]).catch(() => {});
-    await janus.send(hs, { request: 'join', ptype: 'subscriber', room, streams: [{ feed }] });
-    const att = await janus.waitFor((e) => e.sender === hs && e.jsep, 15000);
-    res.subscriberJsepE2ee = !!att.jsep.e2ee;
-    const answer = await pb.evaluate(([s, o]) => window.probe.makeAnswer('sub', s, o),
-      [att.jsep.sdp, { setup: roleS, e2ee }]);
-    await janus.send(hs, { request: 'start', room }, { type: 'answer', sdp: answer });
-    res.subscriberState = await waitConnected(pb, 'sub', 15000);
-    await sleep(4000);
-    const wp = await statsWindow(pa, 'pub');
-    const wsub = await statsWindow(pb, 'sub');
-    res.publisherTransport = transportOf(wp.s2);
-    res.subscriberTransport = transportOf(wsub.s2);
-    res.publisherOut = flow(wp, 'out');
-    res.subscriberIn = flow(wsub, 'in');
-    if (e2ee) {
-      res.workerCountersPublisher = await pa.evaluate(() => window.probe.workerCounters());
-      res.workerCountersSubscriber = await pb.evaluate(() => window.probe.workerCounters());
-    }
-    res.subscriberVideoDecoded = sumIn(wsub.s2, 'video', 'framesDecoded');
-    await janus.send(hs, { request: 'leave' }).catch(() => {});
-    await janus.send(hp, { request: 'leave' }).catch(() => {});
+    await withLoss(loss, async () => {
+      // publisher
+      const hp = await janus.attach('janus.plugin.videoroom');
+      janus.trickle[hp] = (c) => pa.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['pub', c]).catch(() => {});
+      await janus.send(hp, { request: 'join', ptype: 'publisher', room, display: 'pub' });
+      const joined = await janus.waitFor((e) => e.sender === hp && pluginData(e).videoroom === 'joined', 10000);
+      const feed = pluginData(joined).id;
+      const offer = await pa.evaluate((o) => window.probe.makeOffer('pub', o),
+        { audio: true, video: true, e2ee, simulcast });
+      await janus.send(hp, { request: 'publish', audio: true, video: true },
+        { type: 'offer', sdp: offer, ...(e2ee ? { e2ee: true } : {}) });
+      const ans = await janus.waitFor((e) => e.sender === hp && e.jsep, 15000);
+      await pa.evaluate(([i, s]) => window.probe.setAnswer(i, s), ['pub', ans.jsep.sdp]);
+      res.publisherState = await waitConnected(pa, 'pub', loss ? 25000 : 15000);
+      // subscriber
+      const hs = await janus.attach('janus.plugin.videoroom');
+      janus.trickle[hs] = (c) => pb.evaluate(([i, cc]) => window.probe.addCandidate(i, cc), ['sub', c]).catch(() => {});
+      await janus.send(hs, { request: 'join', ptype: 'subscriber', room, streams: [{ feed }] });
+      const att = await janus.waitFor((e) => e.sender === hs && e.jsep, 15000);
+      res.subscriberJsepE2ee = !!att.jsep.e2ee;
+      const answer = await pb.evaluate(([s, o]) => window.probe.makeAnswer('sub', s, o),
+        [att.jsep.sdp, { setup: roleS, e2ee }]);
+      await janus.send(hs, { request: 'start', room }, { type: 'answer', sdp: answer });
+      res.subscriberState = await waitConnected(pb, 'sub', loss ? 25000 : 15000);
+      await sleep(4000);
+      if (simulcast) {
+        // which layers does the publisher really send, and can the subscriber switch?
+        const wp0 = await pa.evaluate(() => window.probe.stats('pub'));
+        res.simulcastPublisherLayers = wp0.outbound.filter((x) => x.kind === 'video')
+          .map((x) => ({ rid: x.rid, w: x.frameWidth, h: x.frameHeight, packets: x.packetsSent }));
+        const m = /m=video[\s\S]*?a=mid:(\S+)/.exec(att.jsep.sdp);
+        const mid = m ? m[1] : '1';
+        res.simulcastSubscriberWidth = {};
+        for (const sub of [0, 2, 1]) {
+          await janus.send(hs, { request: 'configure', streams: [{ mid, substream: sub }] });
+          await sleep(3500);
+          const s = await pb.evaluate(() => window.probe.stats('sub'));
+          res.simulcastSubscriberWidth[sub] = s.inbound.filter((x) => x.kind === 'video')
+            .map((x) => ({ w: x.frameWidth, h: x.frameHeight, decoded: x.framesDecoded }));
+        }
+      }
+      const wp = await statsWindow(pa, 'pub');
+      const wsub = await statsWindow(pb, 'sub');
+      res.publisherTransport = transportOf(wp.s2);
+      res.subscriberTransport = transportOf(wsub.s2);
+      res.publisherOut = flow(wp, 'out');
+      res.subscriberIn = flow(wsub, 'in');
+      res.subscriberVideoDecoded = sumIn(wsub.s2, 'video', 'framesDecoded');
+      res.subscriberState = await pb.evaluate(() => window.probe.state('sub'));
+      res.publisherState = await pa.evaluate(() => window.probe.state('pub'));
+      res.publisherConnectMs = connectMs(res.publisherState);
+      res.subscriberConnectMs = connectMs(res.subscriberState);
+      if (e2ee) {
+        res.workerCountersPublisher = await pa.evaluate(() => window.probe.workerCounters());
+        res.workerCountersSubscriber = await pb.evaluate(() => window.probe.workerCounters());
+      }
+      await janus.send(hs, { request: 'leave' }).catch(() => {});
+      await janus.send(hp, { request: 'leave' }).catch(() => {});
+    });
   } catch (e) { res.error = String(e.message || e); }
   await janus.destroy();
-  await ctx.close();
-  await sleep(500);
+  await ctxP.close();
+  if (subBrowser) await ctxS.close();
+  await sleep(700);
   res.janusLog = policyLines(logSince(off));
-  res.seconds = Math.round((Date.now() - t0) / 100) / 10;
-  const media = !!(res.subscriberIn && res.subscriberIn.audioPackets > 0 && res.subscriberIn.videoPackets > 0 &&
-    res.subscriberVideoDecoded > 0);
-  res.ok = !!(res.publisherTransport && levelOk(res.publisherTransport) && res.subscriberTransport &&
-    levelOk(res.subscriberTransport) && media && janusLevelOk(res.janusLog, 2));
-  if (e2ee) {
+  res.seconds = round1(Date.now() - t0);
+  res.timerExpiredLines = res.janusLog.filter(isTimerLine).length;
+  // Janus is the DTLS client for the publisher and for a subscriber that answers passive,
+  // and the DTLS server for a subscriber that answers active (default)
+  const okLines = res.janusLog.filter(isOkLine).length;
+  const failLines = res.janusLog.filter(isFailLine).length;
+  const pubOk = levelOk(res.publisherTransport) && hasMedia(res.publisherOut);
+  const subMedia = !!(hasMedia(res.subscriberIn) && res.subscriberVideoDecoded > 0);
+  res.accepted = !!(pubOk && levelOk(res.subscriberTransport) && subMedia && okLines >= 2);
+  res.refused = !!(pubOk && !subMedia && okLines === 1);
+  res.refusalLogged = failLines >= 1;
+  res.consistent = res.accepted || res.refused;
+  res.outcome = res.accepted ? 'accepted' : (res.refused ? 'refused' : 'INCONSISTENT');
+  res.ok = expect === 'pass' ? res.accepted : expect === 'fail' ? res.refused : res.consistent;
+  if (e2ee && res.accepted) {
     const c = res.workerCountersSubscriber;
-    res.ok = res.ok && !!c && c.receiver.video > 0 && c.receiver.audio > 0 && res.subscriberJsepE2ee;
+    const e2eeOk = !!c && c.receiver.video > 0 && c.receiver.audio > 0 &&
+      c.integrityOk.video > 0 && c.integrityOk.audio > 0 && c.integrityBad.video === 0 && c.integrityBad.audio === 0 &&
+      res.subscriberJsepE2ee;
+    res.e2eeByteExact = e2eeOk;
+    res.ok = res.ok && e2eeOk;
+  }
+  if (simulcast && res.accepted) {
+    const widths = Object.values(res.simulcastSubscriberWidth || {}).map((a) => (a[0] && a[0].w) || 0);
+    res.simulcastLayersSeen = (res.simulcastPublisherLayers || []).filter((l) => l.packets > 0).length;
+    res.simulcastSwitchWorks = new Set(widths.filter(Boolean)).size >= 2;
+    res.ok = res.ok && res.simulcastLayersSeen >= 3;
   }
   return res;
 }
@@ -283,7 +359,7 @@ async function run(fn, browser, spec) {
   if (!want(spec.name)) return;
   console.log('== ' + spec.name);
   let r;
-  try { r = await fn(browser, spec); } catch (e) { r = { name: spec.name, ok: false, error: String(e && e.stack || e) }; }
+  try { r = await fn(browser, spec); } catch (e) { r = { name: spec.name, ok: false, error: String((e && e.stack) || e) }; }
   console.log(JSON.stringify(r, null, 1));
   results.push(r);
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 1));
@@ -292,25 +368,43 @@ async function run(fn, browser, spec) {
 const srv = await startServer();
 const versions = {};
 try {
-  // Chromium with the PQC field trial (what our apps use) ---------------
+  // Chromium (Playwright build) with the PQC field trial, as our apps run -----
   const pqc = await launchChromium('WebRTC-EnableDtlsPqc/Enabled/');
   versions.chromium = pqc.version();
-  await run(echoScenario, pqc, { name: 'A1-echotest-chromium=DTLS-server', setup: null, expect: 'pass' });
-  await run(echoScenario, pqc, { name: 'A2-echotest-chromium=DTLS-client', setup: 'active', expect: 'pass' });
-  await run(roomScenario, pqc, { name: 'B1-videoroom-pub=server,sub=client', roleP: null, roleS: null, room: 1234 });
-  await run(roomScenario, pqc, { name: 'B2-videoroom-pub=client,sub=server', roleP: 'active', roleS: 'passive', room: 1234 });
-  await run(roomScenario, pqc, { name: 'E1-videoroom-e2ee-xor', roleP: null, roleS: null, room: 2345, e2ee: true });
-  await pqc.close();
-  // Negative: Chromium with the PQC group disabled -----------------------
-  const nopqc = await launchChromium('WebRTC-EnableDtlsPqc/Disabled/');
-  await run(echoScenario, nopqc, { name: 'N1a-no-mlkem-chromium=DTLS-server', setup: null, expect: 'fail' });
-  await run(echoScenario, nopqc, { name: 'N1b-no-mlkem-chromium=DTLS-client', setup: 'active', expect: 'fail' });
-  await nopqc.close();
-  // Informative: stock Chromium, no field trial at all --------------------
+  await run(echoScenario, pqc, { name: 'A1-echotest', expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'B1-videoroom-pub=janus-client,sub=janus-server', room: 1234, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'B2-videoroom-sub=janus-client', roleS: 'passive', room: 1234, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'E1-videoroom-e2ee-xor', room: 2345, e2ee: true, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'S1-videoroom-simulcast', room: 1234, simulcast: true, expect: 'pass' });
+  await run(echoScenario, pqc, { name: 'L1-echotest-30pct-udp-loss', loss: 0.3, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'L2-videoroom-30pct-udp-loss', room: 1234, loss: 0.3, expect: 'pass' });
+  await run(roomScenario, pqc, { name: 'L3-videoroom-sub=janus-client-30pct-udp-loss', roleS: 'passive', room: 1234, loss: 0.3, expect: 'pass' });
+  // stock Chromium without any field trial ------------------------------------
   const stock = await launchChromium('');
-  await run(echoScenario, stock, { name: 'I1-stock-chromium-no-trial-server', setup: null, expect: 'info' });
-  await run(echoScenario, stock, { name: 'I2-stock-chromium-no-trial-client', setup: 'active', expect: 'info' });
+  await run(echoScenario, stock, { name: 'I1-stock-chromium-no-trial', expect: 'auto' });
   await stock.close();
+  // weaker peers: must be refused, fail closed --------------------------------
+  for (const oc of OLD_CHROMES) {
+    for (const trial of ['', 'WebRTC-EnableDtlsPqc/Enabled/']) {
+      let b;
+      try { b = await launchChromium(trial, oc.path); } catch (e) {
+        results.push({ name: `N-chrome${oc.label}-launch`, ok: false, error: String(e.message || e) }); continue;
+      }
+      const tag = `chrome${oc.label}${trial ? '+pqc-trial' : ''}`;
+      versions[tag] = b.version();
+      await run(echoScenario, b, { name: `N-${tag}-echotest(peer=dtls-server)`, expect: 'auto' });
+      await run(roomScenario, pqc, { name: `N-${tag}-room-subscriber(peer=dtls-client)`, room: 1234, subBrowser: b, expect: 'auto' });
+      await b.close();
+    }
+  }
+  if (process.env.WITH_FIREFOX !== '0') {
+    const ff = await launchFirefox();
+    versions.firefox = ff.version();
+    await run(echoScenario, ff, { name: 'N-firefox-echotest(peer=dtls-server)', expect: 'auto' });
+    await run(roomScenario, pqc, { name: 'N-firefox-room-subscriber(peer=dtls-client)', room: 1234, subBrowser: ff, expect: 'auto' });
+    await ff.close();
+  }
+  await pqc.close();
 } catch (e) {
   console.error('FATAL', e);
   results.push({ name: 'fatal', ok: false, error: String((e && e.stack) || e) });
@@ -320,18 +414,23 @@ fs.writeFileSync(path.join(OUT, 'versions.json'), JSON.stringify(versions, null,
 fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 1));
 
 // summary table
-const fmt = (x) => (x ? `${x.tlsVersion || '-'} ${x.dtlsCipher || '-'} ${x.srtpCipher || '-'} ${x.tlsGroup || ''}`.trim() : '-');
+const fmt = (x) => (x && x.tlsVersion ? `${x.tlsVersion} ${x.dtlsCipher || '-'} ${x.srtpCipher || '-'}` : '-');
 const rows = results.map((r) => {
-  const t = r.transport || r.publisherTransport || null;
-  const t2 = r.subscriberTransport || null;
+  const t = r.transport || r.subscriberTransport || null;
   let med = '-';
   if (r.inbound) med = `a${r.inbound.audioPackets}/v${r.inbound.videoPackets}`;
-  else if (r.subscriberIn) med = `a${r.subscriberIn.audioPackets}/v${r.subscriberIn.videoPackets} dec${r.subscriberVideoDecoded}`;
-  const verdict = r.ok === true ? 'PASS' : (r.expect === 'info' ? 'INFO' : 'FAIL');
-  return `${verdict} | ${r.name} | ${fmt(t)}${t2 ? ' || ' + fmt(t2) : ''} | media ${med}${r.error ? ' | ERR ' + r.error : ''}`;
+  else if (r.subscriberIn) med = `a${r.subscriberIn.audioPackets}/v${r.subscriberIn.videoPackets}/dec${r.subscriberVideoDecoded}`;
+  const extra = [];
+  if (r.outcome) extra.push(r.outcome + (r.refused ? (r.refusalLogged ? '(logged)' : '(silent)') : ''));
+  if (r.connectMs != null) extra.push(`conn${r.connectMs}ms`);
+  if (r.subscriberConnectMs != null) extra.push(`subconn${r.subscriberConnectMs}ms`);
+  if (r.timerExpiredLines) extra.push(`timer${r.timerExpiredLines}`);
+  if (r.e2eeByteExact !== undefined) extra.push(`e2ee-byte-exact=${r.e2eeByteExact}`);
+  if (r.simulcastLayersSeen !== undefined) extra.push(`simulcast-layers=${r.simulcastLayersSeen},switch=${r.simulcastSwitchWorks}`);
+  if (r.error) extra.push('ERR ' + String(r.error).slice(0, 160));
+  return `${r.ok === true ? 'PASS' : 'FAIL'} | ${r.name} | ${fmt(t)} | ${med} | ${extra.join(' ')}`;
 });
 const table = rows.join('\n');
 console.log('\n===== SUMMARY =====\n' + table);
 fs.writeFileSync(path.join(OUT, 'summary.txt'), table + '\n');
-const failed = results.filter((r) => r.expect !== 'info' && r.ok !== true);
-process.exit(failed.length ? 1 : 0);
+process.exit(results.some((r) => r.ok !== true) ? 1 : 0);

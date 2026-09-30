@@ -72,7 +72,20 @@ jobs:
         working-directory: janus-probe/client
         run: |
           npm install --no-audit --no-fund
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps chromium firefox
+
+      - name: Older Chrome-for-Testing builds (weaker peers for the negative tests)
+        working-directory: janus-probe/client
+        run: |
+          json='['
+          for m in 130 142 148; do
+            out=$(npx --yes @puppeteer/browsers install "chrome@$m" --path "$HOME/cft" 2>&1 | tail -1) || true
+            p=$(echo "$out" | awk '{print $2}')
+            echo "chrome@$m -> $out"
+            if [ -n "$p" ] && [ -x "$p" ]; then json="$json{\"label\":\"$m\",\"path\":\"$p\"},"; fi
+          done
+          json="${json%,}]"
+          echo "OLD_CHROMES=$json" >> "$GITHUB_ENV"
 
       - name: Run the probe
         id: run
