@@ -195,3 +195,240 @@ jobs:
           tb=$(ls out/qjanus-*.tar.gz)
           docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out:ro" ubuntu:24.04 \
             bash /repo/qjanus/build/check-tarball.sh "/out/$(basename "$tb")" /repo/qjanus/build
+
+  integration:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      OUT_DIR: ${{ github.workspace }}/integration-out
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Install like a node does (install.sh, systemd unit, DTLS key generated here)
+        id: install
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          sudo mkdir -p /tmp/pkg
+          sudo tar -xzf out/qjanus-*.tar.gz -C /tmp/pkg
+          cd /tmp/pkg/qjanus
+          FP=$(sudo ./install.sh --install-deps --http-bind 127.0.0.1 2> "$RUNNER_TEMP/install.log") || { cat "$RUNNER_TEMP/install.log"; exit 1; }
+          cat "$RUNNER_TEMP/install.log"
+          echo "stdout of install.sh: $FP"
+          printf '%s\n' "$FP" | grep -Eq '^sha-256 ([0-9A-F]{2}:){31}[0-9A-F]{2}$' || { echo "::error::install.sh must print exactly one sha-256 fingerprint"; exit 1; }
+          [ "$(printf '%s\n' "$FP" | wc -l)" = 1 ]
+          echo "fp=$FP" >> "$GITHUB_OUTPUT"
+          sudo journalctl -u qjanus -o cat --no-pager | head -60
+
+      - name: install.sh is idempotent (same fingerprint and secrets, no restart when nothing changed)
+        run: |
+          set -euo pipefail
+          env_before=$(sudo sha256sum /etc/qjanus/qjanus.env | cut -d' ' -f1)
+          key_before=$(sudo sha256sum /etc/qjanus/dtls.key | cut -d' ' -f1)
+          pid_before=$(systemctl show -p MainPID --value qjanus)
+          FP2=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/install2.log")
+          cat "$RUNNER_TEMP/install2.log"
+          [ "$FP2" = "${{ steps.install.outputs.fp }}" ]
+          [ "$(sudo sha256sum /etc/qjanus/qjanus.env | cut -d' ' -f1)" = "$env_before" ]
+          [ "$(sudo sha256sum /etc/qjanus/dtls.key | cut -d' ' -f1)" = "$key_before" ]
+          [ "$(systemctl show -p MainPID --value qjanus)" = "$pid_before" ]
+          echo "idempotent"
+
+      - name: The running node - files, sandbox, listeners, no system OpenSSL, no secret on a command line
+        run: |
+          set -euo pipefail
+          sudo ls -l /etc/qjanus /opt/qjanus /opt/qjanus/releases
+          [ "$(sudo stat -c %a /etc/qjanus/qjanus.env)" = 600 ]
+          [ "$(sudo stat -c %a /etc/qjanus/dtls.key)" = 600 ]
+          systemctl is-active --quiet qjanus
+          PID=$(systemctl show -p MainPID --value qjanus)
+          grep -E '^(Uid|NoNewPrivs|CapEff|CapBnd|Seccomp):' /proc/$PID/status
+          [ "$(awk '/^Uid:/ {print $2}' /proc/$PID/status)" != 0 ]
+          [ "$(awk '/^CapEff:/ {print $2}' /proc/$PID/status)" = 0000000000000000 ]
+          [ "$(awk '/^CapBnd:/ {print $2}' /proc/$PID/status)" = 0000000000000000 ]
+          [ "$(awk '/^NoNewPrivs:/ {print $2}' /proc/$PID/status)" = 1 ]
+          [ "$(awk '/^Seccomp:/ {print $2}' /proc/$PID/status)" = 2 ]
+          if sudo tr '\0' ' ' < /proc/$PID/cmdline | grep -Eq '[0-9a-f]{32}'; then echo "::error::a secret-looking value is on the command line"; exit 1; fi
+          if sudo grep -E 'libssl|libcrypto' /proc/$PID/maps; then echo "::error::a system libssl/libcrypto is mapped"; exit 1; fi
+          sudo ss -Hltnp | grep janus | tee "$RUNNER_TEMP/tcp.txt"
+          [ "$(wc -l < "$RUNNER_TEMP/tcp.txt")" = 2 ]
+          grep -q '127.0.0.1:8088' "$RUNNER_TEMP/tcp.txt"
+          grep -q '127.0.0.1:8188' "$RUNNER_TEMP/tcp.txt"
+          systemd-analyze security --no-pager qjanus.service | tail -25 || true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Playwright + Chromium + Firefox
+        working-directory: qjanus/test/e2e
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium firefox
+
+      - name: Older Chrome-for-Testing builds (weaker peers for the negative tests)
+        working-directory: qjanus/test/e2e
+        run: |
+          json='['
+          for m in 130 142 148; do
+            out=$(npx --yes @puppeteer/browsers install "chrome@$m" --path "$HOME/cft" 2>&1 | tail -1) || true
+            p=$(echo "$out" | awk '{print $2}')
+            echo "chrome@$m -> $out"
+            if [ -n "$p" ] && [ -x "$p" ]; then json="$json{\"label\":\"$m\",\"path\":\"$p\"},"; fi
+          done
+          json="${json%,}]"
+          echo "OLD_CHROMES=$json" >> "$GITHUB_ENV"
+
+      - name: netem is available (tc, sch_netem)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends iproute2 > /dev/null
+          sudo modprobe sch_netem || sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          sudo bash qjanus/test/e2e/netem.sh on
+          sudo bash qjanus/test/e2e/netem.sh off
+
+      - name: API conformance (server calls of spec section 3 over HTTP, client calls over WebSockets)
+        working-directory: qjanus/test/conformance
+        run: |
+          set -euo pipefail
+          set -a; . <(sudo cat /etc/qjanus/qjanus.env); set +a
+          echo "::add-mask::$QJANUS_TOKEN_SECRET"; echo "::add-mask::$QJANUS_ADMIN_KEY"
+          export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
+          OUT_DIR="$OUT_DIR/conformance" SECRETS_FILE="$RUNNER_TEMP/secrets-conformance.json" node conformance.mjs 2>&1 | tee "$OUT_DIR/conformance.log"
+
+      - name: E2E - Chromium (PQC trial) group calls with E2EE frames, simulcast, netem loss/reorder, refused peers
+        working-directory: qjanus/test/e2e
+        run: |
+          set -euo pipefail
+          set -a; . <(sudo cat /etc/qjanus/qjanus.env); set +a
+          echo "::add-mask::$QJANUS_TOKEN_SECRET"; echo "::add-mask::$QJANUS_ADMIN_KEY"
+          export QJANUS_FINGERPRINT='${{ steps.install.outputs.fp }}'
+          SUITE=all NETEM="$PWD/netem.sh" OUT_DIR="$OUT_DIR/e2e" SECRETS_FILE="$RUNNER_TEMP/secrets-e2e.json" node e2e.mjs 2>&1 | tee "$OUT_DIR/e2e.log"
+
+      - name: Log hygiene - no identifiers, addresses, fingerprints or secrets in the service journal
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo journalctl -u qjanus -o cat --no-pager > "$OUT_DIR/journal.txt"
+          files=""
+          for f in "$RUNNER_TEMP"/secrets-conformance.json "$RUNNER_TEMP"/secrets-e2e.json; do [ -f "$f" ] && files="$files $f"; done
+          # shellcheck disable=SC2086
+          node qjanus/test/lib/check-logs.mjs "$OUT_DIR/journal.txt" $files
+
+      - name: Listeners after the run - only the two loopback TCP ports, UDP only inside 20000-20999
+        run: |
+          set -euo pipefail
+          sudo ss -Hlunp | grep janus | awk '{print $4}' | tee "$RUNNER_TEMP/udp.txt" || true
+          while read -r a; do
+            [ -n "$a" ] || continue
+            port=${a##*:}
+            if [ "$port" -lt 20000 ] || [ "$port" -gt 20999 ]; then echo "::error::UDP listener outside the rtp_port_range: $a"; exit 1; fi
+          done < "$RUNNER_TEMP/udp.txt"
+          sudo ss -Hltnp | grep janus | awk '{print $4}' | sort
+
+      - name: Upgrade, rollback, uninstall, reinstall (the node lifecycle of the README)
+        run: |
+          set -euo pipefail
+          FP1='${{ steps.install.outputs.fp }}'
+          rel1=$(basename "$(readlink -f /opt/qjanus/current)")
+          # a second release: the same tree with another VERSION
+          sudo rm -rf /tmp/pkg2 && sudo mkdir /tmp/pkg2 && sudo cp -a /tmp/pkg/qjanus /tmp/pkg2/qjanus
+          echo "${rel1}-upgrade" | sudo tee /tmp/pkg2/qjanus/VERSION > /dev/null
+          pid1=$(systemctl show -p MainPID --value qjanus)
+          FP2=$(cd /tmp/pkg2/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/up.log"); cat "$RUNNER_TEMP/up.log"
+          [ "$FP2" = "$FP1" ]
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "${rel1}-upgrade" ]
+          [ "$(systemctl show -p MainPID --value qjanus)" != "$pid1" ]
+          systemctl is-active --quiet qjanus
+          FP3=$(sudo /opt/qjanus/current/install.sh --rollback 2> "$RUNNER_TEMP/rb.log"); cat "$RUNNER_TEMP/rb.log"
+          [ "$FP3" = "$FP1" ]
+          [ "$(basename "$(readlink -f /opt/qjanus/current)")" = "$rel1" ]
+          systemctl is-active --quiet qjanus
+          sudo /opt/qjanus/current/install.sh --uninstall
+          [ ! -e /opt/qjanus ]
+          [ ! -e /etc/systemd/system/qjanus.service ]
+          if systemctl is-active --quiet qjanus; then echo "::error::qjanus still active after uninstall"; exit 1; fi
+          sudo test -s /etc/qjanus/dtls.key
+          FP4=$(cd /tmp/pkg/qjanus && sudo ./install.sh 2> "$RUNNER_TEMP/re.log"); cat "$RUNNER_TEMP/re.log"
+          [ "$FP4" = "$FP1" ]
+          systemctl is-active --quiet qjanus
+          sudo /opt/qjanus/current/install.sh --uninstall --purge
+          [ ! -e /etc/qjanus ]
+          [ ! -e /opt/qjanus ]
+          echo "lifecycle ok"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-integration-out
+          path: |
+            integration-out/
+          if-no-files-found: warn
+          retention-days: 30
+
+  release:
+    needs: [precheck, build, clean-install, integration]
+    if: ${{ !cancelled() && needs.precheck.outputs.release == 'true' && needs.build.result == 'success' && needs.clean-install.result == 'success' && needs.integration.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Refuse if the release tag appeared while we were building (race safety)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release '$IN_RELEASE_TAG' now exists - refusing to publish over it"; exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$IN_RELEASE_TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$IN_RELEASE_TAG' now exists - refusing to attach a release to it"; exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            out/qjanus-*.tar.gz
+            out/SHA256SUMS
+            out/BUILDINFO.json
+
+      - name: Create the release (new tag only, never overwritten)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$IN_RELEASE_TAG" \
+            --notes "qjanus: Janus v1.4.2 VideoRoom SFU on BoringSSL f91f1447 (DTLS 1.3, X25519MLKEM768, TLS_AES_256_GCM_SHA384, SRTP AEAD_AES_256_GCM only, fail closed). Ubuntu 24.04 x86_64 relocatable tarball: unpack and run install.sh (see qjanus/README.md). Sources, pins and patches: BUILDINFO.json. Verify with: gh attestation verify <tarball> -R $GITHUB_REPOSITORY" \
+            out/*
