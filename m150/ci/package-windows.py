@@ -14,11 +14,12 @@ already contains BoringSSL, Opus, abseil, libyuv, ... - one file to link).
 The `webrtc` target does NOT depend on api/crypto:frame_crypto_transformer
 (P1/P3 code, only pulled in by the Android/iOS SDK targets), so that library
 is passed as an [extra.lib] (relative to <build_dir>) and merged into
-webrtc.lib with Chromium's llvm-lib.
+webrtc.lib with the MSVC lib.exe.
 The header tree is the public include set a native client needs: WebRTC's own
 api/, rtc_base/, modules/, ... plus abseil, libyuv and BoringSSL headers.
 No absolute paths, timestamps or runner data are written into the archive.
 """
+import glob
 import os
 import shutil
 import subprocess
@@ -73,17 +74,16 @@ def main():
             if not os.path.isfile(e):
                 print("::error::package-windows: extra library %s missing" % e, file=sys.stderr)
                 return 1
-        bindir = os.path.join(src, "third_party", "llvm-build", "Release+Asserts", "bin")
         merged = os.path.join(build, "obj", "webrtc-merged.lib")
-        # llvm-lib.exe if the Chromium clang package ships it, else lld-link
-        # in its lib mode (same COFF archive writer).
-        llvm_lib = os.path.join(bindir, "llvm-lib.exe")
-        if os.path.isfile(llvm_lib):
-            cmd = [llvm_lib]
-        else:
-            print("package-windows: no llvm-lib.exe in %s (has: %s); using lld-link /lib" %
-                  (bindir, ", ".join(sorted(x for x in os.listdir(bindir) if "lib" in x or "lld" in x))))
-            cmd = [os.path.join(bindir, "lld-link.exe"), "/lib"]
+        # Chromium's clang package has no llvm-lib.exe, and lld-link /lib
+        # crashes on this archive, so use the MSVC lib.exe of the runner's
+        # Visual Studio (the same tool the build itself uses for LIB steps).
+        vs = os.environ.get("GYP_MSVS_OVERRIDE_PATH", "C:/Program Files/Microsoft Visual Studio/2022/Enterprise")
+        cands = sorted(glob.glob(os.path.join(vs, "VC", "Tools", "MSVC", "*", "bin", "Hostx64", "x64", "lib.exe")))
+        if not cands:
+            print("::error::package-windows: no MSVC lib.exe under %s" % vs, file=sys.stderr)
+            return 1
+        cmd = [cands[-1], "/nologo"]
         subprocess.run(cmd + ["/OUT:" + merged, lib] + extras, check=True)
         lib = merged
     files = collect(src)
