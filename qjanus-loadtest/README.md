@@ -97,6 +97,7 @@ Create as many rooms as the ramp will reach (`--ramp-max`), sized like the scena
    ```bash
    bash scripts/node-sampler.sh --out /tmp/qjanus-sampler.csv --latest /tmp/qjanus-latest.json --quiet &
    ```
+   The sampler and its summarizer are two self-contained bash files (bash + awk, no Node): `scp scripts/node-sampler.sh scripts/sampler-summary.sh` to the node.
    It finds the `qjanus` (or `janus`) process by name; `--pid N` if needed. Columns: `ts,iso,cpu_pct,rss_mb,threads,total_cpu_pct,
    load1,rx_mbps,tx_mbps,rx_drop_d,tx_drop_d,udp_in_pps,udp_out_pps,udp_in_errors_d,udp_rcvbuf_errors_d,udp_sndbuf_errors_d,
    cg_throttled_ms_d,pid` (`cpu_pct` is percent of ONE core: 200 = the whole `CPUQuota=200%`; `cg_throttled_ms_d` is the cgroup
@@ -106,7 +107,8 @@ Create as many rooms as the ramp will reach (`--ramp-max`), sized like the scena
      `ramp_start/step/max`, `hold_sec`, `shards` (N runners, room `k` on shard `k mod N`), `video_profile`. The `plan` job sets a common
      start instant (`start_delay_sec`, default 240 s: runner start-up must fit in) so all shards step in lock step; every shard
      uploads `shard-<n>`; the `report` job merges them into `report.md`/`report.json` (artifact `report` + job summary).
-     The workflow can only be dispatched from the default branch once the file is merged there.
+     Dispatch works on any branch that contains the workflow file (`gh workflow run qjanus-loadtest.yml --ref <branch> -f mode=remote ...`).
+     The shard job runs `scripts/run-shard.sh`, the same script the smoke run uses for its own two-shard test (step `i`).
    * **from your own machine(s)**: `export QJANUS_WS_URL=wss://<node>/janus` and
      ```bash
      node bin/qjanus-load.mjs ramp --scenario audio8 --ramp-start 2 --ramp-step 2 --ramp-max 40 --hold-sec 60 \
@@ -148,7 +150,10 @@ The smoke job builds Janus like production (BoringSSL f91f1447, libsrtp 2.8.1, l
 v1.4.2 + the DTLS 1.3 / ML-KEM policy patch; `smoke/`, `scripts/build-*.sh`), starts it with fresh random secrets, and drives it
 with the real harness: access-control negatives (bad/expired/foreign token, admin key, join tokens, kick), `audio8`, `video4`,
 `video8` runs, two ramps (one ends on `max_rooms`, one on the CPU limit), two concurrent shards + merged report, `--manage-rooms`,
-the sampler and its summarizer. On Linux with the same prerequisites: `bash scripts/build-deps.sh && bash scripts/build-janus.sh &&
+the remote-mode shard script (`run-shard.sh`, 2 shards), a ramp under **6 % injected UDP loss** that must stop with `loss`
+(measured 12 % because both directions are hit), layer selection (speaker layer wider than grid layer), the sampler and its summarizer.
+Every bot connection is asserted to be DTLS 1.3 / `TLS_AES_256_GCM_SHA384` / AEAD AES-256-GCM / X25519MLKEM768 on both ends (the
+Janus `DTLS-POLICY ... ok=1` lines are counted). On Linux with the same prerequisites: `bash scripts/build-deps.sh && bash scripts/build-janus.sh &&
 bash scripts/smoke.sh` (`SMOKE_ONLY=a,d` re-runs single steps).
 
 Unit tests (no Janus): `npm ci && npx playwright install chromium && npm test` (about 6 minutes on a slow machine; the browser tests
