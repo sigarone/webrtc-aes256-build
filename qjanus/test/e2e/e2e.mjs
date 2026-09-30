@@ -118,12 +118,23 @@ async function waitState(p, pcId, wanted, ms) {
   }
   return last;
 }
+// the browser's view of the DTLS transport can lag the server's `webrtcup` under packet loss
+async function waitLevel(p, pcId, ms) {
+  const end = Date.now() + ms;
+  let t = null;
+  while (Date.now() < end) {
+    t = await p.transport(pcId).catch(() => null);
+    if (levelOk(t)) return true;
+    await sleep(300);
+  }
+  return false;
+}
 const sumBy = (arr, mid, f) => arr.filter((x) => x.mid === mid).reduce((a, x) => a + (x[f] || 0), 0);
 
 // ------------------------------------------------------------- one call participant
 // Publisher handle + publisher PC, subscriber handle + subscriber PC, all over ONE Janus session.
 class Peer {
-  constructor(name, browserRef, room, { simulcast = true, setup = null, upTimeout = 20000 } = {}) {
+  constructor(name, browserRef, room, { simulcast = true, setup = null, upTimeout = 20000, video = null } = {}) {
     this.name = name;
     this.room = room;
     this.id = hex(16);                   // pseudonym
@@ -131,6 +142,7 @@ class Peer {
     this.key = hex(32);                  // K[me, epoch]
     this.keyIndex = 1;
     this.simulcast = simulcast;
+    this.video = video;                  // {width,height} of the camera; default 640x360
     this.setup = setup;                  // 'passive' = Janus becomes the DTLS client on the subscriber PC
     this.upTimeout = upTimeout;
     this.pubPc = `${name}-pub`;
@@ -161,7 +173,7 @@ class Peer {
   }
   async publish() {
     await evalIn(this, ([k, i]) => window.q.setSendKey(k, i), [this.key, this.keyIndex]);
-    const offer = await evalIn(this, ([i, o]) => window.q.newPublisher(i, o), [this.pubPc, { e2ee: true, simulcast: this.simulcast }]);
+    const offer = await evalIn(this, ([i, o]) => window.q.newPublisher(i, o), [this.pubPc, { e2ee: true, simulcast: this.simulcast, ...(this.video || {}) }]);
     const m = await this.c.message(this.pubHandle, { request: 'publish', audio: true, video: true, descriptions: [{ mid: '0', description: 'mic' }, { mid: '1', description: 'camera' }] },
       { type: 'offer', sdp: offer, e2ee: true });
     assert.equal(pluginData(m).configured, 'ok', JSON.stringify(m).slice(0, 300));
@@ -311,7 +323,7 @@ try {
     let room; let peers = [];
     await check('3-party call: transport level, DTLS pin, E2EE frames from every sender decrypt at every receiver, all media flows', async () => {
       room = await makeRoom(8);
-      peers = await startCall(pqc, room, ['A', 'B', 'C'], { C: { setup: 'passive' } });
+      peers = await startCall(pqc, room, ['A', 'B', 'C'], { B: { video: { width: 1280, height: 720 } }, C: { setup: 'passive' } });   // B publishes the spec profile (l/m/h = 320/640/1280)
       const ids = peers.map((p) => p.id);
       await sleep(6000);
       const detail = [];
@@ -344,13 +356,18 @@ try {
       assert.ok(c.subMidMap && Object.keys(c.subMidMap).length === 4, 'C subscribes to 2 streams of each of 2 publishers');
     });
 
-    await check('simulcast: the publisher sends 3 layers of 160/320/640 px, the subscriber selects each substream (0 < 1 < 2) and gets exactly that size, with E2EE frames', async () => {
+    await check('simulcast: the publisher sends 3 layers of 320/640/1280 px, the subscriber selects each substream (0 < 1 < 2) and gets exactly that size, with E2EE frames', async () => {
       const [A, B] = peers;
-      const st = await B.stats(B.pubPc);
-      const layers = st.outbound.filter((x) => x.kind === 'video' && x.rid && x.packetsSent > 0);
-      assert.deepEqual(layers.map((x) => x.rid).sort(), ['h', 'l', 'm'], 'B sends all three simulcast layers');
-      const out = Object.fromEntries(layers.map((x) => [x.rid, x.frameWidth]));
-      assert.ok(out.l > 0 && out.l < out.m && out.m < out.h, `three distinct layer sizes: ${JSON.stringify(out)}`);
+      let out = {}; let layers = [];
+      for (let i = 0; i < 20; i++) {
+        layers = (await B.stats(B.pubPc)).outbound.filter((x) => x.kind === 'video' && x.rid);
+        out = Object.fromEntries(layers.map((x) => [x.rid, x.frameWidth || 0]));
+        if (out.l > 0 && out.m > 0 && out.h > 0) break;
+        await sleep(500);
+      }
+      const diag = JSON.stringify(layers.map((x) => ({ rid: x.rid, w: x.frameWidth, h: x.frameHeight, frames: x.framesEncoded, pkts: x.packetsSent, kbps: Math.round((x.targetBitrate || 0) / 1000), limit: x.qualityLimitationReason })));
+      assert.deepEqual(layers.filter((x) => x.packetsSent > 0).map((x) => x.rid).sort(), ['h', 'l', 'm'], `B sends all three simulcast layers: ${diag}`);
+      assert.ok(out.l > 0 && out.l < out.m && out.m < out.h, `three distinct layer sizes: ${diag}`);
       const vs = (await A.stats(A.subPc)).inbound.find((x) => x.kind === 'video' && A.subMidMap[x.mid] === B.id);
       assert.ok(vs, 'A receives the video of B');
       const videoMid = vs.mid;
@@ -529,9 +546,9 @@ try {
         await sub.learnKey(pub);
         await pub.join(); await sub.join();
         await pub.publish();                                    // publisher PC: Janus is the DTLS client
-        r.pub = levelOk(await pub.transport(pub.pubPc));
+        r.pub = await waitLevel(pub, pub.pubPc, 15000);
         await sub.subscribe([{ id: pub.id, streams: [{ mid: '0' }, { mid: '1' }] }]);   // subscriber PC: Janus offers
-        r.sub = levelOk(await sub.transport(sub.subPc));
+        r.sub = await waitLevel(sub, sub.subPc, 15000);
       } catch (e) { r.error = String((e && e.message) || e).slice(0, 160); }
       r.ms = Date.now() - t0;
       await pub.close().catch(() => {}); await sub.close().catch(() => {});

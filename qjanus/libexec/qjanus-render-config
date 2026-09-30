@@ -34,6 +34,8 @@ QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTO
 QJANUS_NAT_1_1=${QJANUS_NAT_1_1:-}
 if [ -n "$QJANUS_NAT_1_1" ]; then
   [[ $QJANUS_NAT_1_1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "QJANUS_NAT_1_1 must be an IPv4 address"
+  IFS=. read -r o1 o2 o3 o4 <<< "$QJANUS_NAT_1_1"
+  for o in "$o1" "$o2" "$o3" "$o4"; do [ "$((10#$o))" -le 255 ] || die "QJANUS_NAT_1_1 must be an IPv4 address"; done
   NAT_LINE="nat_1_1_mapping = \"$QJANUS_NAT_1_1\""
 else
   NAT_LINE="# nat_1_1_mapping is not set (QJANUS_NAT_1_1 is empty)"

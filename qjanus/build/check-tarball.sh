@@ -45,6 +45,7 @@ grep -q 'nat_1_1_mapping = ' /tmp/node/etc/janus.jcfg && fail "nat_1_1_mapping m
 QJANUS_NAT_1_1=192.0.2.7 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-nat 2> /dev/null
 grep -q '^	nat_1_1_mapping = "192.0.2.7"$' /tmp/node/etc-nat/janus.jcfg || fail "QJANUS_NAT_1_1 is not rendered"
 if QJANUS_NAT_1_1='1.2.3.4"; x' "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an invalid QJANUS_NAT_1_1 must be refused"; fi
+if QJANUS_NAT_1_1=999.1.1.1 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an out-of-range QJANUS_NAT_1_1 must be refused"; fi
 if QJANUS_HTTP_BIND='1.2.3.4|x' "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an invalid QJANUS_HTTP_BIND must be refused"; fi
 ok "optional 1:1 NAT mapping renders, invalid settings are refused"
 
