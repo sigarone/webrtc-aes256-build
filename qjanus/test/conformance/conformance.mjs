@@ -399,16 +399,20 @@ await check('rtp_forward is for the server only (lock_rtp_forward + admin_key): 
   assert.equal(codeOf(secretOnly), 429, JSON.stringify(secretOnly));
   const viaHttp = await api.session(({ vr }) => vr(req));
   assert.equal(viaHttp.error_code, 429, JSON.stringify(viaHttp));
+  // stopping a forwarder is locked the same way (Janus asks for the admin_key there, not for the room secret)
+  const stop = { request: 'stop_rtp_forward', room, publisher_id: idA, stream_id: 1 };
+  assert.equal(codeOf(await c.message(h, stop)), 429);
+  assert.equal(codeOf(await c.message(h, { ...stop, secret: roomSecret })), 429);
+  assert.equal(codeOf(await c.message(h, { ...stop, admin_key: hex(32) })), 433);
 });
 
-await check('every request that changes a room needs the room secret (429 missing, 433 wrong): edit, enable_recording, stop_rtp_forward, listforwarders - a client cannot turn recording on', async () => {
+await check('every request that changes a room needs the room secret (429 missing, 433 wrong): edit, enable_recording, listforwarders - a client cannot turn recording on', async () => {
   const c = await ws();
   await c.create();
   const h = await c.attach();
   for (const body of [
     { request: 'edit', room, new_description: 'x' },
     { request: 'enable_recording', room, record: true },
-    { request: 'stop_rtp_forward', room, publisher_id: idA, stream_id: 1 },
     { request: 'listforwarders', room },
   ]) {
     const none = await c.message(h, body);
