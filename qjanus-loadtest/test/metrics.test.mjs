@@ -98,12 +98,39 @@ test('loss counts audio and video subscriber packets together; no traffic is no 
   assert.deepEqual([empty.value, empty.breached], [null, false]);
 });
 
-test('freeze tolerance', () => {
-  assert.equal(M.evalFreeze(0, 0).breached, false);
-  assert.equal(M.evalFreeze(1, 0).breached, true);
-  assert.equal(M.evalFreeze(2, 2).breached, false);
-  assert.equal(M.evalFreeze(3, 2).breached, true);
-  assert.deepEqual(M.evalFreeze(null, 0), { value: null, limit: 0, breached: false });
+/** Samples of consecutive 10 s windows with the given freeze counts (one video sample per window). */
+function freezeSamples(counts) {
+  return counts.map((c, w) => sample(w * 10_000 + 1000, { freeze: c }));
+}
+const freezeCheck = (counts, tolerance, breachWindows = 2) => M.evalFreeze(M.freezeWindows(freezeSamples(counts), 0, counts.length * 10_000), { tolerance, breachWindows });
+
+test('freezeWindows sums vIn.freezeCount per slice, with the same slicing as lossWindows', () => {
+  const s = [sample(1000, { freeze: 1 }), sample(3000, { freeze: 2 }), sample(12_000, { freeze: 0 }), sample(25_000, { freeze: 4 })];
+  const w = M.freezeWindows(s, 0, 30_000);
+  assert.deepEqual(w.map((x) => x.freezeCount), [3, 0, 4]);
+  assert.deepEqual(w.map((x) => [x.fromMs, x.toMs]), M.lossWindows(s, 0, 30_000).map((x) => [x.fromMs, x.toMs]));
+  assert.deepEqual(M.freezeWindows(s, 0, 4_000).map((x) => x.freezeCount), [3]); // short window: one slice
+  assert.deepEqual(M.freezeWindows(s, 5, 5), []);
+});
+
+test('freeze is debounced like loss: one isolated slice is not a breach, breach-windows consecutive slices are', () => {
+  assert.equal(freezeCheck([0, 0, 0], 0).breached, false);
+  const isolated = freezeCheck([0, 3, 0], 0);
+  assert.deepEqual([isolated.value, isolated.breached], [0, false]);
+  const twoApart = freezeCheck([1, 0, 1], 0);
+  assert.equal(twoApart.breached, false);
+  const twoInARow = freezeCheck([0, 1, 2], 0);
+  assert.deepEqual([twoInARow.value, twoInARow.limit, twoInARow.breached], [1, 0, true]); // sustained value = min of the pair
+  assert.equal(freezeCheck([0, 3, 0], 0, 1).breached, true); // breach-windows 1: any slice
+  assert.equal(freezeCheck([1, 1, 1], 0, 3).breached, true);
+  assert.equal(freezeCheck([1, 1, 0], 0, 3).breached, false);
+});
+
+test('freeze tolerance is strict per slice', () => {
+  assert.equal(freezeCheck([2, 2], 2).breached, false);
+  assert.equal(freezeCheck([3, 3], 2).breached, true);
+  assert.equal(freezeCheck([3, 2], 2).breached, false);
+  assert.deepEqual(M.evalFreeze([], { tolerance: 0, breachWindows: 2 }), { value: null, limit: 0, breached: false });
 });
 
 test('cpu, join and transport checks', () => {
@@ -149,6 +176,7 @@ test('windowMetrics aggregates only samples inside the window and reports null w
   assert.equal(w.lossPct, 0.498); // 2 lost of 402
   assert.equal(w.freezeEvents, 3);
   assert.equal(w.freezeBots, 2);
+  assert.deepEqual(w.freezeWindows, [3]); // 9 s window: a single slice
   assert.equal(w.aJitterMsP95, 8);
   assert.equal(w.vJitterMsP95, null);
   assert.equal(w.concealedPct, 0.5);

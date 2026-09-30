@@ -456,7 +456,9 @@ class ShardRun {
     await this.d.cpuSource.refresh();
     const windowSamples = M.samplesInWindow(ctx.samples, tMeasureStart, tEnd);
     const win = M.windowMetrics(windowSamples, tMeasureStart, Math.max(tEnd, tMeasureStart));
-    const lossSeries = M.lossWindows(windowSamples, tMeasureStart, Math.max(tEnd, tMeasureStart));
+    const measureEnd = Math.max(tEnd, tMeasureStart);
+    const lossSeries = M.lossWindows(windowSamples, tMeasureStart, measureEnd);
+    const freezeSeries = M.freezeWindows(windowSamples, tMeasureStart, measureEnd);
     const janus = this.d.cpuSource.sample(tMeasureStart, tEnd);
     const clientCpu = M.clientCpuStats(ctx.cpuReadings.filter((r) => r.t >= tJoinEnd && r.t <= tEnd).map((r) => r.pct));
 
@@ -468,7 +470,7 @@ class ShardRun {
 
     const checks = {
       loss: M.evalLoss(lossSeries, { limitPct: cfg.limits.lossPct, breachWindows: cfg.limits.breachWindows }),
-      freeze: M.evalFreeze(win.freezeEvents, cfg.limits.freezeTolerance),
+      freeze: M.evalFreeze(freezeSeries, { tolerance: cfg.limits.freezeTolerance, breachWindows: cfg.limits.breachWindows }),
       cpu: M.evalCpu(janus ? janus.max : null, cfg.cpu.limit),
       join: M.evalJoin(cls, cfg.limits.joinFailPct),
       transport: M.evalTransport(violations),

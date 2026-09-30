@@ -134,7 +134,7 @@ Create as many rooms as the ramp will reach (`--ramp-max`), sized like the scena
 | --- | --- | --- |
 | `cpu` | `--cpu-limit 180` | Janus process CPU max in the window > 180 (percent of one core; = 90 % of the 200 % quota) |
 | `loss` | `--loss-limit-pct 1` | subscriber-side loss `lost/(lost+received)` over audio+video > 1 % for `--breach-windows 2` consecutive 10 s windows |
-| `freeze` | `--freeze-tolerance 0` | video freeze events (Chromium `freezeCount`) in the window > tolerance |
+| `freeze` | `--freeze-tolerance 0` | video freeze events (Chromium `freezeCount`, summed over all subscribers) > tolerance per 10 s window for `--breach-windows 2` consecutive windows (one isolated hiccup of a shared runner does not stop the ramp) |
 | `join` | `--join-fail-limit-pct 5` | (failed + not-steady bots) / attempted bots > 5 % |
 | `transport` | - | any DTLS/SRTP policy violation: fatal, not a capacity result |
 
@@ -182,7 +182,8 @@ a saturated SFU. All browsers and pages are opened before step 1 (`prewarm`), so
 * **Loss is measured at the subscribers only** (`packetsLost` of inbound RTP); uplink loss towards Janus shows up as
   publisher-side NACK/PLI and remote-inbound reports but is not part of the stop condition. RTX/NACK recovered packets do not count as loss.
 * **Freeze detection** relies on Chromium's `freezeCount` of decoded video (`render: attach`); with software decoding on an
-  overloaded generator freezes can be the client's fault (hence the saturation flag).
+  overloaded generator (or a noisy shared runner: the smoke saw 300-600 ms freezes with zero load) freezes can be the client's fault,
+  hence the saturation flag and the consecutive-window rule.
 * **Network path.** Runners reach the node over the public Internet; the measured limit includes Caddy/TLS for signalling but
   the media path is plain UDP. Runner egress is not a controlled network: loss caused by the path shows up as loss.
 * **CPU stop online only with a CPU source** (`--cpu-file`/`--cpu-cmd`). GitHub runners cannot read the node, so in remote

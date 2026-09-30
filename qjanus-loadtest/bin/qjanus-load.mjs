@@ -52,8 +52,9 @@ Rooms and server metrics
 
 Stop conditions
   --loss-limit-pct 1           subscriber loss above this for --breach-windows consecutive 10 s windows
-  --breach-windows 2
-  --freeze-tolerance 0         freeze events tolerated in the measurement window
+  --freeze-tolerance 0         freeze events per 10 s window tolerated; more than this for --breach-windows
+                               consecutive windows stops the run (an isolated window does not)
+  --breach-windows 2           consecutive 10 s windows for the loss AND the freeze rule
   --join-fail-limit-pct 5      (failed + not steady bots) / attempted
 
 Tokens

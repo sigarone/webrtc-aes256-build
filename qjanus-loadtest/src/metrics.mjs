@@ -126,6 +126,15 @@ export function lossWindows(samples, fromMs, toMs, sliceMs = LOSS_WINDOW_MS) {
   });
 }
 
+/** Freeze events (vIn.freezeCount) per slice of the measurement window, same slicing as lossWindows. */
+export function freezeWindows(samples, fromMs, toMs, sliceMs = LOSS_WINDOW_MS) {
+  return sliceWindows(fromMs, toMs, sliceMs).map((w) => ({
+    fromMs: w.fromMs,
+    toMs: w.toMs,
+    freezeCount: sumDeltas(samplesInWindow(samples, w.fromMs, w.toMs)).vIn.freezeCount,
+  }));
+}
+
 /**
  * Largest value that is sustained for `n` consecutive entries:
  * max over i of min(values[i..i+n-1]). Null entries count as 0 (no traffic is
@@ -159,6 +168,7 @@ export function windowMetrics(samples, fromMs, toMs) {
     videoLossPct: round(lossPct(sums.vIn.lost, sums.vIn.packets), 3),
     freezeEvents: empty ? null : sums.vIn.freezeCount,
     freezeBots: empty ? null : freezeBots,
+    freezeWindows: freezeWindows(w, fromMs, toMs).map((s) => s.freezeCount),
     aJitterMsP95: round(percentile(w.map((s) => s.g?.aJitterMsMax), 95), 2),
     vJitterMsP95: round(percentile(w.map((s) => s.g?.vJitterMsMax), 95), 2),
     concealedPct: round(sums.aIn.samples > 0 ? (100 * sums.aIn.concealed) / sums.aIn.samples : null, 3),
@@ -181,9 +191,14 @@ export function evalLoss(windows, { limitPct, breachWindows }) {
   return { value: round(value, 3), limit: limitPct, breached: value !== null && value > limitPct };
 }
 
-/** Freeze: breached when more freeze events than `tolerance` were seen in the window. */
-export function evalFreeze(freezeEvents, tolerance) {
-  return { value: freezeEvents, limit: tolerance, breached: isNum(freezeEvents) && freezeEvents > tolerance };
+/**
+ * Freeze: breached when more freeze events than `tolerance` (strictly) are seen
+ * in `breachWindows` consecutive slices, like loss. One isolated slice (a
+ * transient client hiccup) is not a breach. `value` is the sustained count.
+ */
+export function evalFreeze(windows, { tolerance, breachWindows }) {
+  const value = sustainedMax(windows.map((w) => w.freezeCount), breachWindows);
+  return { value, limit: tolerance, breached: value !== null && value > tolerance };
 }
 
 /** Janus CPU (percent of ONE core): breached when the maximum in the window exceeds the limit. */

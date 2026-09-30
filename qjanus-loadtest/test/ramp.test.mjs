@@ -297,16 +297,41 @@ test('consecutive-window rule: one bad 10 s slice does not stop the ramp, two do
   assert.equal(two.summary.stopReason, 'loss');
 }));
 
-test('freeze: events in the settle period are ignored, events in the window breach', withHarness(async (run) => {
+test('freeze is debounced over --breach-windows slices: settle ignored, one isolated slice ok, two consecutive slices stop', withHarness(async (run) => {
+  // run of 2 rooms: windows are [18,28) [28,38) [38,48) seconds after T0; every bot has one sample per 2 s
+  const at = (from, to) => (live, t) => (t >= T0 + from && t < T0 + to ? 1 : 0);
   const settle = await run(['run', '--rooms', '2'], { host: { freeze: (live, t) => (t < T0 + 18_000 ? 2 : 0) } });
   assert.equal(settle.summary.steps[0].window.freezeEvents, 0);
+  assert.deepEqual(settle.summary.steps[0].window.freezeWindows, [0, 0, 0]);
   assert.equal(settle.summary.steps[0].verdict, 'ok');
-  const win = await run(['run', '--rooms', '2'], { host: { freeze: (live, t) => (t >= T0 + 30_000 && t < T0 + 32_000 ? 1 : 0) } });
-  assert.equal(win.summary.steps[0].window.freezeEvents, 16);
-  assert.equal(win.summary.steps[0].checks.freeze.breached, true);
-  assert.equal(win.summary.stopReason, 'freeze');
-  const tolerant = await run(['run', '--rooms', '2', '--freeze-tolerance', '16'], { host: { freeze: (live, t) => (t >= T0 + 30_000 && t < T0 + 32_000 ? 1 : 0) } });
+
+  // 16 bots freeze once within the same 2 s: a transient hiccup, informational only
+  const isolated = await run(['run', '--rooms', '2'], { host: { freeze: at(30_000, 32_000) } });
+  const row = isolated.summary.steps[0];
+  assert.equal(row.window.freezeEvents, 16);
+  assert.equal(row.window.freezeBots, 16);
+  assert.deepEqual(row.window.freezeWindows, [0, 16, 0]);
+  assert.deepEqual([row.checks.freeze.value, row.checks.freeze.limit, row.checks.freeze.breached], [0, 0, false]);
+  assert.equal(row.verdict, 'ok');
+  assert.equal(isolated.summary.stopReason, null);
+
+  // the same freezes in two consecutive slices stop the run
+  const two = await run(['run', '--rooms', '2'], { host: { freeze: at(36_000, 40_000) } });
+  assert.deepEqual(two.summary.steps[0].window.freezeWindows, [0, 16, 16]);
+  assert.equal(two.summary.steps[0].checks.freeze.value, 16);
+  assert.equal(two.summary.steps[0].checks.freeze.breached, true);
+  assert.equal(two.summary.stopReason, 'freeze');
+  assert.equal(two.summary.steps[0].verdict, 'breach');
+
+  // tolerance is per slice and strict: 16 per slice is tolerated at 16, not at 15
+  const tolerant = await run(['run', '--rooms', '2', '--freeze-tolerance', '16'], { host: { freeze: at(36_000, 40_000) } });
   assert.equal(tolerant.summary.steps[0].checks.freeze.breached, false);
+  const strict = await run(['run', '--rooms', '2', '--freeze-tolerance', '15'], { host: { freeze: at(36_000, 40_000) } });
+  assert.equal(strict.summary.steps[0].checks.freeze.breached, true);
+
+  // --breach-windows 1 makes any single slice count again
+  const single = await run(['run', '--rooms', '2', '--breach-windows', '1'], { host: { freeze: at(30_000, 32_000) } });
+  assert.equal(single.summary.stopReason, 'freeze');
 }));
 
 test('cpu breach from a cmd source stops the ramp; the window filter ignores earlier readings', withHarness(async (run, t) => {

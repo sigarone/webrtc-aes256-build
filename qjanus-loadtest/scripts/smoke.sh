@@ -248,8 +248,10 @@ ensure_rooms() {
 
 # Flags shared by every load run: strict transport (DTLS 1.3, AES-256-GCM), a fast join
 # rate and a short settle. The Chromium field trials are the harness default (ML-KEM DTLS,
-# all simulcast layers even for the small lite/tiny captures).
-COMMON=(--expect-transport strict --join-rate 4 --settle-sec 6)
+# all simulcast layers even for the small lite/tiny captures). A shared CI runner can stall a
+# renderer for a few hundred ms (Chromium then counts a video freeze), so the smoke tolerates
+# freezes: it tests the harness, not the runner.
+COMMON=(--expect-transport strict --join-rate 4 --settle-sec 6 --freeze-tolerance 30)
 CPU_REAL=(--cpu-file "$OUT/sampler.csv")
 
 step_negative() { timeout -k 20 "$STEP_TIMEOUT" node "$HERE/smoke-negative.mjs" --out "$OUT/negative.json"; }

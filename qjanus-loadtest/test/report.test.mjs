@@ -117,6 +117,20 @@ test('merge two shards: sums, worst-shard values, max sustainable and first brea
   });
 });
 
+test('freezes per slice are merged element-wise and shown; old rows without freezeWindows still work', async () => {
+  await withRoot(async (root) => {
+    const withSlices = (row, slices) => ({ ...row, window: { ...row.window, freezeEvents: slices.reduce((a, b) => a + b, 0), freezeWindows: slices } });
+    const a = await shardDir(root, { index: 0, count: 2, steps: [withSlices(stepRow(1), [0, 2, 0]), stepRow(2)] });
+    const b = await shardDir(root, { index: 1, count: 2, steps: [withSlices(stepRow(1), [0, 1, 1]), stepRow(2)] });
+    const report = buildReport([await loadShardDir(a), await loadShardDir(b)]);
+    assert.deepEqual(report.steps[0].freezeWindows, [0, 3, 1]);
+    assert.equal(report.steps[0].freezeEvents, 4);
+    assert.equal(report.steps[1].freezeWindows, null); // rows from before freezeWindows existed
+    const md = renderMarkdown(report);
+    assert.ok(md.includes('4 (0,3,1)'));
+  });
+});
+
 test('a step counts only when every shard is ok: the prefix stops at the first non-ok step even if later ones look fine', async () => {
   await withRoot(async (root) => {
     const a = await shardDir(root, { index: 0, count: 2, steps: [stepRow(1), stepRow(2), stepRow(3)] });

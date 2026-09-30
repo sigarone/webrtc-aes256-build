@@ -71,6 +71,12 @@ export async function loadShardDir(dir) {
 
 const VERDICT_RANK = { ok: 0, inconclusive_client_saturated: 1, breach: 2 };
 
+/** Element-wise sum of per-slice counts; null unless every shard reported the same number of slices (old rows have none). */
+function sumSlices(lists) {
+  if (lists.some((l) => !Array.isArray(l)) || new Set(lists.map((l) => l.length)).size !== 1) return null;
+  return lists[0].map((_, i) => sumOf(lists.map((l) => l[i])));
+}
+
 function mergeCounts(dicts) {
   const out = {};
   for (const d of dicts) for (const [k, v] of Object.entries(d || {})) out[k] = (out[k] || 0) + v;
@@ -131,6 +137,7 @@ function mergeStep(stepNo, shards, expected, samplerRows, cpuLimit) {
     dtlsP95Ms: maxOf(list.map((r) => r.join.dtlsP95Ms)),
     lossPct: maxOf(list.map((r) => r.window.lossPct)),
     freezeEvents: sumOf(list.map((r) => r.window.freezeEvents)),
+    freezeWindows: sumSlices(list.map((r) => r.window.freezeWindows)),
     clientCpuMaxPct: maxOf(list.map((r) => r.clientCpu && r.clientCpu.maxPct)),
     janusCpu: sampler
       ? { avgPct: sampler.cpuAvgPct, maxPct: sampler.cpuMaxPct, source: 'sampler' }
@@ -308,7 +315,7 @@ export function renderMarkdown(r) {
       f(s.iceP95Ms, 0),
       f(s.dtlsP95Ms, 0),
       f(s.lossPct, 2),
-      s.freezeEvents,
+      s.freezeEvents > 0 && s.freezeWindows ? `${s.freezeEvents} (${s.freezeWindows.join(',')})` : s.freezeEvents,
       f(s.clientCpuMaxPct, 0),
       `${f(s.janusCpu.avgPct, 0)}/${f(s.janusCpu.maxPct, 0)}`,
       f(s.rssMaxMb, 0),
@@ -317,7 +324,7 @@ export function renderMarkdown(r) {
       s.missingShards.length ? `incomplete (no row from shard ${s.missingShards.join(',')})` : `${s.verdict}${s.breachReasons.length ? ` (${s.breachReasons.join(',')})` : ''}`,
     ]),
   ));
-  out.push('', 'Join, loss and client CPU columns show the worst shard; bots and freezes are summed over shards.', '');
+  out.push('', 'Join, loss and client CPU columns show the worst shard; bots and freezes are summed over shards. Freezes in brackets are the counts per 10 s slice of the measurement window.', '');
 
   out.push('## Shards', '');
   out.push(table(
