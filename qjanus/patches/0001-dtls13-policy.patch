@@ -1,0 +1,191 @@
+diff --git a/src/dtls.c b/src/dtls.c
+index 2020e01..5ee4fa8 100644
+--- a/src/dtls.c
++++ b/src/dtls.c
+@@ -101,6 +101,39 @@ gboolean janus_is_dtls(char *buf) {
+ 	return ((*buf >= 20) && (*buf <= 64));
+ }
+ 
++/* DTLS 1.3 / ML-KEM / AES-256-GCM-only transport policy (probe patch).
++ * Only BoringSSL implements DTLS 1.3 and the X25519MLKEM768 hybrid group */
++#ifndef HAVE_BORINGSSL
++#error "The DTLS 1.3 policy patch requires BoringSSL (--enable-boringssl)"
++#endif
++#ifndef DTLS1_3_VERSION
++#error "This BoringSSL does not provide DTLS 1.3"
++#endif
++#define JANUS_DTLS_TLS_AES_256_GCM_SHA384	0x1302
++static const uint16_t janus_dtls_groups[] = { SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519 };
++
++/* Fail-closed check of what was actually negotiated: ids only, no key material */
++static gboolean janus_dtls_policy_ok(janus_dtls_srtp *dtls, guint64 handle_id) {
++	const SSL_CIPHER *cipher = SSL_get_current_cipher(dtls->ssl);
++	const SRTP_PROTECTION_PROFILE *profile = SSL_get_selected_srtp_profile(dtls->ssl);
++	unsigned int version = (unsigned int)SSL_version(dtls->ssl);
++	unsigned int cipher_id = cipher ? SSL_CIPHER_get_protocol_id(cipher) : 0;
++	unsigned int srtp_id = profile ? (unsigned int)profile->id : 0;
++	unsigned int group_id = SSL_get_group_id(dtls->ssl);
++	gboolean ok = (version == DTLS1_3_VERSION &&
++		cipher_id == JANUS_DTLS_TLS_AES_256_GCM_SHA384 &&
++		srtp_id == SRTP_AEAD_AES_256_GCM &&
++		group_id == SSL_GROUP_X25519_MLKEM768);
++	janus_ice_peerconnection *pc = (janus_ice_peerconnection *)dtls->pc;
++	JANUS_LOG(LOG_INFO, "[%"SCNu64"] DTLS-POLICY version=0x%04x cipher=0x%04x srtp=0x%04x group=0x%04x role=%s ok=%d"
++		" dtls_in=%"SCNu64"pkts/%"SCNu64"B dtls_out=%"SCNu64"pkts/%"SCNu64"B\n",
++		handle_id, version, cipher_id, srtp_id, group_id,
++		dtls->dtls_role == JANUS_DTLS_ROLE_CLIENT ? "client" : "server", ok ? 1 : 0,
++		pc ? (guint64)pc->dtls_in_stats.info[0].packets : 0, pc ? (guint64)pc->dtls_in_stats.info[0].bytes : 0,
++		pc ? (guint64)pc->dtls_out_stats.info[0].packets : 0, pc ? (guint64)pc->dtls_out_stats.info[0].bytes : 0);
++	return ok;
++}
++
+ /* DTLS stuff */
+ #define DTLS_DEFAULT_CIPHERS	"DEFAULT:!NULL:!aNULL:!SHA256:!SHA384:!aECDH:!AESGCM+AES256:!aPSK"
+ static const char *dtls_ciphers = DTLS_DEFAULT_CIPHERS;
+@@ -438,12 +471,16 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
+ 		return -1;
+ 	}
+ 	SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, janus_dtls_verify_callback);
+-	SSL_CTX_set_tlsext_use_srtp(ssl_ctx,
+-#ifdef HAVE_SRTP_AESGCM
+-		"SRTP_AEAD_AES_256_GCM:SRTP_AEAD_AES_128_GCM:SRTP_AES128_CM_SHA1_80:SRTP_AES128_CM_SHA1_32");
+-#else
+-		"SRTP_AES128_CM_SHA1_80:SRTP_AES128_CM_SHA1_32");
+-#endif
++	/* DTLS 1.3 only (min AND max), SRTP AEAD_AES_256_GCM only */
++	if(!SSL_CTX_set_min_proto_version(ssl_ctx, DTLS1_3_VERSION) ||
++			!SSL_CTX_set_max_proto_version(ssl_ctx, DTLS1_3_VERSION)) {
++		JANUS_LOG(LOG_FATAL, "Error restricting the DTLS context to DTLS 1.3\n");
++		return -1;
++	}
++	if(SSL_CTX_set_tlsext_use_srtp(ssl_ctx, "SRTP_AEAD_AES_256_GCM") != 0) {
++		JANUS_LOG(LOG_FATAL, "Error restricting the SRTP profiles to SRTP_AEAD_AES_256_GCM\n");
++		return -1;
++	}
+ 
+ 	if(!server_pem && !server_key) {
+ 		JANUS_LOG(LOG_INFO, "No cert/key specified, autogenerating some...\n");
+@@ -485,13 +522,21 @@ gint janus_dtls_srtp_init(const char *server_pem, const char *server_key, const
+ 		lfp += 3;
+ 	}
+ 	*(lfp-1) = 0;
+-	JANUS_LOG(LOG_INFO, "Fingerprint of our certificate: %s\n", local_fingerprint);
++	/* qjanus: the certificate is fixed per node and its fingerprint is pinned by the
++	 * application (install.sh prints it): it is not repeated in the logs */
++	JANUS_LOG(LOG_INFO, "Loaded the DTLS certificate (SHA-256 fingerprint not logged)\n");
+ 	if(ciphers)
+ 		dtls_ciphers = ciphers;
+ 	if(SSL_CTX_set_cipher_list(ssl_ctx, dtls_ciphers) == 0) {
+ 		JANUS_LOG(LOG_FATAL, "Error setting cipher list (%s)\n", ERR_reason_error_string(ERR_get_error()));
+ 		return -8;
+ 	}
++	/* Key exchange: X25519MLKEM768 first, X25519 second; AES-256-GCM preferred */
++	if(!SSL_CTX_set1_group_ids(ssl_ctx, janus_dtls_groups, G_N_ELEMENTS(janus_dtls_groups)) ||
++			!SSL_CTX_set_compliance_policy(ssl_ctx, ssl_compliance_policy_cnsa_202407)) {
++		JANUS_LOG(LOG_FATAL, "Error setting the DTLS groups/compliance policy (%s)\n", ERR_reason_error_string(ERR_get_error()));
++		return -8;
++	}
+ 
+ 	if(janus_dtls_bio_agent_init() < 0) {
+ 		JANUS_LOG(LOG_FATAL, "Error initializing BIO agent\n");
+@@ -630,8 +675,23 @@ janus_dtls_srtp *janus_dtls_srtp_create(void *ice_pc, janus_dtls_role role) {
+ 	int grp_list[1] = { NID_X9_62_prime256v1 };
+ 	SSL_set1_groups(dtls->ssl, grp_list, 1);
+ #endif
++	/* In BoringSSL SSL_set_tmp_ecdh() above restricts the groups to P-256:
++	 * replace that list */
++	if(!SSL_set1_group_ids(dtls->ssl, janus_dtls_groups, G_N_ELEMENTS(janus_dtls_groups))) {
++		JANUS_LOG(LOG_ERR, "[%"SCNu64"]   Error setting the DTLS groups! (%s)\n",
++			handle->handle_id, ERR_reason_error_string(ERR_get_error()));
++		janus_refcount_decrease(&dtls->ref);
++		return NULL;
++	}
+ 	const long flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION | SSL_OP_SINGLE_ECDH_USE;
+ 	SSL_set_options(dtls->ssl, flags);
++	/* The compliance policy has to be the last configuration call */
++	if(!SSL_set_compliance_policy(dtls->ssl, ssl_compliance_policy_cnsa_202407)) {
++		JANUS_LOG(LOG_ERR, "[%"SCNu64"]   Error setting the DTLS compliance policy! (%s)\n",
++			handle->handle_id, ERR_reason_error_string(ERR_get_error()));
++		janus_refcount_decrease(&dtls->ref);
++		return NULL;
++	}
+ #ifdef HAVE_DTLS_SETTIMEOUT
+ 	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Setting DTLS initial timeout: %"SCNu16"ms\n", handle->handle_id, dtls_timeout_base);
+ 	DTLSv1_set_initial_timeout_duration(dtls->ssl, dtls_timeout_base);
+@@ -734,6 +794,10 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+ 			char error[200];
+ 			ERR_error_string_n(ERR_get_error(), error, 200);
+ 			JANUS_LOG(LOG_ERR, "[%"SCNu64"] Handshake error: %s\n", handle->handle_id, error);
++			/* Fatal (e.g., peer limited to DTLS 1.2): fail closed right away */
++			dtls->dtls_state = JANUS_DTLS_STATE_FAILED;
++			janus_dtls_notify_state_change(dtls);
++			janus_ice_webrtc_hangup(handle, "DTLS handshake failure");
+ 			return;
+ 		}
+ 	}
+@@ -762,6 +826,16 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+ #endif
+ 	} else {
+ 		JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS established, yay!\n", handle->handle_id);
++		if(!janus_dtls_policy_ok(dtls, handle->handle_id)) {
++			/* Negotiated something weaker than DTLS 1.3 + X25519MLKEM768 +
++			 * AES-256-GCM + AEAD_AES_256_GCM: no SRTP keys, tear it down */
++			SSL_send_fatal_alert(dtls->ssl, SSL_AD_INSUFFICIENT_SECURITY);
++			dtls->dtls_state = JANUS_DTLS_STATE_FAILED;
++			janus_dtls_notify_state_change(dtls);
++			janus_dtls_callback(dtls->ssl, SSL_CB_ALERT, 0);
++			janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_CLEANING);
++			return;
++		}
+ 		/* Check the remote fingerprint */
+ 		X509 *rcert = SSL_get_peer_certificate(dtls->ssl);
+ 		if(!rcert) {
+@@ -787,8 +861,9 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+ 				rfp += 3;
+ 			}
+ 			*(rfp-1) = 0;
+-			JANUS_LOG(LOG_VERB, "[%"SCNu64"] Remote fingerprint (%s) of the client is %s\n",
+-				handle->handle_id, pc->remote_hashing ? pc->remote_hashing : "sha-256", remote_fingerprint);
++			/* qjanus: the peer's fingerprint is never logged */
++			JANUS_LOG(LOG_VERB, "[%"SCNu64"] Remote fingerprint (%s) of the client computed\n",
++				handle->handle_id, pc->remote_hashing ? pc->remote_hashing : "sha-256");
+ 			if(!strcasecmp(remote_fingerprint, pc->remote_fingerprint ? pc->remote_fingerprint : "(none)")) {
+ 				JANUS_LOG(LOG_VERB, "[%"SCNu64"]  Fingerprint is a match!\n", handle->handle_id);
+ 				dtls->dtls_state = JANUS_DTLS_STATE_CONNECTED;
+@@ -797,7 +872,7 @@ void janus_dtls_srtp_incoming_msg(janus_dtls_srtp *dtls, char *buf, uint16_t len
+ 				janus_dtls_notify_state_change(dtls);
+ 			} else {
+ 				/* FIXME NOT a match! MITM? */
+-				JANUS_LOG(LOG_ERR, "[%"SCNu64"]  Fingerprint is NOT a match! got %s, expected %s\n", handle->handle_id, remote_fingerprint, pc->remote_fingerprint);
++				JANUS_LOG(LOG_ERR, "[%"SCNu64"]  Fingerprint is NOT a match!\n", handle->handle_id);
+ 				dtls->dtls_state = JANUS_DTLS_STATE_FAILED;
+ 				/* Notify event handlers */
+ 				janus_dtls_notify_state_change(dtls);
+@@ -1110,8 +1185,15 @@ gboolean janus_dtls_retry(gpointer stack) {
+ 	if(janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_STOP))
+ 		goto stoptimer;
+ 	if(dtls->dtls_state == JANUS_DTLS_STATE_CONNECTED) {
+-		JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS already set up, disabling retransmission timer!\n", handle->handle_id);
+-		goto stoptimer;
++		/* DTLS 1.3 (BoringSSL): the ACK of the peer's last flight, or our own
++		 * final flight's retransmission, may still be pending after the
++		 * handshake: keep servicing the timers for a few seconds */
++		struct timeval pending = {0};
++		if(DTLSv1_get_timeout(dtls->ssl, &pending) == 0 ||
++				janus_get_monotonic_time() - dtls->dtls_connected >= 10*G_USEC_PER_SEC) {
++			JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS already set up, disabling retransmission timer!\n", handle->handle_id);
++			goto stoptimer;
++		}
+ 	}
+ 	if(janus_get_monotonic_time() - dtls->dtls_started >= 20*G_USEC_PER_SEC) {
+ 		/* FIXME Should we really give up after 20 seconds waiting for DTLS? */
+@@ -1129,7 +1211,8 @@ gboolean janus_dtls_retry(gpointer stack) {
+ 	JANUS_LOG(LOG_HUGE, "[%"SCNu64"] DTLSv1_get_timeout: %"SCNu64"\n", handle->handle_id, timeout_value);
+ 	if(timeout_value == 0) {
+ 		dtls->retransmissions++;
+-		JANUS_LOG(LOG_VERB, "[%"SCNu64"] DTLS timeout on component %d of stream %d, retransmitting\n", handle->handle_id, pc->component_id, pc->stream_id);
++		JANUS_LOG(LOG_INFO, "[%"SCNu64"] DTLS timer expired on component %d of stream %d (state=%s), ACK/retransmit\n",
++			handle->handle_id, pc->component_id, pc->stream_id, janus_get_dtls_srtp_state(dtls->dtls_state));
+ 		/* Notify event handlers */
+ 		janus_dtls_notify_state_change(dtls);
+ 		/* Retransmit the packet */

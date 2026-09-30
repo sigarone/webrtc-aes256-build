@@ -1,0 +1,71 @@
+# qjanus core configuration TEMPLATE. libexec/qjanus-render-config renders it at every
+# service start into /run/qjanus/etc, replacing the @KEYS@ from /etc/qjanus/qjanus.env
+# (secrets) and the release directory. Nothing in this file is edited per node.
+general: {
+	configs_folder = "@QJANUS_CONFDIR@"
+	plugins_folder = "@QJANUS_ROOT@/lib/janus/plugins"
+	transports_folder = "@QJANUS_ROOT@/lib/janus/transports"
+	events_folder = "@QJANUS_ROOT@/lib/janus/events"
+	loggers_folder = "@QJANUS_ROOT@/lib/janus/loggers"
+
+	# INFO: what is logged at this level (and below) carries no identifiers, addresses or
+	# fingerprints (patches/0002-log-scrub.patch); never raise it on a production node
+	debug_level = 4
+	debug_timestamps = true
+	debug_colors = false
+	server_name = "qjanus"
+	hide_dependencies = true
+	exit_on_dl_error = true
+
+	# The application server mints HMAC-SHA256 signed tokens
+	# ("<expiry>,janus,janus.plugin.videoroom:<base64 signature>"); there is no api_secret and
+	# the Admin API is off in every transport.
+	token_auth = true
+	token_auth_secret = "@QJANUS_TOKEN_SECRET@"
+	token_auth_hash = "sha256"
+
+	session_timeout = 60
+	reclaim_session_timeout = 20
+
+	# Janus never writes recordings (rooms are created with record=false, lock_record=true),
+	# and these are the folders it refuses to write to anyway
+	protected_folders = [
+		"/bin", "/boot", "/dev", "/etc", "/initrd", "/lib", "/lib32", "/lib64", "/proc",
+		"/sbin", "/sys", "/usr", "/var", "/opt", "/root", "/run"
+	]
+}
+
+# The DTLS certificate is FIXED per node (ECDSA P-256, generated on the node by install.sh);
+# the application pins its SHA-256 fingerprint. The key is handed to the service through
+# systemd credentials.
+certificates: {
+	cert_pem = "@QJANUS_DTLS_CERT@"
+	cert_key = "@QJANUS_DTLS_KEY@"
+}
+
+media: {
+	ipv6 = true
+	min_nack_queue = 500
+	rtp_port_range = "20000-20999"
+	dtls_mtu = 1200
+	dtls_timeout = 500
+	twcc_period = 200
+	slowlink_threshold = 4
+	no_media_timer = 1
+}
+
+nat: {
+	ice_lite = true
+	ice_tcp = false
+	ice_ignore_list = "vmnet,docker,veth,br-,virbr,lxc,wg"
+}
+
+# No other plugins, transports, event handlers or loggers exist in the build; nothing to disable.
+plugins: {
+}
+transports: {
+}
+loggers: {
+}
+events: {
+}

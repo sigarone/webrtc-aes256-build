@@ -1,0 +1,12 @@
+# qjanus VideoRoom configuration TEMPLATE (see janus.jcfg.tmpl).
+# Rooms are NEVER configured here: the application server creates them through the local
+# API (create with admin_key + a per-room secret) and destroys them again.
+general: {
+	# only requests carrying this key can create rooms (and use rtp_forward)
+	admin_key = "@QJANUS_ADMIN_KEY@"
+	lock_rtp_forward = true
+	# no event handlers exist in this build
+	events = false
+	# room ids and participant ids (the per-call pseudonyms) are strings
+	string_ids = true
+}

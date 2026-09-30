@@ -1,0 +1,15 @@
+# qjanus WebSockets transport TEMPLATE (see janus.jcfg.tmpl): the client-facing API.
+# Plain WebSocket on the loopback interface only; Caddy terminates TLS on 443 (path /janus)
+# and proxies to it. There is no secure WebSocket and no Admin API here.
+general: {
+	json = "compact"
+	events = false
+	ws = true
+	ws_port = 8188
+	ws_ip = "127.0.0.1"
+	wss = false
+}
+admin: {
+	admin_ws = false
+	admin_wss = false
+}

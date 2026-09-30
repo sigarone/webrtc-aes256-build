@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# qjanus-render-config: renders share/qjanus/conf/*.jcfg.tmpl into <out>/ (default
+# $RUNTIME_DIRECTORY/etc, i.e. /run/qjanus/etc when started by systemd), replacing the @KEYS@
+# from the environment. Runs as ExecStartPre (unprivileged, EnvironmentFile already applied),
+# so the secrets exist only in /etc/qjanus/qjanus.env (root, 0600) and in the private tmpfs
+# /run/qjanus (service user, 0700); they are never on a command line.
+#   QJANUS_TOKEN_SECRET   HMAC key of the signed session tokens        (required, hex)
+#   QJANUS_ADMIN_KEY      VideoRoom admin_key                          (required, hex)
+#   QJANUS_HTTP_BIND      address of the server-facing HTTP API        (default 127.0.0.1)
+#   QJANUS_DTLS_CERT      DTLS certificate (PEM)                       (default /etc/qjanus/dtls.crt)
+#   QJANUS_DTLS_KEY       DTLS private key (PEM)                       (default $CREDENTIALS_DIRECTORY/dtls.key)
+set -euo pipefail
+
+# the release directory as this script was reached: /opt/qjanus/current/... stays "current"
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+OUT=${1:-${RUNTIME_DIRECTORY:-/run/qjanus}/etc}
+TMPL=$ROOT/share/qjanus/conf
+
+die() { echo "qjanus-render-config: $*" >&2; exit 1; }
+
+: "${QJANUS_TOKEN_SECRET:?QJANUS_TOKEN_SECRET is not set (see /etc/qjanus/qjanus.env)}"
+: "${QJANUS_ADMIN_KEY:?QJANUS_ADMIN_KEY is not set (see /etc/qjanus/qjanus.env)}"
+QJANUS_HTTP_BIND=${QJANUS_HTTP_BIND:-127.0.0.1}
+QJANUS_DTLS_CERT=${QJANUS_DTLS_CERT:-/etc/qjanus/dtls.crt}
+QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTORY/dtls.key}}
+[ -n "$QJANUS_DTLS_KEY" ] || die "QJANUS_DTLS_KEY is not set and there is no credentials directory"
+
+# the values end up inside sed programs and libconfig strings: strict charsets only
+[[ $QJANUS_TOKEN_SECRET =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_TOKEN_SECRET must be 32-128 lowercase hex characters"
+[[ $QJANUS_ADMIN_KEY =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_ADMIN_KEY must be 32-128 lowercase hex characters"
+[[ $QJANUS_HTTP_BIND =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || die "QJANUS_HTTP_BIND must be an IPv4 or IPv6 address"
+[[ $QJANUS_DTLS_CERT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_CERT must be an absolute path"
+[[ $QJANUS_DTLS_KEY =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "QJANUS_DTLS_KEY must be an absolute path"
+[[ $ROOT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the release directory path has unsupported characters"
+[[ $OUT =~ ^/[A-Za-z0-9._/@%+-]+$ ]] || die "the output directory path has unsupported characters"
+[ -r "$QJANUS_DTLS_CERT" ] || die "cannot read the DTLS certificate $QJANUS_DTLS_CERT"
+[ -r "$QJANUS_DTLS_KEY" ] || die "cannot read the DTLS private key (systemd credential dtls.key)"
+compgen -G "$TMPL/*.jcfg.tmpl" > /dev/null || die "no config templates in $TMPL"
+
+umask 077
+mkdir -p "$OUT"
+for t in "$TMPL"/*.jcfg.tmpl; do
+  f=$OUT/$(basename "${t%.tmpl}")
+  sed \
+    -e "s|@QJANUS_ROOT@|$ROOT|g" \
+    -e "s|@QJANUS_CONFDIR@|$OUT|g" \
+    -e "s|@QJANUS_TOKEN_SECRET@|$QJANUS_TOKEN_SECRET|g" \
+    -e "s|@QJANUS_ADMIN_KEY@|$QJANUS_ADMIN_KEY|g" \
+    -e "s|@QJANUS_HTTP_BIND@|$QJANUS_HTTP_BIND|g" \
+    -e "s|@QJANUS_DTLS_CERT@|$QJANUS_DTLS_CERT|g" \
+    -e "s|@QJANUS_DTLS_KEY@|$QJANUS_DTLS_KEY|g" \
+    "$t" > "$f.tmp"
+  if grep -q '@QJANUS_' "$f.tmp"; then
+    rm -f "$f.tmp"; die "unreplaced placeholder in $(basename "$t")"
+  fi
+  mv -f "$f.tmp" "$f"
+done
+echo "qjanus-render-config: rendered $(ls "$OUT" | wc -l) files into $OUT (http bind $QJANUS_HTTP_BIND)" >&2

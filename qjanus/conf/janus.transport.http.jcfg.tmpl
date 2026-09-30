@@ -1,0 +1,17 @@
+# qjanus HTTP transport TEMPLATE (see janus.jcfg.tmpl): the server-facing API used by the
+# application server to create, allow, kick and destroy rooms. It is never exposed publicly:
+# it listens on 127.0.0.1 (same host as the application server) or on the VPN address of
+# the node (QJANUS_HTTP_BIND in /etc/qjanus/qjanus.env). No HTTPS, no Admin API.
+general: {
+	json = "compact"
+	events = false
+	base_path = "/janus"
+	http = true
+	port = 8088
+	ip = "@QJANUS_HTTP_BIND@"
+	https = false
+}
+admin: {
+	admin_http = false
+	admin_https = false
+}

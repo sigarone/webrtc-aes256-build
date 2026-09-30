@@ -1,0 +1,197 @@
+name: qjanus
+
+# Builds qjanus, the patched Janus VideoRoom SFU of the Q-Audion group calls v2
+# (qjanus/, spec GROUP_CALLS_V2 section 6): Janus v1.4.2 + BoringSSL f91f1447 (the
+# commit the hardened WebRTC M150 builds pin) + libsrtp 2.8.1 on the BoringSSL backend +
+# libnice 0.1.24 + libwebsockets, only VideoRoom + HTTP + WebSockets, DTLS 1.3 /
+# X25519MLKEM768 / TLS_AES_256_GCM_SHA384 / SRTP AEAD_AES_256_GCM only (fail closed).
+#
+#   precheck   (contents: read)     - validate the release tag input, refuse if it exists
+#   build      (contents: read)     - deps (cached), Janus, unit tests, relocatable tarball
+#   clean-install (contents: read)  - the tarball on a CLEAN ubuntu:24.04 container: apt-deps.txt
+#                                     is complete, relocation works, no system libssl, module set
+#   integration (contents: read)    - the tarball installed with install.sh under systemd (the
+#                                     real unit + sandbox), API conformance over HTTP+WebSockets,
+#                                     Chromium (PQC) publisher/subscriber with E2EE frames,
+#                                     simulcast, netem loss/reorder, negative peers refused
+#   release    (contents: write, id-token, attestations) - only on workflow_dispatch with a
+#                                     release_tag: SHA256SUMS re-verified, attested, published
+#
+# Every input reaches the shell only through env. PUBLIC REPO: nothing private may land here.
+
+on:
+  push:
+    branches: [feat/group-calls-v2, main]
+    paths:
+      - 'qjanus/**'
+      - '.github/workflows/qjanus.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "publish a GitHub release with this tag (qjanus-<version>, must not exist yet); empty = build and test only"
+        required: false
+        default: ""
+
+env:
+  IN_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qjanus-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  precheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+      release: ${{ steps.id.outputs.release }}
+    steps:
+      - name: Validate the release tag input (charset allow-list, fail closed) and compute the build id
+        id: id
+        run: |
+          set -euo pipefail
+          if [ -n "$IN_RELEASE_TAG" ]; then
+            printf %s "$IN_RELEASE_TAG" | grep -Eq '^qjanus-[0-9A-Za-z][0-9A-Za-z._-]{0,40}$' \
+              || { echo "::error::release_tag must look like qjanus-<version> ([0-9A-Za-z._-])"; exit 1; }
+            echo "build_id=${IN_RELEASE_TAG#qjanus-}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_id=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse if the release or git tag already exists (never overwrite a shipped asset)
+        if: ${{ github.event.inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$IN_RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release '$IN_RELEASE_TAG' already exists - use a new release_tag"; exit 1
+          fi
+          refs=$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$IN_RELEASE_TAG")
+          if [ -n "$refs" ]; then
+            echo "::error::git tag '$IN_RELEASE_TAG' already exists - use a new release_tag"; exit 1
+          fi
+
+  build:
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      BSSL: /opt/boringssl
+      PREFIX: /opt/qjanus
+      SRC: /home/runner/qjanus-src
+      OUT: ${{ github.workspace }}/qjanus-out
+      BUILD_ID: ${{ needs.precheck.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: apt build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build meson pkg-config git curl ca-certificates \
+            autoconf automake libtool gengetopt gettext patchelf python3 \
+            libglib2.0-dev libjansson-dev libconfig-dev libmicrohttpd-dev libgnutls28-dev zlib1g-dev
+
+      - name: Prepare install dirs
+        run: |
+          sudo mkdir -p "$BSSL" "$PREFIX"
+          sudo chown -R "$USER" "$BSSL" "$PREFIX"
+
+      - name: Restore the dependency cache (BoringSSL, libsrtp, libnice, libwebsockets)
+        id: deps-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus
+          key: qjanus-deps-${{ hashFiles('qjanus/build/build-deps.sh', 'qjanus/build/pins.env') }}
+
+      - name: Build the dependencies from the pinned sources
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: qjanus/build/build-deps.sh
+
+      - name: Save the dependency cache
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /opt/boringssl
+            /opt/qjanus
+          key: qjanus-deps-${{ hashFiles('qjanus/build/build-deps.sh', 'qjanus/build/pins.env') }}
+
+      - name: Build Janus (patched, VideoRoom + HTTP + WebSockets only)
+        run: qjanus/build/build-janus.sh
+
+      - name: Unit test - log scrubber (ASan + UBSan)
+        run: |
+          set -euo pipefail
+          cc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -I"$SRC/janus/src" qjanus/test/log-scrub/test_scrub.c -o "$RUNNER_TEMP/test_scrub"
+          "$RUNNER_TEMP/test_scrub"
+
+      - name: Package the relocatable tarball
+        run: qjanus/build/package.sh
+
+      - name: Upload the tarball, SHA256SUMS and BUILDINFO.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-tarball
+          path: |
+            qjanus-out/qjanus-*.tar.gz
+            qjanus-out/SHA256SUMS
+            qjanus-out/BUILDINFO.json
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qjanus-build-logs
+          path: |
+            /opt/qjanus/versions.txt
+            /opt/qjanus/janus-configure.log
+            /opt/qjanus/janus-modules.txt
+            qjanus-out/janus-version.txt
+            qjanus-out/apt-deps.raw
+          if-no-files-found: warn
+          retention-days: 30
+
+  clean-install:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qjanus-tarball
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: The tarball on a clean ubuntu:24.04 (apt-deps.txt only, relocated, no system libssl)
+        run: |
+          set -euo pipefail
+          tb=$(ls out/qjanus-*.tar.gz)
+          docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out:ro" ubuntu:24.04 \
+            bash /repo/qjanus/build/check-tarball.sh "/out/$(basename "$tb")" /repo/qjanus/build
