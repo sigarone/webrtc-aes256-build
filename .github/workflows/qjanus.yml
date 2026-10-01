@@ -27,6 +27,11 @@ on:
     paths:
       - 'qjanus/**'
       - '.github/workflows/qjanus.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'qjanus/**'
+      - '.github/workflows/qjanus.yml'
   workflow_dispatch:
     inputs:
       release_tag:
@@ -43,7 +48,7 @@ permissions:
 concurrency:
   # per event type: an incidental push to the branch must never cancel a release run in progress
   group: qjanus-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   precheck:

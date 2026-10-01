@@ -27,6 +27,11 @@ general: {
 	session_timeout = 60
 	reclaim_session_timeout = 20
 
+	# At most this many live sessions per distinct signed token string (patches/0008): a token that
+	# outlives the membership of its holder (it stays valid up to its expiry) cannot open sessions
+	# without limit. Refused with Janus error 473. QJANUS_MAX_SESSIONS_PER_TOKEN in qjanus.env (1-1024).
+	max_sessions_per_token = @QJANUS_MAX_SESSIONS_PER_TOKEN@
+
 	# Janus never writes recordings (rooms are created with record=false, lock_record=true),
 	# and these are the folders it refuses to write to anyway
 	protected_folders = [

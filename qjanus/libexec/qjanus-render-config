@@ -15,6 +15,8 @@
 #                         missing, down, loopback/VPN/bridge interface, a name that is the prefix of
 #                         another interface, an interface with private addresses only (unless
 #                         QJANUS_NAT_1_1 is set or QJANUS_ALLOW_PRIVATE_ICE_IFACE=yes)
+#   QJANUS_MAX_SESSIONS_PER_TOKEN  live Janus sessions allowed per distinct signed token string
+#                         (optional, 1-1024, default 4)
 #   QJANUS_NAT_1_1        public IPv4 to advertise when the node sits behind a 1:1 NAT (optional;
 #                         nodes that carry their public address on an interface need nothing)
 set -euo pipefail
@@ -40,6 +42,9 @@ QJANUS_DTLS_KEY=${QJANUS_DTLS_KEY:-${CREDENTIALS_DIRECTORY:+$CREDENTIALS_DIRECTO
 [[ $QJANUS_ADMIN_KEY =~ ^[0-9a-f]{32,128}$ ]] || die "QJANUS_ADMIN_KEY must be 32-128 lowercase hex characters"
 # the server API is plain HTTP for the application server only: never a public address
 qjanus_check_http_bind "$QJANUS_HTTP_BIND" || die "QJANUS_HTTP_BIND is not acceptable"
+QJANUS_MAX_SESSIONS_PER_TOKEN=${QJANUS_MAX_SESSIONS_PER_TOKEN:-4}
+[[ $QJANUS_MAX_SESSIONS_PER_TOKEN =~ ^[1-9][0-9]{0,3}$ ]] && [ "$QJANUS_MAX_SESSIONS_PER_TOKEN" -le 1024 ] \
+  || die "QJANUS_MAX_SESSIONS_PER_TOKEN must be an integer between 1 and 1024"
 QJANUS_NAT_1_1=${QJANUS_NAT_1_1:-}
 if [ -n "$QJANUS_NAT_1_1" ]; then
   [[ $QJANUS_NAT_1_1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "QJANUS_NAT_1_1 must be an IPv4 address"
@@ -75,6 +80,7 @@ for t in "$TMPL"/*.jcfg.tmpl; do
     -e "s|@QJANUS_HTTP_BIND@|$QJANUS_HTTP_BIND|g" \
     -e "s|@QJANUS_DTLS_CERT@|$QJANUS_DTLS_CERT|g" \
     -e "s|@QJANUS_DTLS_KEY@|$QJANUS_DTLS_KEY|g" \
+    -e "s|@QJANUS_MAX_SESSIONS_PER_TOKEN@|$QJANUS_MAX_SESSIONS_PER_TOKEN|g" \
     -e "s|@QJANUS_NAT_1_1_LINE@|$NAT_LINE|g" \
     -e "s|@QJANUS_ICE_ENFORCE_IFACE@|$QJANUS_ICE_ENFORCE_IFACE|g" \
     -e "s|@QJANUS_ICE_IGNORE_LIST@|$QJANUS_ICE_IGNORE_LIST|g" \

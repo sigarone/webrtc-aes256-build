@@ -4,6 +4,36 @@ Every release is published by the `qjanus` workflow (`release_tag=qjanus-<versio
 heading is `## <version>` becomes the text of the GitHub release (the workflow refuses a release without one).
 The Janus base is always the pinned upstream v1.4.2 (`build/pins.env`); `-qN` counts the qjanus builds of it.
 
+## 1.4.2-q3
+
+Session limit per token (security review L2). A removed member keeps a valid signed token for up to its TTL (600 s) and could
+open unlimited Janus sessions with it; now it can hold only a few.
+
+- New patch 0008: at most N live sessions per distinct signed token string, `max_sessions_per_token` in `janus.jcfg`
+  (default 4, rendered from `QJANUS_MAX_SESSIONS_PER_TOKEN` in `/etc/qjanus/qjanus.env`, 1-1024, no "unlimited"). The next
+  `create` is refused with the new Janus error 473 "Too many sessions for this token". The check and the count are one step
+  under one lock (concurrent creates cannot overshoot); the slot is given back exactly once when the session ends, by
+  `destroy`, by the idle `session_timeout`, or when its transport has been gone for `reclaim_session_timeout`; `claim` takes
+  no slot. A session counts for the token it was CREATED with, and Janus still validates the token of every later request
+  on its own: a refreshed token (a new string) keeps working on a session created with the previous one.
+- `info` reports `max-sessions-per-token`.
+- A client holds one session per call (publisher and subscriber handles share it) and reconnects by `claim` or by a new
+  `media_join`, which mints a new token, so 4 leaves room for an old and a new session of one member. The counter is per
+  token STRING: tokens minted from the same second and ttl are the same string (see the README), so the application server
+  should add a random descriptor to every token it mints.
+- Tests: N sessions succeed and N+1 is refused with 473 (over HTTP and over WebSockets), destroy frees exactly one slot, a
+  failed destroy frees none, different tokens are independent, the bare server token format is counted per string,
+  keepalive / attach / a message with a refreshed token work on a full token without moving a slot, a dropped socket keeps
+  its slots for the reclaim window and a `claim` keeps one, idle sessions time out and free theirs; the rendering of
+  `max_sessions_per_token` (default, override, malformed values refused) on a clean Ubuntu 24.04. The test tokens carry a
+  random descriptor so that parallel clients do not share a counter.
+
+Upgrade (per node; the DTLS key and fingerprint, the token secret, the admin key and the ICE interface stay):
+
+```
+./install.sh --install-deps
+```
+
 ## 1.4.2-q2
 
 ICE candidates, join token, build guard. An upgrade from q1 needs ONE new setting per node (see Upgrade).

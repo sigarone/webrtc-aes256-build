@@ -75,6 +75,14 @@ if QJANUS_NAT_1_1='1.2.3.4"; x' "$ROOT/libexec/qjanus-render-config" /tmp/node/e
 if QJANUS_NAT_1_1=999.1.1.1 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an out-of-range QJANUS_NAT_1_1 must be refused"; fi
 if QJANUS_HTTP_BIND='1.2.3.4|x' "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "an invalid QJANUS_HTTP_BIND must be refused"; fi
 ok "optional 1:1 NAT mapping renders, invalid settings are refused"
+# the per-token session limit (patches/0008): default 4, the env setting is rendered, anything else is refused
+grep -q '^	max_sessions_per_token = 4$' /tmp/node/etc/janus.jcfg || fail "max_sessions_per_token is not 4 by default"
+QJANUS_MAX_SESSIONS_PER_TOKEN=7 "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-mst 2> /dev/null
+grep -q '^	max_sessions_per_token = 7$' /tmp/node/etc-mst/janus.jcfg || fail "QJANUS_MAX_SESSIONS_PER_TOKEN is not rendered"
+for bad in 0 -1 1025 4096 10000 abc '4;x' '4 5' 04; do
+  if QJANUS_MAX_SESSIONS_PER_TOKEN=$bad "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "QJANUS_MAX_SESSIONS_PER_TOKEN='$bad' must be refused"; fi
+done
+ok "max_sessions_per_token: default 4, configurable, malformed or out-of-range values refused"
 # the server API (plain HTTP) must never be bound to a public or wildcard address, whatever the env file says
 for a in 8.8.8.8 203.0.113.9 0.0.0.0 :: 2a01:4f9::1 172.32.0.1 100.128.0.1; do
   if QJANUS_HTTP_BIND=$a "$ROOT/libexec/qjanus-render-config" /tmp/node/etc-bad 2> /dev/null; then fail "QJANUS_HTTP_BIND=$a must be refused"; fi
@@ -105,6 +113,7 @@ jq -e '(.transports | keys) == ["janus.transport.http","janus.transport.websocke
 jq -e '.data_channels == false and .["ice-lite"] == true and .["ice-tcp"] == false and .ipv6 == true' /tmp/node/info.json > /dev/null || fail "ice/data-channel flags"
 jq -e '.["dtls-mtu"] == 1200 and .["session-timeout"] == 60 and .["reclaim-session-timeout"] == 20 and .["min-nack-queue"] == 500 and .["twcc-period"] == 200' /tmp/node/info.json > /dev/null || fail "media settings"
 jq -e '.auth_token == true and .api_secret == false' /tmp/node/info.json > /dev/null || fail "auth flags"
+jq -e '.["max-sessions-per-token"] == 4' /tmp/node/info.json > /dev/null || fail "max-sessions-per-token is not 4"
 jq -e 'has("dependencies") | not' /tmp/node/info.json > /dev/null || fail "dependencies are not hidden"
 ok "info: VideoRoom + HTTP + WebSockets only, hardened core settings, dependencies hidden"
 # no libssl/libcrypto mapped into the running process

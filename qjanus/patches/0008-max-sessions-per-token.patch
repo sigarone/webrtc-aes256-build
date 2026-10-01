@@ -1,0 +1,185 @@
+diff --git a/src/apierror.c b/src/apierror.c
+index 10f2673..da4194a 100644
+--- a/src/apierror.c
++++ b/src/apierror.c
+@@ -54,6 +54,8 @@ const char *janus_get_api_error(int error) {
+ 			return "Wrong WebRTC state";
+ 		case JANUS_ERROR_NOT_ACCEPTING_SESSIONS:
+ 			return "Currently not accepting new sessions";
++		case JANUS_ERROR_TOO_MANY_SESSIONS:
++			return "Too many sessions for this token";
+ 		default:
+ 			return "Unknown error";
+ 	}
+diff --git a/src/apierror.h b/src/apierror.h
+index 55eee13..4be04cd 100644
+--- a/src/apierror.h
++++ b/src/apierror.h
+@@ -66,6 +66,8 @@
+ #define JANUS_ERROR_WEBRTC_STATE				471
+ /*! \brief The server is currently configured not to accept new sessions */
+ #define JANUS_ERROR_NOT_ACCEPTING_SESSIONS		472
++/*! \brief qjanus: the token already has the maximum number of live sessions (max_sessions_per_token) */
++#define JANUS_ERROR_TOO_MANY_SESSIONS			473
+ 
+ 
+ /*! \brief Helper method to get a string representation of an API error code
+diff --git a/src/janus.c b/src/janus.c
+index 8fc10b7..e0bab9d 100644
+--- a/src/janus.c
++++ b/src/janus.c
+@@ -300,6 +300,45 @@ static uint reclaim_session_timeout = DEFAULT_RECLAIM_SESSION_TIMEOUT;
+  * server to grow too much, or because we're draining the server. */
+ static gboolean accept_new_sessions = TRUE;
+ 
++/* qjanus: at most N sessions may be live at the same time for the same signed token string, so that
++ * a token that is still valid (up to its expiry) after its holder was removed from a call cannot be
++ * used to open sessions without limit. A session counts for the token it was CREATED with; Janus
++ * keeps validating the token of every later request on its own, so a refreshed token (a new string)
++ * keeps working on a session created with the previous one. N comes from "max_sessions_per_token"
++ * in the general section of janus.jcfg; there is no "unlimited" setting. */
++#define DEFAULT_MAX_SESSIONS_PER_TOKEN	4
++#define MAX_MAX_SESSIONS_PER_TOKEN		1024
++static uint max_sessions_per_token = DEFAULT_MAX_SESSIONS_PER_TOKEN;
++/* token string -> number of live sessions created with it (entries are removed at zero). This mutex
++ * is a leaf: it may be taken while sessions_mutex is held, never the other way around */
++static GHashTable *token_sessions = NULL;
++static janus_mutex token_sessions_mutex = JANUS_MUTEX_INITIALIZER;
++static gboolean janus_token_sessions_acquire(const char *token) {
++	gboolean ok = FALSE;
++	janus_mutex_lock(&token_sessions_mutex);
++	if(token_sessions != NULL) {
++		guint n = GPOINTER_TO_UINT(g_hash_table_lookup(token_sessions, token));
++		if(n < max_sessions_per_token) {
++			/* If the key exists the table frees the duplicate we pass and keeps its own */
++			g_hash_table_insert(token_sessions, g_strdup(token), GUINT_TO_POINTER(n + 1));
++			ok = TRUE;
++		}
++	}
++	janus_mutex_unlock(&token_sessions_mutex);
++	return ok;
++}
++static void janus_token_sessions_release(const char *token) {
++	janus_mutex_lock(&token_sessions_mutex);
++	if(token_sessions != NULL) {
++		guint n = GPOINTER_TO_UINT(g_hash_table_lookup(token_sessions, token));
++		if(n <= 1)
++			g_hash_table_remove(token_sessions, token);
++		else
++			g_hash_table_insert(token_sessions, g_strdup(token), GUINT_TO_POINTER(n - 1));
++	}
++	janus_mutex_unlock(&token_sessions_mutex);
++}
++
+ /* We don't hold (trickle) candidates indefinitely either: by default, we
+  * only store them for 45 seconds. After that, they're discarded, in order
+  * to avoid leaks or orphaned media details. This means that, if for instance
+@@ -345,6 +384,7 @@ static json_t *janus_info(const char *transaction) {
+ 	json_object_set_new(info, "accepting-new-sessions", accept_new_sessions ? json_true() : json_false());
+ 	json_object_set_new(info, "session-timeout", json_integer(global_session_timeout));
+ 	json_object_set_new(info, "reclaim-session-timeout", json_integer(reclaim_session_timeout));
++	json_object_set_new(info, "max-sessions-per-token", json_integer(max_sessions_per_token));
+ 	json_object_set_new(info, "candidates-timeout", json_integer(candidates_timeout));
+ 	json_object_set_new(info, "server-name", json_string(server_name ? server_name : JANUS_SERVER_NAME));
+ 	/* qjanus: the info reply is served to unauthenticated peers: no addresses, no build details */
+@@ -662,6 +702,7 @@ static void janus_session_free(const janus_refcount *session_ref) {
+ 		janus_request_destroy(session->source);
+ 		session->source = NULL;
+ 	}
++	g_free(session->token);
+ 	janus_mutex_destroy(&session->mutex);
+ 	g_free(session);
+ }
+@@ -789,6 +830,7 @@ janus_session *janus_session_create(guint64 session_id) {
+ 	session->last_activity = janus_get_monotonic_time();
+ 	session->transport_gone_time = 0;
+ 	session->ice_handles = NULL;
++	session->token = NULL;
+ 	janus_mutex_init(&session->mutex);
+ 	janus_mutex_lock(&sessions_mutex);
+ 	g_hash_table_insert(sessions, janus_uint64_dup(session->session_id), session);
+@@ -834,6 +876,10 @@ gint janus_session_destroy(janus_session *session) {
+ 	JANUS_LOG(LOG_INFO, "Destroying session %"SCNu64"; %p\n", session_id, session);
+ 	if(!g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
+ 		return 0;
++	/* qjanus: every way a session ends (destroy request, timeout, transport gone, reclaim timeout)
++	 * passes here once: free its slot of the token it was created with */
++	if(session->token != NULL)
++		janus_token_sessions_release(session->token);
+ 	janus_session_handles_clear(session);
+ 	/* The session will actually be destroyed when the counter gets to 0 */
+ 	janus_refcount_decrease(&session->ref);
+@@ -1134,12 +1180,34 @@ int janus_process_incoming_request(janus_request *request) {
+ 			}
+ 		}
+ 
++		/* qjanus: at most max_sessions_per_token live sessions per signed token string. The check and
++		 * the count happen together, before the session exists: concurrent creates cannot overshoot */
++		const char *session_token = NULL;
++		if(janus_auth_is_enabled()) {
++			session_token = json_string_value(json_object_get(root, "token"));
++			if(session_token == NULL) {
++				/* Cannot happen (the secret/token check above passed), but never fail open */
++				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNAUTHORIZED, NULL);
++				goto jsondone;
++			}
++			if(!janus_token_sessions_acquire(session_token)) {
++				JANUS_LOG(LOG_WARN, "Refusing a new session: its token already has %u live sessions\n", max_sessions_per_token);
++				ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_TOO_MANY_SESSIONS, NULL);
++				goto jsondone;
++			}
++		}
++
+ 		/* Handle it */
+ 		session = janus_session_create(session_id);
+ 		if(session == NULL) {
++			if(session_token != NULL)
++				janus_token_sessions_release(session_token);
+ 			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNKNOWN, "Memory error");
+ 			goto jsondone;
+ 		}
++		/* From here the session owns the slot: janus_session_destroy gives it back */
++		if(session_token != NULL)
++			session->token = g_strdup(session_token);
+ 		session_id = session->session_id;
+ 		/* We increase the counter as this request is using the session */
+ 		janus_refcount_increase(&session->ref);
+@@ -5069,6 +5137,17 @@ gint main(int argc, char *argv[]) {
+ 		}
+ 	}
+ 
++	/* qjanus: concurrent sessions per signed token (1..1024, default 4; a bad value keeps the default) */
++	item = janus_config_get(config, config_general, janus_config_type_item, "max_sessions_per_token");
++	if(item && item->value) {
++		int mst = atoi(item->value);
++		if(mst < 1 || mst > MAX_MAX_SESSIONS_PER_TOKEN) {
++			JANUS_LOG(LOG_WARN, "Ignoring max_sessions_per_token value as it's not an integer between 1 and %d\n", MAX_MAX_SESSIONS_PER_TOKEN);
++		} else {
++			max_sessions_per_token = mst;
++		}
++	}
++
+ 	/* Check if a custom reclaim session timeout value was specified */
+ 	item = janus_config_get(config, config_general, janus_config_type_item, "reclaim_session_timeout");
+ 	if(item && item->value) {
+@@ -5535,6 +5614,7 @@ gint main(int argc, char *argv[]) {
+ 
+ 	/* Sessions */
+ 	sessions = g_hash_table_new_full(g_int64_hash, g_int64_equal, (GDestroyNotify)g_free, NULL);
++	token_sessions = g_hash_table_new_full(g_str_hash, g_str_equal, (GDestroyNotify)g_free, NULL);
+ 	/* Start the sessions timeout watchdog */
+ 	sessions_watchdog_context = g_main_context_new();
+ 	GMainLoop *watchdog_loop = g_main_loop_new(sessions_watchdog_context, FALSE);
+diff --git a/src/janus.h b/src/janus.h
+index 46cc227..6ae2eb6 100644
+--- a/src/janus.h
++++ b/src/janus.h
+@@ -48,6 +48,8 @@ typedef struct janus_session {
+ 	GHashTable *ice_handles;
+ 	/*! \brief Time of the last activity on the session */
+ 	gint64 last_activity;
++	/*! \brief The signed token the session was created with (qjanus: sessions are counted per token), or NULL */
++	char *token;
+ 	/*! \brief Pointer to the request instance (and the transport that originated the session) */
+ 	janus_request *source;
+ 	/*! \brief Flag to notify there's been a session timeout */
