@@ -30,7 +30,8 @@ too short or a token would expire before the planned end of the run (plus a 120 
   `call_answer` / `call_accepted` / `group*` message counters move), a foreign room appears or gets
   participants, load average 1 min > 3.5, `/api/v1/health` not 200 or slower than max(150 ms, 6 x the baseline)
   three samples in a row, bcrypto-server above 40 % of one core three samples in a row, the metrics
-  unreadable, the window over, or a `STOP` file (the normal end).
+  unreadable, the Janus room list unreadable for a minute, the window over, or a `STOP` file (the normal end).
+  A controller that dies leaves the guard running: it ends at 06:00 at the latest, destroying the rooms, and the samplers stop after 8 h.
 * Never restarts or reloads anything; the controller only reads the node, creates / destroys its own rooms and
   starts / stops its own processes under `/root/aruba-loadtest`.
 * Cleanup, also on Ctrl-C or any error, and VERIFIED: guard and samplers stopped, rooms destroyed, the three

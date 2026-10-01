@@ -400,7 +400,7 @@ if wanted e; then
 fi
 sleep 3                                            # a few baseline rows before the first load
 
-for id in negative a b c d e f report g i h; do
+for id in negative a b c d e f report g i p h; do
   wanted "$id" || continue
   case $id in
     negative) run_step negative "access control: tokens, admin key, join tokens, kick" step_negative ;;

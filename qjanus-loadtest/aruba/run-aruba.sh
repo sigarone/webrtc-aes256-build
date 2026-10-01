@@ -119,8 +119,8 @@ install_node() {
 start_node_jobs() {
   rsh "cd $RDIR && rm -f guard/ABORT guard/STOP \
     && QJANUS_LOADTEST_SEED_FILE=$RDIR/seed setsid nohup python3 aruba_tool.py guard --out $RDIR/guard > guard.log 2>&1 < /dev/null & \
-    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/janus.csv --process qjanus,janus --interval 2 --quiet > sampler-janus.log 2>&1 < /dev/null & \
-    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/bcrypto.csv --process bcrypto-lite --interval 2 --quiet > sampler-bc.log 2>&1 < /dev/null & \
+    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/janus.csv --process qjanus,janus --interval 2 --duration 28800 --quiet > sampler-janus.log 2>&1 < /dev/null & \
+    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/bcrypto.csv --process bcrypto-lite --interval 2 --duration 28800 --quiet > sampler-bc.log 2>&1 < /dev/null & \
     sleep 12; cat $RDIR/guard.log" || return 1
   node_alive || return 1
 }

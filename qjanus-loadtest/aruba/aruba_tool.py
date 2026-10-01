@@ -51,6 +51,7 @@ BC_CPU_ABORT_PCT = 40.0  # bcrypto-server, percent of ONE core, CONSECUTIVE samp
 HEALTH_ABS_MS = 150.0
 HEALTH_REL = 6.0
 CONSECUTIVE = 3
+ROOMS_UNREADABLE_CHECKS = 12  # guard checks (5 s each) in a row without a readable Janus room list
 
 # Janus videoroom parameters of spec section 3 (mirror of SPEC_ROOM_DEFAULTS in src/janus-admin.mjs)
 SPEC_ROOM_DEFAULTS = {
@@ -415,6 +416,7 @@ class GuardState:
         self.cpu_run = 0
         self.health_run = 0
         self.foreign_n = None
+        self.rooms_none = 0
 
     def check(self, s):
         """s: dict(load1, bc_cpu, health=(status, ms), metrics, rooms, window_ok, manual). A reason, or None to go on."""
@@ -432,7 +434,12 @@ class GuardState:
         if m["total_calls"] != self.base["total_calls"] or m["call_msgs"] != self.base["call_msgs"] or m["group_msgs"] != self.base["group_msgs"]:
             return "a real call or group call started"
         rooms = s["rooms"]
-        if rooms is not None:
+        if rooms is None:
+            self.rooms_none += 1
+            if self.rooms_none >= ROOMS_UNREADABLE_CHECKS:
+                return "janus room list unreadable"
+        else:
+            self.rooms_none = 0
             if rooms[1] > 0:
                 return "a group call is active"
             if self.foreign_n is None:

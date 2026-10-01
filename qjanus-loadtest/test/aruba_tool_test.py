@@ -134,8 +134,14 @@ class GuardTest(unittest.TestCase):
         self.assertIsNone(st.check(sample(rooms=(1, 0, 4, 32))))
         self.assertIn("foreign room", st.check(sample(rooms=(2, 0, 4, 32))))
 
-    def test_unreadable_rooms_do_not_abort_by_themselves(self):
-        self.assertIsNone(self.state().check(sample(rooms=None)))
+    def test_unreadable_rooms_abort_only_after_a_minute(self):
+        st = self.state()
+        for _ in range(t.ROOMS_UNREADABLE_CHECKS - 1):
+            self.assertIsNone(st.check(sample(rooms=None)))
+        self.assertIsNone(st.check(sample(rooms=(0, 0, 0, 0))))   # a readable list resets the run
+        for _ in range(t.ROOMS_UNREADABLE_CHECKS - 1):
+            self.assertIsNone(st.check(sample(rooms=None)))
+        self.assertIn("unreadable", st.check(sample(rooms=None)))
 
     def test_health_needs_three_in_a_row(self):
         st = self.state(health_ms=2.0)  # limit = max(150, 12) = 150 ms
