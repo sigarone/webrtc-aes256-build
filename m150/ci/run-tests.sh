@@ -47,6 +47,23 @@ T5_FILTER="AudioEncoderOpusTest.ConfigComplexityAdaptation"
 # brand-new file with no existing unittest - still a genuine TODO for whoever
 # adds rtc_base/qaudion_tuning_unittest.cc.
 T6_FILTER=""
+# T7-T9 (P12, frame anti-replay). Unlike T1/T2 these run in BOTH configs: the
+# FrameCryptor code path is identical in strict and switchable builds.
+# T7 (KAT): the real FrameCryptorTransformer opens every wire vector of the
+# shared frame-crypto KAT (api/crypto/frame_crypto_kat_vectors.inc, generated
+# by m150/ci/kat2inc.py from m150/kat/group-calls-v2-frame-crypto.json),
+# re-seals every plaintext byte-for-byte and replays the replay scenarios.
+T7_FILTER="FrameCryptorKat.*"
+# T8 (replay window): window logic (reorder 255/256, duplicate, shift >= 256,
+# top = 0xFFFFFFFF, cap 64, GC on key change, reflection) and real
+# FrameCryptorTransformer pairs (duplicate dropped without any failure state,
+# second receiver of a participant, counter continuity, exhaustion, H.264 IV
+# that needs RBSP escaping).
+T8_FILTER="FrameReplayWindow.*:FrameCryptorReplay.*"
+# T9 (upstream gtests): the 7 pre-existing FrameCryptor / KeyProvider /
+# DataPacketCryptor tests (compiled but never run before P12), moved to the
+# 32-byte keys P1 requires, plus the P1/P12 key-provider checks.
+T9_FILTER="FrameCryptor.KeyProvider:KeyProvider.*:DataPacketCryptor.*"
 
 any=0
 # <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
@@ -56,7 +73,9 @@ any=0
 # upstream (LiveKit default).
 for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
             "T3:modules_unittests:$T3_FILTER" "T4:modules_unittests:$T4_FILTER" \
-            "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER"; do
+            "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER" \
+            "T7:rtc_unittests:$T7_FILTER" "T8:rtc_unittests:$T8_FILTER" \
+            "T9:rtc_unittests:$T9_FILTER"; do
   name=${spec%%:*}
   rest=${spec#*:}
   bin=${rest%%:*}
@@ -80,6 +99,6 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   any=$((any + 1))
 done
 if [ "$any" -eq 0 ]; then
-  echo "::warning::no T1-T6 filters ran - build-only smoke passed, no tests ran"
+  echo "::warning::no T1-T9 filters ran - build-only smoke passed, no tests ran"
 fi
 echo "run-tests: $any filter group(s) passed ($CONFIG)"

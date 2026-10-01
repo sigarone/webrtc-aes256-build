@@ -23,6 +23,12 @@ third_party P4a-opus-dnn-osce-build.patch
 . P6-srtp-aes256gcm-only.patch
 . P7-dtls13-aes256-pqc.patch
 #
+# Crypto author, frame anti-replay (P12): receiver replay window per sender
+# ssrc, full 32-bit sender counter, parse-after-unescape, window GC on key
+# change. Touches only api/crypto/frame_crypto_transformer.{h,cc}, its
+# unittest and api/crypto/BUILD.gn; applies on top of P1/P2/P3/P6/P7.
+. P12-frame-replay-window.patch
+#
 # Build-tooling author: P10 touches the separate 'build' repo (DEPS
 # 'src/build'), not the webrtc src tree or third_party, so it has no hunk
 # overlap with P1-P8/P4a and its position in this file does not matter.

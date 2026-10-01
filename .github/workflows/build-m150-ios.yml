@@ -1,11 +1,11 @@
 name: build-webrtc-ios-m150-hardened
 
-# Builds BOTH iOS M150 variants (plain WebRTC.xcframework + LiveKitWebRTC.xcframework)
-# device:arm64 + simulator:arm64 ONLY (no x86_64 simulator slice - all
+# Builds the iOS M150 WebRTC.xcframework (plain; the LiveKit-prefixed -lk
+# variant is gone) device:arm64 + simulator:arm64 ONLY (no x86_64 simulator slice - all
 # GitHub-hosted macOS runners are Apple Silicon now, see plan v2 §0). Same
 # job graph and reasoning as build-m150-android.yml (finding #16): precheck
-# (contents: read) -> build (contents: read, matrix plain/lk) -> publish
-# (contents: write + id-token: write + attestations: write, matrix plain/lk).
+# (contents: read) -> build (contents: read) -> publish
+# (contents: write + id-token: write + attestations: write).
 #
 # Runner: macos-26 (= macOS 26 Tahoe, Apple Silicon - confirmed present in
 # actions/runner-images as of 2026-09-28, ships Xcode 26.0.1 through 26.6;
@@ -24,7 +24,7 @@ on:
         description: "fork to sync from (must already carry webrtc_ref at exactly ba469aa2093ba950066258ca0a59a6fbd1295582 - Appendix B of webrtc-plan.md)"
         default: "https://github.com/sigarone/webrtc.git"
       release_suffix:
-        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-ios[-lk]-m150-<this> - must not already exist)"
+        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-ios-m150-<this> - must not already exist)"
         required: true
 
 env:
@@ -46,7 +46,6 @@ jobs:
       contents: read
     outputs:
       tag_plain: ${{ steps.tags.outputs.tag_plain }}
-      tag_lk: ${{ steps.tags.outputs.tag_lk }}
     steps:
       - name: Validate dispatch inputs (charset allow-list, fail closed)
         run: |
@@ -60,14 +59,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "tag_plain=webrtc-ios-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "tag_lk=webrtc-ios-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if either release or git tag already exists
+      - name: Refuse if the release or git tag already exists
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for t in "webrtc-ios-m150-${IN_SUFFIX}" "webrtc-ios-lk-m150-${IN_SUFFIX}"; do
+          for t in "webrtc-ios-m150-${IN_SUFFIX}"; do
             if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "::error::release tag '$t' already exists - use a new release_suffix"
               exit 1
@@ -88,10 +86,6 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [plain, lk]
     env:
       DEPOT_TOOLS_UPDATE: "0"
     steps:
@@ -130,8 +124,8 @@ jobs:
           WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
         run: bash ctrl/m150/ci/sync.sh "$RUNNER_TEMP/webrtc" "$IN_WEBRTC_REF" ios,mac
 
-      - name: Apply patch series (variant=ios${{ matrix.variant == 'lk' && '-lk' || '' }})
-        run: bash ctrl/m150/apply-series.sh "$RUNNER_TEMP/webrtc/src" "ios${{ matrix.variant == 'lk' && '-lk' || '' }}"
+      - name: Apply patch series (variant=ios)
+        run: bash ctrl/m150/apply-series.sh "$RUNNER_TEMP/webrtc/src" ios
 
       - name: Fetch Opus DNN weights (sha256-pinned)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$RUNNER_TEMP/webrtc/src/third_party/opus/src"
@@ -146,26 +140,13 @@ jobs:
             sed -i '' "/'third_party', 'siso', 'cipd', 'siso'/d" "$f"
           fi
 
-      - name: Build (build_ios_libs.py, device:arm64 + simulator:arm64, both variants)
+      - name: Build (build_ios_libs.py, device:arm64 + simulator:arm64)
         working-directory: ${{ runner.temp }}/webrtc/src
         env:
-          GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
-          # plain -> WebRTC.xcframework; lk -> LiveKitWebRTC.xcframework (the
-          # vendored m150/lk/apple_prefix.patch, applied by apply-series.sh for
-          # ios-lk, renames build_ios_libs.py's SDK_* output names, the
-          # framework output_name and the RTC_OBJC_TYPE_PREFIX to LK).
-          XC_NAME: ${{ matrix.variant == 'plain' && 'WebRTC' || 'LiveKitWebRTC' }}
+          GN_STRICT: "true"
+          XC_NAME: WebRTC
         run: |
           set -euo pipefail
-          # Security review, stage 3: the LK leg used to run the vendored
-          # upstream m150/lk/xcframework.sh, which (a) builds 11 slices
-          # (iOS x64 sim, macOS, Catalyst, tvOS, visionOS) far past this job's
-          # time budget and the G6 arm64-only allow-list, and (b) never
-          # receives GN_ARGS, so the LK framework would have been built with
-          # the GN default rtc_qaudion_transport_strict=true (not switchable)
-          # and treat_warnings_as_errors=true. Both variants now go through
-          # the same build_ios_libs.py invocation; only GN_STRICT and the
-          # (patch-driven) output name differ.
           # depot_tools lives under $RUNNER_TEMP/webrtc (m150/ci/sync.sh),
           # which also ran its ensure_bootstrap; fail closed if it did not.
           test -f "$RUNNER_TEMP/webrtc/depot_tools/python3_bin_reldir.txt"
@@ -198,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           XC=$(find "$GITHUB_WORKSPACE/out" -maxdepth 1 -name '*.xcframework')
-          bash ctrl/m150/gates.sh ios "${{ matrix.variant }}" "$XC" \
+          bash ctrl/m150/gates.sh ios plain "$XC" \
             "$RUNNER_TEMP/webrtc/src/third_party/opus/src/dnn" \
             "$RUNNER_TEMP/webrtc/src/third_party/boringssl/src/include/openssl/ssl.h"
 
@@ -219,7 +200,7 @@ jobs:
           set -euo pipefail
           XCODE_VERSION=$(xcodebuild -version 2>/dev/null | awk 'NR==1{print $2}')  # no head: SIGPIPE aborts xcodebuild under pipefail
           echo "XCODE_VERSION=$XCODE_VERSION" >> "$GITHUB_ENV"
-          XCODE_VERSION="$XCODE_VERSION" python3 ctrl/m150/buildinfo.py ios "${{ matrix.variant }}" > "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
+          XCODE_VERSION="$XCODE_VERSION" python3 ctrl/m150/buildinfo.py ios plain > "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
           cat "$GITHUB_WORKSPACE/pub/BUILDINFO.json"
 
       - name: SHA256SUMS
@@ -228,16 +209,15 @@ jobs:
       - name: Upload build artifact (workflow-scoped only)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ios-${{ matrix.variant }}
+          name: ios-plain
           path: pub/*
           if-no-files-found: error
 
   publish:
     needs: [precheck, build]
-    # Publish each variant that built and passed its gates, even if the other
-    # matrix leg failed: a leg whose build failed never uploaded its artifact
-    # (the upload is the build job's last step, after the gates), so its
-    # publish leg fails closed at the download below.
+    # A build that failed never uploaded its artifact (the upload is the build
+    # job's last step, after the gates), so a failed build fails closed at the
+    # download below.
     if: ${{ !cancelled() && needs.precheck.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -245,15 +225,11 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [plain, lk]
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: ios-${{ matrix.variant }}
+          name: ios-plain
           path: out
 
       - name: Re-verify SHA256SUMS
@@ -265,7 +241,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
+          TAG="${{ needs.precheck.outputs.tag_plain }}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
             exit 1
@@ -290,6 +266,6 @@ jobs:
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --notes "M150 iOS xcframework (${{ matrix.variant }}), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
+            --notes "M150 iOS xcframework (plain), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
             out/* \
             || echo "::warning::GITHUB_TOKEN could not create release $TAG (HTTP 403 seen 2026-09-29). The artifact is attested and sha256-verified; the maintainer publishes it from this run with a personal token."

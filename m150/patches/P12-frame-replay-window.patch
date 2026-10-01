@@ -1,0 +1,2214 @@
+FrameCryptor: receiver anti-replay window, full 32-bit sender counter, parse
+after RBSP unescaping (P12, frame E2EE anti-replay)
+
+Normative design: WIRE_SPEC section 11 ("Frame E2EE wire format and receiver
+replay window") and the P12 design. Applies on top of P1/P2/P3/P6/P7 (same two
+files as P1-P3; the hunks do not overlap with them). Touches only
+api/crypto/frame_crypto_transformer.{h,cc}, its unittest and api/crypto/BUILD.gn
+(test deps). No new exported API: no JNI / ObjC change, the FrameCryptionState
+enum keeps its 7 values, ParticipantKeyHandler is not RTC_EXPORT.
+
+Why: an SFU (or an attacker that controls signalling) can re-packetize any
+authenticated frame and send it again, or reflect a 1:1 peer's own frames back
+to it. SRTP replay protection only covers one hop and the frame AEAD key slot
+stays installed, so the receiver accepted every such frame.
+
+What changes (all in api/crypto/frame_crypto_transformer.{h,cc}):
+- IV: w3 = (rtpTimestamp - counter) mod 2^32 with a FULL 32-bit counter (it was
+  `send_count % 0xFFFF`, a per-transformer counter with a random first value
+  that never survived into the first IV). Byte layout, AAD, trailer and key
+  derivation are unchanged; a frame with counter 0 is byte-identical to before.
+- The sender counter lives in ParticipantKeyHandler (NextSendCounter(ssrc),
+  mutex-guarded, per ssrc): it survives re-creation of the transformer, is never
+  reset (key switch, enable toggle, slot change), never copied by Clone(), and
+  never wraps - after 0xFFFFFFFF has been issued the frame is dropped and the
+  transformer reports kEncryptionFailed once (edge-triggered).
+- Receiver window: RFC 4303-style 256-frame sliding bitmap, one window per IV
+  ssrc per ParticipantKeyHandler (shared by every transformer bound to the same
+  participant), at most 64 windows (the 65th new stream is rejected - never
+  evicted). Replay identity = (handler, IV word 1, (word 2 - word 3) mod 2^32);
+  RTP metadata is never used. The check is split: ReplayCheck(commit=false) is a
+  stateless pre-check before AES, ReplayCheck(commit=true) is the authoritative
+  check-and-set after the GCM tag verified, so a forger can neither advance a
+  window nor allocate one.
+- Reflection guard: a frame whose IV ssrc is a local send ssrc of the same
+  handler is rejected (1:1 shared handlers; a no-op in group calls).
+- A replay verdict (duplicate, too old, reflected, cap) is a SILENT drop: no
+  FrameCryptionState change and no observer callback, so it can never produce
+  kDecryptionFailed / kMissingKey (which drive media_key_nack and PLI). Internal
+  atomic counters per handler and one rate-limited log line per transformer
+  (at most one per 10 s, only when a counter moved):
+  "Q-AUDION frame-replay drop dup=N old=N refl=N cap=N kind=audio|video"
+  (counts and media kind only: no ssrc, participant id, key index, key or IV).
+  That literal is the build marker m150/gates.sh G3 checks.
+- Window GC tied to keys: SetKeyFromMaterial compares the new material with the
+  slot's current material in constant time (CRYPTO_memcmp). A different key (new
+  key, zeroed retirement, short/refused material, overwrite) clears the slot bit
+  from every window and erases the windows left without a slot; identical
+  material (idempotent re-install) changes nothing, because resetting there
+  would re-open replay. Frames a collected window accepted were sealed under a
+  key that is no longer installed, so a replay of them fails the tag.
+- Latent upstream bug fixed because the receive path is rewritten anyway:
+  decryptFrame read the 2-byte trailer and the 12-byte IV from the RBSP-ESCAPED
+  buffer. For H.264/H.265 the sender escapes ciphertext||tag||iv||trailer as one
+  unit, so whenever the IV or trailer contains 00 00 0x (x <= 3) the receiver
+  read a shifted IV and the frame never decrypted. The body is now unescaped
+  first and trailer and IV are parsed from the unescaped tail (the desktop JS
+  engine already did this).
+- KeyProviderOptions: the copy constructor now copies
+  discard_frame_when_cryptor_not_ready (DefaultKeyProviderImpl takes the options
+  by value, so the flag the app set used to be lost: the copy carried an
+  indeterminate value) and the field has the in-class default `true`.
+- The dead CreateRandomNonZeroId() line in makeIv is gone with the old counter.
+
+Tests (api/crypto/frame_crypto_transformer_unittest.cc, built into
+rtc_unittests, run by m150/ci/run-tests.sh as T7-T9 in both GN configs):
+- the 7 upstream gtests (never run before) move to the 32-byte keys P1 requires;
+- FrameReplayWindow.*: window logic (in order, reorder 255 ok / 256 too old,
+  duplicate, shift >= 256, shift 255, top = 0xFFFFFFFF, per-ssrc windows, cap 64,
+  GC on material change, no GC on identical material, reflection, counters);
+- FrameCryptorReplay.*: real FrameCryptorTransformer pairs with mock
+  transformable audio / VP8 / H.264 frames (round trip + IV layout, duplicate
+  dropped with no failure state, second receiver of the same participant,
+  reflection in shared-key mode, counter continuity across a destroyed sender,
+  exhaustion, forged frames neither advance nor create a window, H.264 frame
+  whose IV contains 00 00 01);
+- FrameCryptorKat.*: the shared KAT (m150/kat/group-calls-v2-frame-crypto.json,
+  sha256-pinned by m150/ci/kat2inc.py, compiled in through the generated
+  api/crypto/frame_crypto_kat_vectors.inc) runs through the real receiver and
+  sender transformers: every case, counterCases (counter seam), ringScenarios
+  and replayScenarios - closing review item L3 (no test ever ran the native
+  decryptFrame over any vector).
+
+
+diff --git a/api/crypto/BUILD.gn b/api/crypto/BUILD.gn
+index a455b74..d99082e 100644
+--- a/api/crypto/BUILD.gn
++++ b/api/crypto/BUILD.gn
+@@ -105,6 +105,11 @@ if (rtc_include_tests) {
+     deps = [
+       ":crypto",
+       ":frame_crypto_transformer",
++      "..:frame_transformer_interface",
++      "..:mock_transformable_audio_frame",
++      "..:mock_transformable_video_frame",
++      "../../modules/rtp_rtcp:rtp_video_header",
++      "../../rtc_base:threading",
+       "//testing/gtest",
+       "../../test:test_support",
+     ]
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index 8671166..6eb3642 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -21,11 +21,13 @@
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
+ #include <openssl/hkdf.h>
++#include <openssl/mem.h>
+ #include <openssl/pem.h>
+ #include <openssl/rand.h>
+ 
+ #include <iomanip>
+ #include <iostream>
++#include <optional>
+ #include <sstream>
+ #include <string>
+ 
+@@ -387,6 +389,154 @@ int ParticipantKeyHandler::DoKeyDerivation(const std::vector<uint8_t>& key,
+   return OperationError;
+ }
+ 
++// ---- Q-Audion P12: sender counter and receiver anti-replay window ---------
++
++std::optional<uint32_t> ParticipantKeyHandler::NextSendCounter(uint32_t ssrc) {
++  webrtc::MutexLock lock(&mutex_);
++  // First frame of a ssrc: counter 0. The map entry doubles as the "local
++  // send ssrc" set that feeds the reflection guard.
++  auto it = send_next_.try_emplace(ssrc, 0).first;
++  if (it->second > 0xFFFFFFFFull) {
++    send_exhausted_.fetch_add(1, std::memory_order_relaxed);
++    return std::nullopt;
++  }
++  const uint32_t counter = static_cast<uint32_t>(it->second);
++  it->second += 1;
++  return counter;
++}
++
++void ParticipantKeyHandler::SetSendCounterForTesting(uint32_t ssrc,
++                                                     uint32_t next) {
++  webrtc::MutexLock lock(&mutex_);
++  send_next_[ssrc] = next;
++}
++
++size_t ParticipantKeyHandler::ReplayWindowCountForTesting() {
++  webrtc::MutexLock lock(&mutex_);
++  return windows_.size();
++}
++
++ReplayCounters ParticipantKeyHandler::GetReplayCounters() const {
++  ReplayCounters c;
++  c.dup = replay_dup_.load(std::memory_order_relaxed);
++  c.old = replay_old_.load(std::memory_order_relaxed);
++  c.refl = replay_refl_.load(std::memory_order_relaxed);
++  c.cap = replay_cap_.load(std::memory_order_relaxed);
++  c.exhausted = send_exhausted_.load(std::memory_order_relaxed);
++  return c;
++}
++
++bool ParticipantKeyHandler::SameKeyMaterial(
++    const webrtc::scoped_refptr<KeySet>& current,
++    const std::vector<uint8_t>& material) {
++  if (current == nullptr || current->material.size() != material.size()) {
++    return false;
++  }
++  // Constant time: key material must not leak through compare timing.
++  return CRYPTO_memcmp(current->material.data(), material.data(),
++                       material.size()) == 0;
++}
++
++void ParticipantKeyHandler::OnSlotMaterialChangedLocked(size_t slot) {
++  if (slot >= MAX_KEYRING_SIZE) {
++    return;
++  }
++  for (auto it = windows_.begin(); it != windows_.end();) {
++    it->second.slot_mask.reset(slot);
++    if (it->second.slot_mask.none()) {
++      it = windows_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++}
++
++ReplayVerdict ParticipantKeyHandler::ReplayCheckLocked(uint32_t iv_ssrc,
++                                                       uint32_t counter,
++                                                       int key_index,
++                                                       bool commit) {
++  // Reflection guard: a frame carrying one of OUR send ssrcs is our own
++  // stream coming back (1:1 shares one handler between both directions).
++  if (send_next_.find(iv_ssrc) != send_next_.end()) {
++    return ReplayVerdict::kReflected;
++  }
++  const size_t slot =
++      (key_index >= 0 ? static_cast<size_t>(key_index)
++                      : static_cast<size_t>(current_key_index_)) %
++      crypto_key_ring_.size();
++
++  auto it = windows_.find(iv_ssrc);
++  if (it == windows_.end()) {
++    if (commit) {
++      if (windows_.size() >= kMaxReplayWindowsPerHandler) {
++        return ReplayVerdict::kCap;
++      }
++      ReplayWindow w;
++      w.top = counter;
++      w.seen.set(0);
++      w.slot_mask.set(slot);
++      windows_.emplace(iv_ssrc, w);
++    }
++    return ReplayVerdict::kOk;
++  }
++
++  ReplayWindow& w = it->second;
++  if (counter > w.top) {
++    if (commit) {
++      const uint32_t d = counter - w.top;
++      if (d >= kReplayWindowFrames) {
++        w.seen.reset();
++      } else {
++        w.seen <<= static_cast<size_t>(d);
++      }
++      w.seen.set(0);
++      w.top = counter;
++      w.slot_mask.set(slot);
++    }
++    return ReplayVerdict::kOk;
++  }
++  const uint32_t d = w.top - counter;
++  if (d >= kReplayWindowFrames) {
++    return ReplayVerdict::kTooOld;
++  }
++  if (w.seen.test(static_cast<size_t>(d))) {
++    return ReplayVerdict::kDuplicate;
++  }
++  if (commit) {
++    w.seen.set(static_cast<size_t>(d));
++    w.slot_mask.set(slot);
++  }
++  return ReplayVerdict::kOk;
++}
++
++ReplayVerdict ParticipantKeyHandler::ReplayCheck(uint32_t iv_ssrc,
++                                                 uint32_t counter,
++                                                 int key_index,
++                                                 bool commit) {
++  ReplayVerdict verdict;
++  {
++    webrtc::MutexLock lock(&mutex_);
++    verdict = ReplayCheckLocked(iv_ssrc, counter, key_index, commit);
++  }
++  switch (verdict) {
++    case ReplayVerdict::kDuplicate:
++      replay_dup_.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case ReplayVerdict::kTooOld:
++      replay_old_.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case ReplayVerdict::kReflected:
++      replay_refl_.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case ReplayVerdict::kCap:
++      replay_cap_.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case ReplayVerdict::kOk:
++      break;
++  }
++  return verdict;
++}
++
+ FrameCryptorTransformer::FrameCryptorTransformer(
+     webrtc::Thread* signaling_thread,
+     const std::string participant_id,
+@@ -514,7 +664,20 @@ void FrameCryptorTransformer::encryptFrame(
+   webrtc::Buffer frame_trailer = webrtc::Buffer::CreateUninitializedWithSize(2);
+   frame_trailer[0] = getIvSize();
+   frame_trailer[1] = key_index_;
+-  webrtc::Buffer iv = makeIv(frame->GetSsrc(), frame->GetTimestamp());
++  // Q-Audion P12 (D3): the counter lives in the handler (per ssrc, never
++  // reset, never wraps). Exhausted = drop the frame, never reuse a counter.
++  std::optional<webrtc::Buffer> iv_or =
++      makeIv(key_handler.get(), frame->GetSsrc(), frame->GetTimestamp());
++  if (!iv_or.has_value()) {
++    RTC_LOG(LS_ERROR) << "FrameCryptorTransformer::encryptFrame() send "
++                         "counter exhausted, frame dropped";
++    if (last_enc_error_ != FrameCryptionState::kEncryptionFailed) {
++      last_enc_error_ = FrameCryptionState::kEncryptionFailed;
++      onFrameCryptionStateChanged(last_enc_error_);
++    }
++    return;
++  }
++  webrtc::Buffer iv = std::move(*iv_or);
+ 
+   webrtc::Buffer payload =
+       webrtc::Buffer::CreateUninitializedWithSize(data_in.size() - unencrypted_bytes);
+@@ -670,11 +833,42 @@ void FrameCryptorTransformer::decryptFrame(
+     frame_header[i] = data_in[i];
+   }
+ 
+-  webrtc::Buffer frame_trailer = webrtc::Buffer::CreateUninitializedWithSize(2);
+-  frame_trailer[0] = data_in[data_in.size() - 2];
+-  frame_trailer[1] = data_in[data_in.size() - 1];
+-  uint8_t ivLength = frame_trailer[0];
+-  uint8_t key_index = frame_trailer[1];
++  // Q-Audion P12 (D10): for H.264/H.265 the sender RBSP-escapes
++  // ciphertext||tag||iv||trailer as ONE unit, so the body is unescaped FIRST
++  // and the trailer and the IV are parsed from the unescaped tail. Upstream
++  // read both from the escaped buffer: whenever the IV or the trailer
++  // contained 00 00 0x (x <= 3) it read a shifted IV and the frame failed to
++  // decrypt (the desktop JS engine already parsed after unescaping).
++  webrtc::Buffer encrypted_buffer =
++      webrtc::Buffer::CreateUninitializedWithSize(data_in.size() - unencrypted_bytes);
++  for (size_t i = unencrypted_bytes; i < data_in.size(); i++) {
++    encrypted_buffer[i - unencrypted_bytes] = data_in[i];
++  }
++
++  if (FrameIsH264(frame.get(), type_) &&
++      NeedsRbspUnescaping(encrypted_buffer)) {
++    encrypted_buffer.SetData(
++        H264::ParseRbsp(encrypted_buffer.data(), encrypted_buffer.size()));
++#ifdef RTC_ENABLE_H265
++  } else if (FrameIsH265(frame.get(), type_) &&
++             NeedsRbspUnescaping(encrypted_buffer)) {
++    encrypted_buffer.SetData(
++        H265::ParseRbsp(encrypted_buffer.data(), encrypted_buffer.size()));
++#endif // RTC_ENABLE_H265
++  }
++
++  // Q-Audion: RBSP unescaping shrinks the buffer; re-check before subtracting.
++  if (encrypted_buffer.size() <
++      static_cast<size_t>(getIvSize()) + 2 + kGcmTagBytes) {
++    if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
++      last_dec_error_ = FrameCryptionState::kDecryptionFailed;
++      onFrameCryptionStateChanged(last_dec_error_);
++    }
++    return;
++  }
++
++  uint8_t ivLength = encrypted_buffer[encrypted_buffer.size() - 2];
++  uint8_t key_index = encrypted_buffer[encrypted_buffer.size() - 1];
+ 
+   if (ivLength != getIvSize()) {
+     RTC_LOG(LS_WARNING) << "FrameCryptorTransformer::decryptFrame() ivLength["
+@@ -714,34 +908,27 @@ void FrameCryptorTransformer::decryptFrame(
+ 
+   webrtc::Buffer iv = webrtc::Buffer::CreateUninitializedWithSize(ivLength);
+   for (size_t i = 0; i < ivLength; i++) {
+-    iv[i] = data_in[data_in.size() - 2 - ivLength + i];
+-  }
+-
+-  webrtc::Buffer encrypted_buffer =
+-      webrtc::Buffer::CreateUninitializedWithSize(data_in.size() - unencrypted_bytes);
+-  for (size_t i = unencrypted_bytes; i < data_in.size(); i++) {
+-    encrypted_buffer[i - unencrypted_bytes] = data_in[i];
++    iv[i] = encrypted_buffer[encrypted_buffer.size() - 2 - ivLength + i];
+   }
+ 
+-  if (FrameIsH264(frame.get(), type_) &&
+-      NeedsRbspUnescaping(encrypted_buffer)) {
+-    encrypted_buffer.SetData(
+-        H264::ParseRbsp(encrypted_buffer.data(), encrypted_buffer.size()));
+-#ifdef RTC_ENABLE_H265
+-  } else if (FrameIsH265(frame.get(), type_) &&
+-             NeedsRbspUnescaping(encrypted_buffer)) {
+-    encrypted_buffer.SetData(
+-        H265::ParseRbsp(encrypted_buffer.data(), encrypted_buffer.size()));
+-#endif // RTC_ENABLE_H265
+-  }
+-
+-  // Q-Audion: RBSP unescaping shrinks the buffer; re-check before subtracting.
+-  if (encrypted_buffer.size() <
+-      static_cast<size_t>(ivLength) + 2 + kGcmTagBytes) {
+-    if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
+-      last_dec_error_ = FrameCryptionState::kDecryptionFailed;
+-      onFrameCryptionStateChanged(last_dec_error_);
+-    }
++  // Q-Audion P12 (D1): replay identity = (handler, ivSsrc, frameCounter) with
++  // ivSsrc = IV word 1 and frameCounter = (IV word 2 - IV word 3) mod 2^32.
++  // The IV is the GCM nonce, so a forged value fails the tag below.
++  auto iv_word = [&iv](size_t word) -> uint32_t {
++    return (static_cast<uint32_t>(iv[word * 4]) << 24) |
++           (static_cast<uint32_t>(iv[word * 4 + 1]) << 16) |
++           (static_cast<uint32_t>(iv[word * 4 + 2]) << 8) |
++           static_cast<uint32_t>(iv[word * 4 + 3]);
++  };
++  const uint32_t iv_ssrc = iv_word(0);
++  const uint32_t frame_counter = iv_word(1) - iv_word(2);
++
++  // Cheap pre-check, no state change. A replay verdict is a SILENT drop (D7):
++  // no FrameCryptionState change, no observer call, so it can never drive
++  // media_key_nack / PLI.
++  if (key_handler->ReplayCheck(iv_ssrc, frame_counter, key_index, false) !=
++      ReplayVerdict::kOk) {
++    maybeLogReplayDrops(key_handler.get());
+     return;
+   }
+ 
+@@ -839,6 +1026,14 @@ void FrameCryptorTransformer::decryptFrame(
+     return;
+   }
+ 
++  // Q-Audion P12 (D8): the authoritative check-and-set runs only now that the
++  // tag verified, so a forger can neither advance a window nor allocate one.
++  if (key_handler->ReplayCheck(iv_ssrc, frame_counter, key_index, true) !=
++      ReplayVerdict::kOk) {
++    maybeLogReplayDrops(key_handler.get());
++    return;
++  }
++
+   webrtc::Buffer payload(buffer.data(), buffer.size());
+   webrtc::Buffer data_out;
+   data_out.AppendData(frame_header);
+@@ -864,24 +1059,58 @@ void FrameCryptorTransformer::onFrameCryptionStateChanged(
+   }
+ }
+ 
+-webrtc::Buffer FrameCryptorTransformer::makeIv(uint32_t ssrc, uint32_t timestamp) {
+-  uint32_t send_count = 0;
+-  if (send_counts_.find(ssrc) == send_counts_.end()) {
+-    send_counts_[ssrc] = floor(CreateRandomNonZeroId() * 0xFFFF);
+-  } else {
+-    send_count = send_counts_[ssrc];
++// Q-Audion P12 (D2/D3): IV = BE32(ssrc) || BE32(timestamp) ||
++// BE32((timestamp - counter) mod 2^32) with a FULL 32-bit, never-resetting,
++// per-ssrc counter held by the key handler (upstream used a per-transformer
++// counter taken modulo 0xFFFF). A receiver recovers the counter as
++// (word2 - word3) mod 2^32 without ever looking at RTP metadata.
++std::optional<webrtc::Buffer> FrameCryptorTransformer::makeIv(
++    ParticipantKeyHandler* key_handler,
++    uint32_t ssrc,
++    uint32_t timestamp) {
++  std::optional<uint32_t> counter = key_handler->NextSendCounter(ssrc);
++  if (!counter.has_value()) {
++    return std::nullopt;
+   }
+   webrtc::ByteBufferWriter buf;
+   buf.WriteUInt32(ssrc);
+   buf.WriteUInt32(timestamp);
+-  buf.WriteUInt32(timestamp - (send_count % 0xFFFF));
+-  send_counts_[ssrc] = send_count + 1;
++  buf.WriteUInt32(timestamp - *counter);
+ 
+   RTC_CHECK_EQ(buf.Length(), getIvSize());
+ 
+   return webrtc::Buffer(buf.Data(), buf.Length());
+ }
+ 
++// Q-Audion P12 (D7, design section 3.6): at most one line per 10 s per transformer, only
++// when a drop counter moved. No ssrc, participant id, key index, key or IV.
++// The literal "Q-AUDION frame-replay" is the build marker gates.sh (G3)
++// checks for.
++void FrameCryptorTransformer::maybeLogReplayDrops(
++    ParticipantKeyHandler* key_handler) {
++  constexpr int64_t kReplayLogMinIntervalMs = 10000;
++  const int64_t now_ms = webrtc::TimeMillis();
++  if (replay_log_started_ &&
++      now_ms - last_replay_log_ms_ < kReplayLogMinIntervalMs) {
++    return;
++  }
++  const ReplayCounters cur = key_handler->GetReplayCounters();
++  const uint64_t dup = cur.dup - last_replay_logged_.dup;
++  const uint64_t old = cur.old - last_replay_logged_.old;
++  const uint64_t refl = cur.refl - last_replay_logged_.refl;
++  const uint64_t cap = cur.cap - last_replay_logged_.cap;
++  if (dup + old + refl + cap == 0) {
++    return;
++  }
++  replay_log_started_ = true;
++  last_replay_log_ms_ = now_ms;
++  last_replay_logged_ = cur;
++  RTC_LOG(LS_WARNING) << "Q-AUDION frame-replay drop dup=" << dup
++                      << " old=" << old << " refl=" << refl << " cap=" << cap
++                      << " kind="
++                      << (type_ == MediaType::kAudioFrame ? "audio" : "video");
++}
++
+ uint8_t FrameCryptorTransformer::getIvSize() {
+   switch (algorithm_) {
+     case Algorithm::kAesGcm:
+diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
+index 659fab4..da582f5 100644
+--- a/api/crypto/frame_crypto_transformer.h
++++ b/api/crypto/frame_crypto_transformer.h
+@@ -18,7 +18,13 @@
+ #define WEBRTC_FRAME_CRYPTOR_TRANSFORMER_H_
+ 
+ #include <atomic>
++#include <bitset>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "api/frame_transformer_interface.h"
+ #include "api/make_ref_counted.h"
+@@ -50,22 +56,27 @@ struct KeyProviderOptions {
+   int failure_tolerance;
+   // key ring size should be between 1 and 255
+   int key_ring_size;
+-  bool discard_frame_when_cryptor_not_ready;
++  // Q-Audion P12 (D10): the in-class initializer gives the field a defined
++  // value on every path; the upstream copy constructor below did not copy it,
++  // so a copied KeyProviderOptions (DefaultKeyProviderImpl takes it by value)
++  // carried an indeterminate value.
++  bool discard_frame_when_cryptor_not_ready = true;
+   KeyDerivationAlgorithm key_derivation_algorithm;
+   KeyProviderOptions()
+       : shared_key(false),
+         ratchet_window_size(0),
+         failure_tolerance(-1),
+         key_ring_size(DEFAULT_KEYRING_SIZE),
+-        discard_frame_when_cryptor_not_ready(false),
+         key_derivation_algorithm(kPBKDF2) {}
+-  KeyProviderOptions(KeyProviderOptions& copy)
++  KeyProviderOptions(const KeyProviderOptions& copy)
+       : shared_key(copy.shared_key),
+         ratchet_salt(copy.ratchet_salt),
+         uncrypted_magic_bytes(copy.uncrypted_magic_bytes),
+         ratchet_window_size(copy.ratchet_window_size),
+         failure_tolerance(copy.failure_tolerance),
+         key_ring_size(copy.key_ring_size),
++        discard_frame_when_cryptor_not_ready(
++            copy.discard_frame_when_cryptor_not_ready),
+         key_derivation_algorithm(copy.key_derivation_algorithm) {}
+ };
+ 
+@@ -102,6 +113,35 @@ class KeyProvider : public webrtc::RefCountInterface {
+   virtual ~KeyProvider() {}
+ };
+ 
++// Q-Audion P12: receiver anti-replay window (WIRE_SPEC "Frame E2EE wire format
++// and receiver replay window"). Replay identity = (ParticipantKeyHandler, IV
++// word 1 = sender ssrc, frame counter = (IV word 2 - IV word 3) mod 2^32).
++// The whole IV is the AES-GCM nonce, so it is authenticated; RTP metadata is
++// never used because an SFU rewrites it.
++enum class ReplayVerdict {
++  kOk = 0,
++  kDuplicate,
++  kTooOld,
++  kReflected,
++  kCap,
++};
++
++// Window size in frames (RFC 4303 style sliding bitmap) and the hard cap on
++// live windows (= distinct sender ssrcs) per handler. A full handler REJECTS
++// new streams (fail-closed); old windows are never evicted because eviction
++// would re-open replay.
++constexpr size_t kReplayWindowFrames = 256;
++constexpr size_t kMaxReplayWindowsPerHandler = 64;
++
++// Internal drop/exhaustion counters of one handler (no exported API).
++struct ReplayCounters {
++  uint64_t dup = 0;
++  uint64_t old = 0;
++  uint64_t refl = 0;
++  uint64_t cap = 0;
++  uint64_t exhausted = 0;
++};
++
+ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+  public:
+   struct KeySet : public webrtc::RefCountInterface {
+@@ -131,6 +171,8 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+     clone->crypto_key_ring_ = crypto_key_ring_;
+     clone->current_key_index_ = current_key_index_;
+     clone->has_valid_key_ = has_valid_key_;
++    // Q-Audion P12: send counters, replay windows and drop counters are NOT
++    // copied (a clone is a new participant slot that starts empty).
+     return clone;
+   }
+ 
+@@ -204,6 +246,7 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+     if (key_index >= 0) {
+       current_key_index_ = key_index % crypto_key_ring_.size();
+     }
++    const size_t slot = static_cast<size_t>(current_key_index_);
+     // Q-Audion (strict): AES-256-GCM only. Material shorter than 32 bytes is
+     // refused and the slot is emptied instead of deriving a weaker (128-bit)
+     // key - encryptFrame()/decryptFrame() then hit kMissingKey and DROP the
+@@ -211,13 +254,45 @@ class ParticipantKeyHandler : public webrtc::RefCountInterface {
+     if (password.size() < 32) {
+       RTC_LOG(LS_ERROR) << "FrameCryptor: key material shorter than 32 bytes "
+                             "refused (Q-Audion strict AES-256-only policy)";
+-      crypto_key_ring_[current_key_index_] = nullptr;
++      crypto_key_ring_[slot] = nullptr;
++      OnSlotMaterialChangedLocked(slot);
+       return;
+     }
+-    crypto_key_ring_[current_key_index_] =
++    // Q-Audion P12 (window GC): compare with the slot's current material in
++    // constant time. Identical material (idempotent re-install) changes
++    // nothing: resetting the replay windows there would re-open replay.
++    const bool same_material = SameKeyMaterial(crypto_key_ring_[slot], password);
++    crypto_key_ring_[slot] =
+         DeriveKeys(password, key_provider_->options().ratchet_salt, 256);
++    if (!same_material || crypto_key_ring_[slot] == nullptr) {
++      OnSlotMaterialChangedLocked(slot);
++    }
+   }
+ 
++  // Q-Audion P12 sender counter. Returns the next frame counter of `ssrc`
++  // (the first frame of a ssrc gets 0, each later one the previous + 1) and
++  // records `ssrc` as a local send ssrc (input of the reflection guard).
++  // Counters are per handler, never reset, never copied by Clone() and never
++  // wrap: after 0xFFFFFFFF has been issued the call returns std::nullopt and
++  // the sender must drop the frame (kEncryptionFailed).
++  std::optional<uint32_t> NextSendCounter(uint32_t ssrc);
++
++  // Q-Audion P12 receiver window. `commit` = false is the cheap pre-check
++  // (no state change, run before AES); `commit` = true is the authoritative
++  // check-and-set, run only AFTER the AEAD tag verified. A non-kOk verdict is
++  // counted internally; the caller drops the frame silently (no observer
++  // callback, never kDecryptionFailed / kMissingKey).
++  ReplayVerdict ReplayCheck(uint32_t iv_ssrc,
++                            uint32_t counter,
++                            int key_index,
++                            bool commit);
++
++  ReplayCounters GetReplayCounters() const;
++
++  // Test seams (not part of any exported API).
++  void SetSendCounterForTesting(uint32_t ssrc, uint32_t next);
++  size_t ReplayWindowCountForTesting();
++
+   bool DecryptionFailure() {
+     webrtc::MutexLock lock(&mutex_);
+     if (key_provider_->options().failure_tolerance < 0) {
+@@ -238,6 +313,27 @@ private:
+                       const std::vector<uint8_t>& salt,
+                       unsigned int optional_length_bits,
+                       std::vector<uint8_t>& derived_key);
++
++  // Q-Audion P12. One sliding window per sender ssrc: bit d of `seen` is set
++  // when counter (top - d) has been accepted. `slot_mask` records which key
++  // ring slots authenticated frames of this window (see window GC).
++  struct ReplayWindow {
++    uint32_t top = 0;
++    std::bitset<kReplayWindowFrames> seen;
++    std::bitset<MAX_KEYRING_SIZE> slot_mask;
++  };
++  static bool SameKeyMaterial(const webrtc::scoped_refptr<KeySet>& current,
++                              const std::vector<uint8_t>& material);
++  // Called with `mutex_` held after the material of ring slot `slot` changed
++  // (new key, zeroed retirement or overwrite): every frame the windows
++  // accepted under the old key can no longer authenticate, so the slot bit is
++  // cleared everywhere and windows left without any slot are erased.
++  void OnSlotMaterialChangedLocked(size_t slot);
++  ReplayVerdict ReplayCheckLocked(uint32_t iv_ssrc,
++                                  uint32_t counter,
++                                  int key_index,
++                                  bool commit);
++
+  private:
+   bool has_valid_key_ = false;
+   int decryption_failure_count_ = 0;
+@@ -245,6 +341,14 @@ private:
+   int current_key_index_ = 0;
+   KeyProvider* key_provider_;
+   std::vector<webrtc::scoped_refptr<KeySet>> crypto_key_ring_;
++  // Q-Audion P12 state, all guarded by mutex_ except the atomic counters.
++  std::map<uint32_t, uint64_t> send_next_;    // ssrc -> next counter to issue
++  std::map<uint32_t, ReplayWindow> windows_;  // ssrc -> window, size <= 64
++  std::atomic<uint64_t> replay_dup_{0};
++  std::atomic<uint64_t> replay_old_{0};
++  std::atomic<uint64_t> replay_refl_{0};
++  std::atomic<uint64_t> replay_cap_{0};
++  std::atomic<uint64_t> send_exhausted_{0};
+ };
+ 
+ class DefaultKeyProviderImpl : public KeyProvider {
+@@ -480,8 +584,13 @@ class RTC_EXPORT FrameCryptorTransformer
+   void encryptFrame(std::unique_ptr<webrtc::TransformableFrameInterface> frame);
+   void decryptFrame(std::unique_ptr<webrtc::TransformableFrameInterface> frame);
+   void onFrameCryptionStateChanged(FrameCryptionState error);
+-  webrtc::Buffer makeIv(uint32_t ssrc, uint32_t timestamp);
++  // Q-Audion P12: w3 = (timestamp - counter) mod 2^32 with the handler's
++  // never-resetting per-ssrc counter. std::nullopt = counter exhausted.
++  std::optional<webrtc::Buffer> makeIv(ParticipantKeyHandler* key_handler,
++                                       uint32_t ssrc,
++                                       uint32_t timestamp);
+   uint8_t getIvSize();
++  void maybeLogReplayDrops(ParticipantKeyHandler* key_handler);
+ 
+  private:
+   TaskQueueBase* const signaling_thread_;
+@@ -496,7 +605,6 @@ class RTC_EXPORT FrameCryptorTransformer
+   std::map<uint32_t, webrtc::scoped_refptr<webrtc::TransformedFrameCallback>>
+       sink_callbacks_;
+   int key_index_ = 0;
+-  std::map<uint32_t, uint32_t> send_counts_;
+   webrtc::scoped_refptr<KeyProvider> key_provider_;
+   webrtc::scoped_refptr<FrameCryptorTransformerObserver> observer_;
+   FrameCryptionState last_enc_error_ = FrameCryptionState::kNew;
+@@ -506,6 +614,10 @@ class RTC_EXPORT FrameCryptorTransformer
+   // separate from last_dec_error_ above, which the pre-existing
+   // failure_tolerance-gated path still owns unchanged.
+   std::atomic<int64_t> last_decrypt_fail_notify_ms_{0};
++  // Q-Audion P12: rate-limited replay-drop log (decrypt thread only).
++  bool replay_log_started_ = false;
++  int64_t last_replay_log_ms_ = 0;
++  ReplayCounters last_replay_logged_;
+ };
+ 
+ class RTC_EXPORT EncryptedPacket : public webrtc::RefCountInterface {
+diff --git a/api/crypto/frame_crypto_transformer_unittest.cc b/api/crypto/frame_crypto_transformer_unittest.cc
+index de63b23..f45f73a 100644
+--- a/api/crypto/frame_crypto_transformer_unittest.cc
++++ b/api/crypto/frame_crypto_transformer_unittest.cc
+@@ -1,16 +1,293 @@
+ #include "api/crypto/frame_crypto_transformer.h"
+ 
++#include <algorithm>
+ #include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstring>
++#include <future>
+ #include <memory>
++#include <mutex>
++#include <optional>
++#include <span>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
++#include "api/frame_transformer_interface.h"
++#include "api/test/mock_transformable_audio_frame.h"
++#include "api/test/mock_transformable_video_frame.h"
++#include "modules/rtp_rtcp/source/rtp_video_header.h"
+ #include "rtc_base/logging.h"
++#include "rtc_base/thread.h"
+ #include "test/gmock.h"
+ #include "test/gtest.h"
+ 
+ namespace webrtc {
+ 
++namespace {
++
++using FrameDirection = TransformableFrameInterface::Direction;
++using CryptorMediaType = FrameCryptorTransformer::MediaType;
++
++// 32-byte AES-256 key material. P1 refuses anything shorter.
++std::vector<uint8_t> TestKey32(uint8_t seed = 0) {
++  std::vector<uint8_t> key(32);
++  for (size_t i = 0; i < key.size(); ++i) {
++    key[i] = static_cast<uint8_t>(seed + i);
++  }
++  return key;
++}
++
++scoped_refptr<DefaultKeyProviderImpl> MakeHkdfProvider(bool shared_key) {
++  KeyProviderOptions options;
++  options.shared_key = shared_key;
++  options.key_derivation_algorithm = KeyDerivationAlgorithm::kHKDF;
++  return webrtc::make_ref_counted<DefaultKeyProviderImpl>(options);
++}
++
++// A key handler together with the provider it points at (the handler keeps a
++// raw KeyProvider*).
++struct HandlerFixture {
++  HandlerFixture()
++      : provider(MakeHkdfProvider(false)),
++        handler(webrtc::make_ref_counted<ParticipantKeyHandler>(
++            provider.get())) {}
++  scoped_refptr<DefaultKeyProviderImpl> provider;
++  scoped_refptr<ParticipantKeyHandler> handler;
++};
++
++uint32_t Be32(const std::vector<uint8_t>& v, size_t offset) {
++  return (static_cast<uint32_t>(v[offset]) << 24) |
++         (static_cast<uint32_t>(v[offset + 1]) << 16) |
++         (static_cast<uint32_t>(v[offset + 2]) << 8) |
++         static_cast<uint32_t>(v[offset + 3]);
++}
++
++// The 12-byte IV of a NON-escaped frame (audio / VP8): ... iv(12) trailer(2).
++std::vector<uint8_t> IvOf(const std::vector<uint8_t>& wire) {
++  return std::vector<uint8_t>(wire.end() - 14, wire.end() - 2);
++}
++
++class CollectingSink : public TransformedFrameCallback {
++ public:
++  void OnTransformedFrame(
++      std::unique_ptr<TransformableFrameInterface> frame) override {
++    std::span<const uint8_t> data = frame->GetData();
++    std::lock_guard<std::mutex> lock(mutex_);
++    frames_.emplace_back(data.begin(), data.end());
++    cv_.notify_all();
++  }
++  bool WaitForCount(size_t count, int timeout_ms = 15000) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
++                        [&] { return frames_.size() >= count; });
++  }
++  size_t Count() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return frames_.size();
++  }
++  std::vector<uint8_t> Frame(size_t index) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return index < frames_.size() ? frames_[index] : std::vector<uint8_t>();
++  }
++
++ private:
++  mutable std::mutex mutex_;
++  std::condition_variable cv_;
++  std::vector<std::vector<uint8_t>> frames_;
++};
++
++class CollectingObserver : public FrameCryptorTransformerObserver {
++ public:
++  void OnFrameCryptionStateChanged(const std::string participant_id,
++                                   FrameCryptionState state) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    states_.push_back(state);
++    cv_.notify_all();
++  }
++  bool WaitFor(FrameCryptionState state, int timeout_ms = 10000) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    return cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
++      return std::count(states_.begin(), states_.end(), state) > 0;
++    });
++  }
++  size_t CountOf(FrameCryptionState state) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return static_cast<size_t>(
++        std::count(states_.begin(), states_.end(), state));
++  }
++
++ private:
++  mutable std::mutex mutex_;
++  std::condition_variable cv_;
++  std::vector<FrameCryptionState> states_;
++};
++
++// The signaling thread the cryptors post observer callbacks to.
++class ReplayTestThread {
++ public:
++  ReplayTestThread() : thread_(Thread::Create()) {
++    thread_->SetName("replay-signaling", nullptr);
++    thread_->Start();
++  }
++  ~ReplayTestThread() { thread_->Stop(); }
++  Thread* get() { return thread_.get(); }
++  // Everything posted before this call has run when it returns.
++  void Flush() {
++    std::promise<void> done;
++    std::future<void> future = done.get_future();
++    thread_->PostTask([&done] { done.set_value(); });
++    future.wait_for(std::chrono::seconds(10));
++  }
++
++ private:
++  std::unique_ptr<Thread> thread_;
++};
++
++class TestAudioFrame : public MockTransformableAudioFrame {
++ public:
++  TestAudioFrame(std::vector<uint8_t> data,
++                 uint32_t ssrc,
++                 uint32_t timestamp,
++                 FrameDirection direction)
++      : data_(std::move(data)),
++        ssrc_(ssrc),
++        timestamp_(timestamp),
++        direction_(direction) {}
++  std::span<const uint8_t> GetData() const override { return data_; }
++  void SetData(std::span<const uint8_t> data) override {
++    data_.assign(data.begin(), data.end());
++  }
++  uint32_t GetSsrc() const override { return ssrc_; }
++  uint32_t GetTimestamp() const override { return timestamp_; }
++  FrameDirection GetDirection() const override { return direction_; }
++
++ private:
++  std::vector<uint8_t> data_;
++  uint32_t ssrc_;
++  uint32_t timestamp_;
++  FrameDirection direction_;
++};
++
++class TestVideoFrame : public MockTransformableVideoFrame {
++ public:
++  TestVideoFrame(std::vector<uint8_t> data,
++                 uint32_t ssrc,
++                 uint32_t timestamp,
++                 FrameDirection direction,
++                 VideoCodecType codec,
++                 bool key_frame)
++      : data_(std::move(data)),
++        ssrc_(ssrc),
++        timestamp_(timestamp),
++        direction_(direction),
++        key_frame_(key_frame) {
++    header_.codec = codec;
++  }
++  std::span<const uint8_t> GetData() const override { return data_; }
++  void SetData(std::span<const uint8_t> data) override {
++    data_.assign(data.begin(), data.end());
++  }
++  uint32_t GetSsrc() const override { return ssrc_; }
++  uint32_t GetTimestamp() const override { return timestamp_; }
++  FrameDirection GetDirection() const override { return direction_; }
++  bool IsKeyFrame() const override { return key_frame_; }
++  RTPVideoHeader& header() const override { return header_; }
++
++ private:
++  std::vector<uint8_t> data_;
++  uint32_t ssrc_;
++  uint32_t timestamp_;
++  FrameDirection direction_;
++  bool key_frame_;
++  mutable RTPVideoHeader header_;
++};
++
++// One real FrameCryptorTransformer with a collecting sink and observer.
++struct Cryptor {
++  Cryptor(Thread* signaling,
++          const std::string& participant_id,
++          CryptorMediaType type,
++          scoped_refptr<KeyProvider> provider,
++          int key_index,
++          uint32_t video_ssrc = 0) {
++    transformer = scoped_refptr<FrameCryptorTransformer>(
++        new FrameCryptorTransformer(signaling, participant_id, type,
++                                    FrameCryptorTransformer::Algorithm::kAesGcm,
++                                    std::move(provider)));
++    transformer->SetEnabled(true);
++    transformer->SetKeyIndex(key_index);
++    transformer->RegisterFrameCryptorTransformerObserver(observer);
++    FrameTransformerInterface* iface = transformer.get();
++    if (type == CryptorMediaType::kAudioFrame) {
++      iface->RegisterTransformedFrameCallback(sink);
++    } else {
++      iface->RegisterTransformedFrameSinkCallback(sink, video_ssrc);
++    }
++  }
++  void Feed(std::unique_ptr<TransformableFrameInterface> frame) {
++    FrameTransformerInterface* iface = transformer.get();
++    iface->Transform(std::move(frame));
++  }
++
++  scoped_refptr<CollectingSink> sink = webrtc::make_ref_counted<CollectingSink>();
++  scoped_refptr<CollectingObserver> observer =
++      webrtc::make_ref_counted<CollectingObserver>();
++  scoped_refptr<FrameCryptorTransformer> transformer;
++};
++
++// Opus-like payload: 1 clear header byte + (n - 1) pseudo-random bytes.
++std::vector<uint8_t> AudioPayload(size_t n, uint8_t seed) {
++  std::vector<uint8_t> v(n);
++  for (size_t i = 0; i < n; ++i) {
++    v[i] = static_cast<uint8_t>(seed * 31 + i * 7 + 3);
++  }
++  v[0] = 0x78;
++  return v;
++}
++
++void FeedAudio(Cryptor& c,
++               const std::vector<uint8_t>& data,
++               uint32_t ssrc,
++               uint32_t timestamp,
++               FrameDirection direction) {
++  c.Feed(std::make_unique<TestAudioFrame>(data, ssrc, timestamp, direction));
++}
++
++// Seals one audio frame with the sender cryptor and returns the wire bytes.
++std::vector<uint8_t> SealAudio(Cryptor& tx,
++                               const std::vector<uint8_t>& plain,
++                               uint32_t ssrc,
++                               uint32_t timestamp) {
++  const size_t before = tx.sink->Count();
++  FeedAudio(tx, plain, ssrc, timestamp, FrameDirection::kSender);
++  EXPECT_TRUE(tx.sink->WaitForCount(before + 1));
++  return tx.sink->Frame(before);
++}
++
++
++// Annex-B H.264 IDR slice: start code, NAL header, 1 byte, then payload that
++// contains no start code.
++std::vector<uint8_t> H264Idr(size_t payload_len, uint8_t seed) {
++  std::vector<uint8_t> v = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
++  for (size_t i = 0; i < payload_len; ++i) {
++    v.push_back(static_cast<uint8_t>(0x10 + ((seed + i * 5) % 0xE0)));
++  }
++  return v;
++}
++
++bool ContainsEmulationPrevention(const std::vector<uint8_t>& v, size_t from) {
++  for (size_t i = from; i + 2 < v.size(); ++i) {
++    if (v[i] == 0 && v[i + 1] == 0 && v[i + 2] == 3) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
+ TEST(FrameCryptor, KeyProvider) {
+   auto key_options = KeyProviderOptions();
+   RTC_LOG(LS_INFO) << "DataPacketCrypt shared_key default: "
+@@ -28,23 +305,22 @@ TEST(FrameCryptor, KeyProvider) {
+   EXPECT_NE(key_provider, nullptr);
+ 
+   std::string participant_id = "participant_1";
+-  key_provider->SetKey(participant_id, 0,
+-                       std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                            11, 12, 13, 14, 15});
++  key_provider->SetKey(participant_id, 0, TestKey32());
+   auto key_handler = key_provider->GetKey(participant_id);
+   EXPECT_NE(key_handler, nullptr);
+ 
+   auto keyset = key_handler->GetKeySet(0);
+   EXPECT_NE(keyset, nullptr);
+ 
+-  EXPECT_EQ(keyset->material,
+-            std::vector<uint8_t>(
+-                {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}));
+-  EXPECT_EQ(keyset->encryption_key.size(), 16u);
++  EXPECT_EQ(keyset->material, TestKey32());
++  EXPECT_EQ(keyset->encryption_key.size(), 32u);
+ 
++  // PBKDF2-HMAC-SHA256(key, salt = 00..07, 100000 iterations, 32 bytes).
+   EXPECT_EQ(keyset->encryption_key,
+-            std::vector<uint8_t>({166, 88, 205, 82, 239, 186, 202, 223, 236,
+-                                  223, 224, 160, 220, 87, 78, 195}));
++            std::vector<uint8_t>({12,  34,  206, 240, 186, 197, 126, 54,
++                                  101, 211, 21,  101, 185, 187, 217, 64,
++                                  166, 193, 16,  240, 177, 25,  69,  209,
++                                  203, 108, 101, 32,  206, 197, 157, 79}));
+ 
+   key_handler->RatchetKey(0);
+   auto new_keyset = key_handler->GetKeySet(0);
+@@ -62,9 +338,7 @@ TEST(DataPacketCryptor, BasicTest) {
+   EXPECT_NE(key_provider, nullptr);
+ 
+   std::string participant_id = "participant_1";
+-  key_provider->SetKey(participant_id, 0,
+-                       std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                            11, 12, 13, 14, 15});
++  key_provider->SetKey(participant_id, 0, TestKey32());
+   auto data_packet_cryptor = webrtc::make_ref_counted<DataPacketCryptor>(
+       FrameCryptorTransformer::Algorithm::kAesGcm, key_provider);
+   EXPECT_NE(data_packet_cryptor, nullptr);
+@@ -108,9 +382,7 @@ TEST(DataPacketCryptor, BasicTest) {
+   EXPECT_FALSE(decrypted_data2.ok());
+ 
+   // set back to previous key
+-  key_provider->SetKey(participant_id, 0,
+-                       std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                            11, 12, 13, 14, 15});
++  key_provider->SetKey(participant_id, 0, TestKey32());
+   auto decrypted_data3 =
+       data_packet_cryptor->Decrypt(participant_id, encrypted_data.value());
+   EXPECT_TRUE(decrypted_data3.ok());
+@@ -141,12 +413,8 @@ TEST(DataPacketCryptor, DifferentKeyProvider) {
+   EXPECT_NE(key_provider2, nullptr);
+ 
+   std::string participant_id = "participant_1";
+-  key_provider1->SetKey(participant_id, 0,
+-                        std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                             11, 12, 13, 14, 15});
+-  key_provider2->SetKey(participant_id, 0,
+-                        std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                             11, 12, 13, 14, 15});
++  key_provider1->SetKey(participant_id, 0, TestKey32());
++  key_provider2->SetKey(participant_id, 0, TestKey32());
+ 
+   auto data_packet_cryptor1 = webrtc::make_ref_counted<DataPacketCryptor>(
+       FrameCryptorTransformer::Algorithm::kAesGcm, key_provider1);
+@@ -189,9 +457,7 @@ TEST(DataPacketCryptor, IVGeneration) {
+       webrtc::make_ref_counted<DefaultKeyProviderImpl>(key_options);
+ 
+   std::string participant_id = "participant_1";
+-  key_provider->SetKey(participant_id, 0,
+-                       std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                            11, 12, 13, 14, 15});
++  key_provider->SetKey(participant_id, 0, TestKey32());
+   auto data_packet_cryptor = webrtc::make_ref_counted<DataPacketCryptor>(
+       FrameCryptorTransformer::Algorithm::kAesGcm, key_provider);
+   EXPECT_NE(data_packet_cryptor, nullptr);
+@@ -220,9 +486,7 @@ TEST(KeyProvider, KeyDerivationAlgorithm) {
+       webrtc::make_ref_counted<DefaultKeyProviderImpl>(key_options);
+ 
+   std::string participant_id = "participant_1";
+-  key_provider->SetKey(participant_id, 0,
+-                       std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-                                            11, 12, 13, 14, 15});
++  key_provider->SetKey(participant_id, 0, TestKey32());
+   auto data_packet_cryptor = webrtc::make_ref_counted<DataPacketCryptor>(
+       FrameCryptorTransformer::Algorithm::kAesGcm, key_provider);
+   EXPECT_NE(data_packet_cryptor, nullptr);
+@@ -249,7 +513,7 @@ TEST(KeyProvider, KeyRingSizeMaxAcceptsIndex255) {
+   auto key_provider =
+       webrtc::make_ref_counted<DefaultKeyProviderImpl>(key_options);
+ 
+-  const std::vector<uint8_t> key{0xAA, 0xBB, 0xCC, 0xDD};
++  const std::vector<uint8_t> key = TestKey32(0xAA);
+   EXPECT_TRUE(key_provider->SetSharedKey(255, key));
+   EXPECT_EQ(key_provider->ExportSharedKey(255), key);
+ }
+@@ -259,7 +523,7 @@ TEST(KeyProvider, GetKeySetReturnsNullptrForOutOfRange) {
+   key_options.shared_key = true;
+   auto key_provider =
+       webrtc::make_ref_counted<DefaultKeyProviderImpl>(key_options);
+-  ASSERT_TRUE(key_provider->SetSharedKey(0, std::vector<uint8_t>{0x00}));
++  ASSERT_TRUE(key_provider->SetSharedKey(0, TestKey32()));
+ 
+   auto key_handler = key_provider->GetSharedKey("participant_1");
+   ASSERT_NE(key_handler, nullptr);
+@@ -274,4 +538,1101 @@ TEST(KeyProvider, GetKeySetReturnsNullptrForOutOfRange) {
+   EXPECT_EQ(key_handler->GetKeySet(-2), nullptr);
+ }
+ 
++// ===========================================================================
++// Q-Audion P12 tests.
++//   FrameReplayWindow.*   - pure window / counter logic on ParticipantKeyHandler
++//   FrameCryptorReplay.*  - real FrameCryptorTransformer pairs
++//   FrameCryptorKat.*     - shared KAT vectors (see the second half)
++// ===========================================================================
++
++TEST(KeyProvider, ShortKeyMaterialIsRefused) {
++  auto key_provider = MakeHkdfProvider(false);
++  // P1: anything shorter than 32 bytes empties the slot, never AES-128.
++  key_provider->SetKey("p", 0, std::vector<uint8_t>(16, 0x11));
++  auto handler = key_provider->GetKey("p");
++  ASSERT_NE(handler, nullptr);
++  EXPECT_EQ(handler->GetKeySet(0), nullptr);
++  key_provider->SetKey("p", 0, TestKey32());
++  EXPECT_NE(handler->GetKeySet(0), nullptr);
++  EXPECT_EQ(handler->GetKeySet(0)->encryption_key.size(), 32u);
++}
++
++TEST(KeyProvider, OptionsCopyKeepsDiscardFlag) {
++  KeyProviderOptions defaults;
++  EXPECT_TRUE(defaults.discard_frame_when_cryptor_not_ready);
++
++  KeyProviderOptions options;
++  options.discard_frame_when_cryptor_not_ready = false;
++  options.shared_key = true;
++  options.key_ring_size = 8;
++  KeyProviderOptions copy(options);
++  EXPECT_FALSE(copy.discard_frame_when_cryptor_not_ready);
++  EXPECT_TRUE(copy.shared_key);
++  EXPECT_EQ(copy.key_ring_size, 8);
++
++  options.discard_frame_when_cryptor_not_ready = true;
++  KeyProviderOptions copy2(options);
++  EXPECT_TRUE(copy2.discard_frame_when_cryptor_not_ready);
++}
++
++// ---------------------------------------------------------------------------
++// FrameReplayWindow: pure window logic.
++// ---------------------------------------------------------------------------
++
++TEST(FrameReplayWindow, InOrderAcceptedOnceAndDuplicatesRejected) {
++  HandlerFixture f;
++  for (uint32_t c = 0; c < 100; ++c) {
++    ASSERT_EQ(f.handler->ReplayCheck(7, c, 0, false), ReplayVerdict::kOk) << c;
++    ASSERT_EQ(f.handler->ReplayCheck(7, c, 0, true), ReplayVerdict::kOk) << c;
++  }
++  for (uint32_t c = 0; c < 100; ++c) {
++    EXPECT_EQ(f.handler->ReplayCheck(7, c, 0, false), ReplayVerdict::kDuplicate)
++        << c;
++    EXPECT_EQ(f.handler->ReplayCheck(7, c, 0, true), ReplayVerdict::kDuplicate)
++        << c;
++  }
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 1u);
++  EXPECT_EQ(f.handler->GetReplayCounters().dup, 200u);
++}
++
++TEST(FrameReplayWindow, PreCheckChangesNoState) {
++  HandlerFixture f;
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, false), ReplayVerdict::kOk);
++  // Still nothing recorded: no window exists and the same frame is still new.
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 0u);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, false), ReplayVerdict::kDuplicate);
++  // Pre-checks of a newer / older-but-unseen counter do not record it either.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 9, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 9, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 3, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 3, 0, false), ReplayVerdict::kOk);
++}
++
++TEST(FrameReplayWindow, ReorderAt255AcceptedAt256Rejected) {
++  HandlerFixture f;
++  ASSERT_EQ(f.handler->ReplayCheck(7, 1000, 0, true), ReplayVerdict::kOk);
++  // 255 behind the top: still inside the 256-frame window.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 745, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 745, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 745, 0, true), ReplayVerdict::kDuplicate);
++  // 256 behind the top: out of the window.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 744, 0, false), ReplayVerdict::kTooOld);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 744, 0, true), ReplayVerdict::kTooOld);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0, 0, true), ReplayVerdict::kTooOld);
++  EXPECT_EQ(f.handler->GetReplayCounters().old, 3u);
++}
++
++TEST(FrameReplayWindow, ReorderedFramesEachAcceptedExactlyOnce) {
++  HandlerFixture f;
++  const uint32_t order[] = {0, 2, 1, 5, 3, 4, 9, 8, 7, 6};
++  for (uint32_t c : order) {
++    EXPECT_EQ(f.handler->ReplayCheck(7, c, 0, true), ReplayVerdict::kOk) << c;
++  }
++  for (uint32_t c : order) {
++    EXPECT_EQ(f.handler->ReplayCheck(7, c, 0, true), ReplayVerdict::kDuplicate)
++        << c;
++  }
++}
++
++TEST(FrameReplayWindow, ShiftOf256OrMoreResetsTheWindow) {
++  HandlerFixture f;
++  ASSERT_EQ(f.handler->ReplayCheck(7, 10, 0, true), ReplayVerdict::kOk);
++  // Jump by exactly 256: the old top falls out, only the new top is set.
++  ASSERT_EQ(f.handler->ReplayCheck(7, 266, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 10, 0, true), ReplayVerdict::kTooOld);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 266, 0, true), ReplayVerdict::kDuplicate);
++  // 255 behind the new top was never seen.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 11, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 11, 0, true), ReplayVerdict::kDuplicate);
++  // A jump far beyond the window.
++  ASSERT_EQ(f.handler->ReplayCheck(7, 1000000, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 266, 0, true), ReplayVerdict::kTooOld);
++}
++
++TEST(FrameReplayWindow, ShiftOf255KeepsTheOldTop) {
++  HandlerFixture f;
++  ASSERT_EQ(f.handler->ReplayCheck(7, 0, 0, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 255, 0, true), ReplayVerdict::kOk);
++  // Counter 0 is exactly 255 behind the new top: inside the window, seen.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0, 0, true), ReplayVerdict::kDuplicate);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 1, 0, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 256, 0, true), ReplayVerdict::kOk);
++  // Now counter 0 is 256 behind: out.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0, 0, true), ReplayVerdict::kTooOld);
++}
++
++TEST(FrameReplayWindow, CounterTopAtUint32Max) {
++  HandlerFixture f;
++  ASSERT_EQ(f.handler->ReplayCheck(7, 0xFFFFFFF0u, 0, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 0xFFFFFFFFu, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0xFFFFFFFFu, 0, true),
++            ReplayVerdict::kDuplicate);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0xFFFFFFF0u, 0, true),
++            ReplayVerdict::kDuplicate);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0xFFFFFFFEu, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0xFFFFFEFFu, 0, true),
++            ReplayVerdict::kTooOld);  // 256 behind
++  EXPECT_EQ(f.handler->ReplayCheck(7, 0xFFFFFF00u, 0, true), ReplayVerdict::kOk);
++  // A counter that "wrapped" is simply far behind: never accepted.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 3, 0, true), ReplayVerdict::kTooOld);
++}
++
++TEST(FrameReplayWindow, WindowsAreIndependentPerSsrc) {
++  HandlerFixture f;
++  EXPECT_EQ(f.handler->ReplayCheck(1, 50, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(2, 50, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(1, 50, 0, true), ReplayVerdict::kDuplicate);
++  // Interleaved simulcast layers advance independently.
++  EXPECT_EQ(f.handler->ReplayCheck(1, 51, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(2, 52, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(2, 51, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 2u);
++}
++
++TEST(FrameReplayWindow, CapRejectsTheSixtyFifthStreamAndNeverEvicts) {
++  HandlerFixture f;
++  for (uint32_t ssrc = 1; ssrc <= kMaxReplayWindowsPerHandler; ++ssrc) {
++    ASSERT_EQ(f.handler->ReplayCheck(ssrc, 0, 0, true), ReplayVerdict::kOk)
++        << ssrc;
++  }
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(),
++            kMaxReplayWindowsPerHandler);
++  const uint32_t extra = 1000;
++  // The pre-check cannot know the window would be refused: it changes nothing
++  // and says kOk. The authoritative commit says kCap.
++  EXPECT_EQ(f.handler->ReplayCheck(extra, 0, 0, false), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(extra, 0, 0, true), ReplayVerdict::kCap);
++  EXPECT_EQ(f.handler->ReplayCheck(extra, 1, 0, true), ReplayVerdict::kCap);
++  EXPECT_EQ(f.handler->GetReplayCounters().cap, 2u);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(),
++            kMaxReplayWindowsPerHandler);
++  // Existing windows keep working and still reject duplicates (no eviction).
++  EXPECT_EQ(f.handler->ReplayCheck(1, 0, 0, true), ReplayVerdict::kDuplicate);
++  EXPECT_EQ(f.handler->ReplayCheck(1, 1, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayCheck(64, 0, 0, true), ReplayVerdict::kDuplicate);
++}
++
++TEST(FrameReplayWindow, GcOnKeyMaterialChange) {
++  HandlerFixture f;
++  f.handler->SetKey(TestKey32(1), 0);
++  f.handler->SetKey(TestKey32(2), 1);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayCheck(8, 5, 1, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayWindowCountForTesting(), 2u);
++
++  // A different key in slot 3: no window used slot 3, nothing is collected.
++  f.handler->SetKey(TestKey32(3), 3);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 2u);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kDuplicate);
++
++  // Overwriting slot 0 with different material collects the window that only
++  // slot 0 ever authenticated; the other one survives.
++  f.handler->SetKey(TestKey32(9), 0);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 1u);
++  EXPECT_EQ(f.handler->ReplayCheck(8, 5, 1, true), ReplayVerdict::kDuplicate);
++  // The collected stream opens a fresh window under the new key.
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 2u);
++
++  // A zeroed retirement counts as a different key too.
++  f.handler->SetKey(std::vector<uint8_t>(32, 0), 1);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 1u);
++}
++
++TEST(FrameReplayWindow, WindowSpanningTwoSlotsSurvivesUntilBothChange) {
++  HandlerFixture f;
++  f.handler->SetKey(TestKey32(1), 0);
++  f.handler->SetKey(TestKey32(2), 1);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 6, 1, true), ReplayVerdict::kOk);
++  f.handler->SetKey(TestKey32(11), 0);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 1u);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 6, 1, true), ReplayVerdict::kDuplicate);
++  f.handler->SetKey(TestKey32(12), 1);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 0u);
++}
++
++TEST(FrameReplayWindow, NoGcOnIdenticalMaterial) {
++  HandlerFixture f;
++  f.handler->SetKey(TestKey32(1), 0);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  // Idempotent re-install of the very same key (what a re-apply does).
++  f.handler->SetKey(TestKey32(1), 0);
++  f.handler->SetKey(TestKey32(1), 0);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 1u);
++  EXPECT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kDuplicate);
++  // A one-bit difference is a different key.
++  std::vector<uint8_t> other = TestKey32(1);
++  other[31] ^= 0x01;
++  f.handler->SetKey(other, 0);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 0u);
++}
++
++TEST(FrameReplayWindow, ShortMaterialRetiresTheSlotAndCollects) {
++  HandlerFixture f;
++  f.handler->SetKey(TestKey32(1), 0);
++  ASSERT_EQ(f.handler->ReplayCheck(7, 5, 0, true), ReplayVerdict::kOk);
++  f.handler->SetKey(std::vector<uint8_t>(16, 1), 0);  // refused, slot emptied
++  EXPECT_EQ(f.handler->GetKeySet(0), nullptr);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 0u);
++}
++
++TEST(FrameReplayWindow, ReflectionOfALocalSendSsrcIsRejected) {
++  HandlerFixture f;
++  EXPECT_EQ(f.handler->ReplayCheck(0xAABB, 0, 0, false), ReplayVerdict::kOk);
++  ASSERT_EQ(f.handler->NextSendCounter(0xAABB), std::optional<uint32_t>(0));
++  EXPECT_EQ(f.handler->ReplayCheck(0xAABB, 0, 0, false),
++            ReplayVerdict::kReflected);
++  EXPECT_EQ(f.handler->ReplayCheck(0xAABB, 1, 0, true),
++            ReplayVerdict::kReflected);
++  EXPECT_EQ(f.handler->ReplayWindowCountForTesting(), 0u);
++  // Other ssrcs are unaffected.
++  EXPECT_EQ(f.handler->ReplayCheck(0xCCDD, 0, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(f.handler->GetReplayCounters().refl, 2u);
++}
++
++TEST(FrameReplayWindow, SendCounterStartsAtZeroAndIncrementsPerSsrc) {
++  HandlerFixture f;
++  EXPECT_EQ(f.handler->NextSendCounter(1), std::optional<uint32_t>(0));
++  EXPECT_EQ(f.handler->NextSendCounter(1), std::optional<uint32_t>(1));
++  EXPECT_EQ(f.handler->NextSendCounter(2), std::optional<uint32_t>(0));
++  EXPECT_EQ(f.handler->NextSendCounter(1), std::optional<uint32_t>(2));
++  EXPECT_EQ(f.handler->NextSendCounter(2), std::optional<uint32_t>(1));
++}
++
++TEST(FrameReplayWindow, SendCounterNeverWrapsAndReportsExhaustion) {
++  HandlerFixture f;
++  f.handler->SetSendCounterForTesting(5, 0xFFFFFFFEu);
++  EXPECT_EQ(f.handler->NextSendCounter(5), std::optional<uint32_t>(0xFFFFFFFEu));
++  EXPECT_EQ(f.handler->NextSendCounter(5), std::optional<uint32_t>(0xFFFFFFFFu));
++  EXPECT_FALSE(f.handler->NextSendCounter(5).has_value());
++  EXPECT_FALSE(f.handler->NextSendCounter(5).has_value());
++  EXPECT_EQ(f.handler->GetReplayCounters().exhausted, 2u);
++  // Other ssrcs keep their own counters.
++  EXPECT_EQ(f.handler->NextSendCounter(6), std::optional<uint32_t>(0));
++}
++
++TEST(FrameReplayWindow, CloneCopiesNeitherCountersNorWindows) {
++  HandlerFixture f;
++  f.handler->SetKey(TestKey32(1), 0);
++  ASSERT_EQ(f.handler->NextSendCounter(1), std::optional<uint32_t>(0));
++  ASSERT_EQ(f.handler->NextSendCounter(1), std::optional<uint32_t>(1));
++  ASSERT_EQ(f.handler->ReplayCheck(9, 5, 0, true), ReplayVerdict::kOk);
++  auto clone = f.handler->Clone();
++  EXPECT_NE(clone->GetKeySet(0), nullptr);  // keys are copied ...
++  EXPECT_EQ(clone->ReplayWindowCountForTesting(), 0u);  // ... state is not
++  EXPECT_EQ(clone->NextSendCounter(1), std::optional<uint32_t>(0));
++  EXPECT_EQ(clone->ReplayCheck(9, 5, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(clone->ReplayCheck(1, 0, 0, true), ReplayVerdict::kReflected);
++}
++
++TEST(FrameReplayWindow, SharedKeyProviderClonesPerParticipant) {
++  auto provider = MakeHkdfProvider(true);
++  ASSERT_TRUE(provider->SetSharedKey(0, TestKey32(1)));
++  auto a = provider->GetSharedKey("a");
++  auto a2 = provider->GetSharedKey("a");
++  auto b = provider->GetSharedKey("b");
++  ASSERT_NE(a, nullptr);
++  EXPECT_EQ(a.get(), a2.get());
++  EXPECT_NE(a.get(), b.get());
++  ASSERT_EQ(a->ReplayCheck(9, 1, 0, true), ReplayVerdict::kOk);
++  EXPECT_EQ(b->ReplayCheck(9, 1, 0, true), ReplayVerdict::kOk);  // own window
++  EXPECT_EQ(a->ReplayCheck(9, 1, 0, true), ReplayVerdict::kDuplicate);
++  // SetSharedKey with a new key reaches every clone and collects its windows.
++  ASSERT_TRUE(provider->SetSharedKey(0, TestKey32(2)));
++  EXPECT_EQ(a->ReplayWindowCountForTesting(), 0u);
++  EXPECT_EQ(b->ReplayWindowCountForTesting(), 0u);
++}
++
++// ---------------------------------------------------------------------------
++// FrameCryptorReplay: real FrameCryptorTransformers.
++// ---------------------------------------------------------------------------
++
++TEST(FrameCryptorReplay, AudioRoundTripAndIvLayout) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("alice", 3, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("alice", 3, TestKey32(1)));
++  Cryptor tx(signaling.get(), "alice", CryptorMediaType::kAudioFrame, tx_provider, 3);
++  Cryptor rx(signaling.get(), "alice", CryptorMediaType::kAudioFrame, rx_provider, 3);
++
++  const uint32_t ssrc = 0x11223344u;
++  const uint32_t ts0 = 4294967000u;  // the RTP timestamp wraps at i = 1
++  for (uint32_t i = 0; i < 4; ++i) {
++    const std::vector<uint8_t> plain = AudioPayload(40, static_cast<uint8_t>(i));
++    const uint32_t ts = ts0 + 960 * i;
++    const std::vector<uint8_t> wire = SealAudio(tx, plain, ssrc, ts);
++    ASSERT_EQ(wire.size(), plain.size() + 16 + 12 + 2);
++    EXPECT_EQ(wire[0], plain[0]);  // 1 clear header byte for Opus
++    EXPECT_EQ(wire[wire.size() - 2], 12);
++    EXPECT_EQ(wire[wire.size() - 1], 3);
++    const std::vector<uint8_t> iv = IvOf(wire);
++    EXPECT_EQ(Be32(iv, 0), ssrc);
++    EXPECT_EQ(Be32(iv, 4), ts);
++    EXPECT_EQ(Be32(iv, 8), ts - i);  // counter = i, full width, mod 2^32
++
++    FeedAudio(rx, wire, ssrc, ts, FrameDirection::kReceiver);
++    ASSERT_TRUE(rx.sink->WaitForCount(i + 1));
++    EXPECT_EQ(rx.sink->Frame(i), plain);
++  }
++  signaling.Flush();
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kMissingKey), 0u);
++}
++
++TEST(FrameCryptorReplay, Vp8KeyAndDeltaFramesRoundTrip) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("bob", 1, TestKey32(5)));
++  ASSERT_TRUE(rx_provider->SetKey("bob", 1, TestKey32(5)));
++  const uint32_t ssrc = 0x01020304u;
++  Cryptor tx(signaling.get(), "bob", CryptorMediaType::kVideoFrame, tx_provider, 1,
++             ssrc);
++  Cryptor rx(signaling.get(), "bob", CryptorMediaType::kVideoFrame, rx_provider, 1,
++             ssrc);
++  for (int i = 0; i < 4; ++i) {
++    const bool key_frame = (i % 2) == 0;
++    const size_t clear = key_frame ? 10 : 3;
++    std::vector<uint8_t> plain = AudioPayload(120, static_cast<uint8_t>(i + 9));
++    const uint32_t ts = 90000 * (i + 1);
++    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, FrameDirection::kSender,
++                                             VideoCodecType::kVideoCodecVP8,
++                                             key_frame));
++    ASSERT_TRUE(tx.sink->WaitForCount(i + 1));
++    const std::vector<uint8_t> wire = tx.sink->Frame(i);
++    ASSERT_EQ(wire.size(), plain.size() + 16 + 12 + 2);
++    EXPECT_TRUE(std::equal(plain.begin(), plain.begin() + clear, wire.begin()));
++    EXPECT_EQ(Be32(IvOf(wire), 8), ts - static_cast<uint32_t>(i));
++
++    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, FrameDirection::kReceiver,
++                                             VideoCodecType::kVideoCodecVP8,
++                                             key_frame));
++    ASSERT_TRUE(rx.sink->WaitForCount(i + 1));
++    EXPECT_EQ(rx.sink->Frame(i), plain);
++  }
++}
++
++// D10 regression: the sender RBSP-escapes ciphertext||tag||iv||trailer as one
++// unit. An IV holding 00 00 0x (here ssrc 1 -> 00 00 00 01, timestamp
++// 0x100 -> 00 00 01 00) gets emulation-prevention bytes inserted INSIDE it, so
++// a receiver that reads the IV before unescaping reads a shifted IV and the
++// frame never decrypts.
++TEST(FrameCryptorReplay, H264FrameWhoseIvNeedsEscapingDecrypts) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("carol", 2, TestKey32(7)));
++  ASSERT_TRUE(rx_provider->SetKey("carol", 2, TestKey32(7)));
++  const uint32_t ssrc = 0x00000001u;
++  Cryptor tx(signaling.get(), "carol", CryptorMediaType::kVideoFrame, tx_provider, 2,
++             ssrc);
++  Cryptor rx(signaling.get(), "carol", CryptorMediaType::kVideoFrame, rx_provider, 2,
++             ssrc);
++  for (int i = 0; i < 3; ++i) {
++    const std::vector<uint8_t> plain = H264Idr(100, static_cast<uint8_t>(i));
++    const uint32_t ts = 0x00000100u + i;  // 00 00 01 00 / 00 00 01 01 ...
++    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, FrameDirection::kSender,
++                                             VideoCodecType::kVideoCodecH264,
++                                             true));
++    ASSERT_TRUE(tx.sink->WaitForCount(i + 1));
++    const std::vector<uint8_t> wire = tx.sink->Frame(i);
++    // Header = start code (4) + 2 bytes; the escaped tail is longer than the
++    // raw ciphertext||tag||iv||trailer and holds emulation-prevention bytes.
++    EXPECT_GT(wire.size(), plain.size() + 16 + 12 + 2);
++    EXPECT_TRUE(ContainsEmulationPrevention(wire, 6));
++
++    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, FrameDirection::kReceiver,
++                                             VideoCodecType::kVideoCodecH264,
++                                             true));
++    ASSERT_TRUE(rx.sink->WaitForCount(i + 1)) << "frame " << i;
++    EXPECT_EQ(rx.sink->Frame(i), plain);
++  }
++  signaling.Flush();
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++}
++
++TEST(FrameCryptorReplay, H264FrameWithPlainIvRoundTrips) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("dave", 0, TestKey32(8)));
++  ASSERT_TRUE(rx_provider->SetKey("dave", 0, TestKey32(8)));
++  const uint32_t ssrc = 0x7A7B7C7Du;
++  Cryptor tx(signaling.get(), "dave", CryptorMediaType::kVideoFrame, tx_provider, 0,
++             ssrc);
++  Cryptor rx(signaling.get(), "dave", CryptorMediaType::kVideoFrame, rx_provider, 0,
++             ssrc);
++  const std::vector<uint8_t> plain = H264Idr(300, 4);
++  tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, 123456, FrameDirection::kSender,
++                                           VideoCodecType::kVideoCodecH264,
++                                           true));
++  ASSERT_TRUE(tx.sink->WaitForCount(1));
++  rx.Feed(std::make_unique<TestVideoFrame>(tx.sink->Frame(0), ssrc, 123456,
++                                           FrameDirection::kReceiver,
++                                           VideoCodecType::kVideoCodecH264,
++                                           true));
++  ASSERT_TRUE(rx.sink->WaitForCount(1));
++  EXPECT_EQ(rx.sink->Frame(0), plain);
++}
++
++TEST(FrameCryptorReplay, DuplicateIsDroppedSilently) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("erin", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("erin", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "erin", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "erin", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x0A0B0C0Du;
++  const auto p0 = AudioPayload(30, 1);
++  const auto p1 = AudioPayload(30, 2);
++  const auto w0 = SealAudio(tx, p0, ssrc, 1000);
++  const auto w1 = SealAudio(tx, p1, ssrc, 1960);
++
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);  // exact duplicate
++  FeedAudio(rx, w0, ssrc, 99999, FrameDirection::kReceiver);  // rewritten metadata
++  FeedAudio(rx, w1, ssrc, 1960, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.sink->WaitForCount(2));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), 2u);
++  EXPECT_EQ(rx.sink->Frame(0), p0);
++  EXPECT_EQ(rx.sink->Frame(1), p1);
++  // D7: a replay never produces a failure state (those drive media_key_nack).
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kMissingKey), 0u);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kInternalError), 0u);
++  EXPECT_EQ(rx_provider->GetKey("erin")->GetReplayCounters().dup, 2u);
++}
++
++TEST(FrameCryptorReplay, ReorderedFramesInsideTheWindowAreAcceptedOnce) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("fay", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("fay", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "fay", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "fay", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x0F0E0D0Cu;
++  std::vector<std::vector<uint8_t>> plains;
++  std::vector<std::vector<uint8_t>> wires;
++  for (uint32_t i = 0; i < 11; ++i) {
++    plains.push_back(AudioPayload(24, static_cast<uint8_t>(i)));
++    wires.push_back(SealAudio(tx, plains.back(), ssrc, 5000 + 960 * i));
++  }
++  const size_t order[] = {0, 2, 1, 4, 3, 9, 8, 7, 6, 5};
++  size_t expected = 0;
++  for (size_t idx : order) {
++    FeedAudio(rx, wires[idx], ssrc, 5000, FrameDirection::kReceiver);
++    ++expected;
++    ASSERT_TRUE(rx.sink->WaitForCount(expected));
++    EXPECT_EQ(rx.sink->Frame(expected - 1), plains[idx]);
++  }
++  FeedAudio(rx, wires[5], ssrc, 5000, FrameDirection::kReceiver);  // late duplicate
++  FeedAudio(rx, wires[10], ssrc, 5000, FrameDirection::kReceiver);  // new frame
++  ASSERT_TRUE(rx.sink->WaitForCount(expected + 1));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), expected + 1);
++  EXPECT_EQ(rx.sink->Frame(expected), plains[10]);
++}
++
++TEST(FrameCryptorReplay, FramesOlderThanTheWindowAreDropped) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("gus", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("gus", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "gus", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "gus", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x12121212u;
++  std::vector<std::vector<uint8_t>> plains;
++  std::vector<std::vector<uint8_t>> wires;
++  for (uint32_t i = 0; i < 300; ++i) {
++    plains.push_back(AudioPayload(20, static_cast<uint8_t>(i)));
++    wires.push_back(SealAudio(tx, plains.back(), ssrc, 960 * i));
++  }
++  FeedAudio(rx, wires[299], ssrc, 0, FrameDirection::kReceiver);  // top = 299
++  FeedAudio(rx, wires[0], ssrc, 0, FrameDirection::kReceiver);    // 299 behind: old
++  FeedAudio(rx, wires[43], ssrc, 0, FrameDirection::kReceiver);   // 256 behind: old
++  FeedAudio(rx, wires[44], ssrc, 0, FrameDirection::kReceiver);   // 255 behind: ok
++  ASSERT_TRUE(rx.sink->WaitForCount(2));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), 2u);
++  EXPECT_EQ(rx.sink->Frame(0), plains[299]);
++  EXPECT_EQ(rx.sink->Frame(1), plains[44]);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++  EXPECT_EQ(rx_provider->GetKey("gus")->GetReplayCounters().old, 2u);
++}
++
++TEST(FrameCryptorReplay, SecondReceiverOfTheSameParticipantDropsTheReplay) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("hal", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("hal", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "hal", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  // Two receiver cryptors bound to the SAME participant (another mid, or a
++  // re-created cryptor): they share the handler, hence the window.
++  Cryptor rx_a(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  Cryptor rx_b(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x33445566u;
++  const auto p0 = AudioPayload(26, 1);
++  const auto p1 = AudioPayload(26, 2);
++  const auto w0 = SealAudio(tx, p0, ssrc, 100);
++  const auto w1 = SealAudio(tx, p1, ssrc, 1060);
++
++  FeedAudio(rx_a, w0, ssrc, 100, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx_a.sink->WaitForCount(1));
++  FeedAudio(rx_b, w0, ssrc, 100, FrameDirection::kReceiver);  // replay onto "mid 2"
++  FeedAudio(rx_b, w1, ssrc, 1060, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx_b.sink->WaitForCount(1));
++  signaling.Flush();
++  EXPECT_EQ(rx_b.sink->Count(), 1u);
++  EXPECT_EQ(rx_b.sink->Frame(0), p1);
++  EXPECT_EQ(rx_b.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++  EXPECT_EQ(rx_a.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++
++  // A brand-new receiver cryptor on the same provider is covered as well.
++  Cryptor rx_c(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  FeedAudio(rx_c, w1, ssrc, 1060, FrameDirection::kReceiver);
++  const auto w2 = SealAudio(tx, AudioPayload(26, 3), ssrc, 2020);
++  FeedAudio(rx_c, w2, ssrc, 2020, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx_c.sink->WaitForCount(1));
++  signaling.Flush();
++  EXPECT_EQ(rx_c.sink->Count(), 1u);
++}
++
++TEST(FrameCryptorReplay, ForgedFramesNeitherAdvanceNorCreateAWindow) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("ivy", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("ivy", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "ivy", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "ivy", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x21436587u;
++  const auto p0 = AudioPayload(30, 1);
++  const auto p1 = AudioPayload(30, 2);
++  const auto w0 = SealAudio(tx, p0, ssrc, 1000);
++  const auto w1 = SealAudio(tx, p1, ssrc, 1960);
++
++  // Forged first: tampered ciphertext on a never-seen ssrc. The tag fails, so
++  // no window may be created.
++  std::vector<uint8_t> tampered = w0;
++  tampered[3] ^= 0x40;
++  FeedAudio(rx, tampered, ssrc, 1000, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.observer->WaitFor(FrameCryptionState::kDecryptionFailed));
++  EXPECT_EQ(rx_provider->GetKey("ivy")->ReplayWindowCountForTesting(), 0u);
++
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.sink->WaitForCount(1));
++  EXPECT_EQ(rx_provider->GetKey("ivy")->ReplayWindowCountForTesting(), 1u);
++
++  // Forged IV: counter pushed to 2^31. The IV is the GCM nonce, so the tag
++  // fails and the window top must NOT move.
++  std::vector<uint8_t> forged = w1;
++  const size_t w2_off = forged.size() - 14 + 4;
++  forged[w2_off] ^= 0x80;  // word 2 += 2^31, word 3 unchanged
++  FeedAudio(rx, forged, ssrc, 1960, FrameDirection::kReceiver);
++  FeedAudio(rx, w1, ssrc, 1960, FrameDirection::kReceiver);  // genuine counter 1
++  ASSERT_TRUE(rx.sink->WaitForCount(2));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Frame(1), p1);
++  EXPECT_EQ(rx_provider->GetKey("ivy")->GetReplayCounters().old, 0u);
++}
++
++TEST(FrameCryptorReplay, SharedKeyReflectionOfOwnFramesIsDropped) {
++  ReplayTestThread signaling;
++  // Shared-key mode: sender and receiver cryptors of one call bind the SAME
++  // participant id, hence the same handler (and the same key).
++  auto local = MakeHkdfProvider(true);
++  auto remote = MakeHkdfProvider(true);
++  ASSERT_TRUE(local->SetSharedKey(0, TestKey32(4)));
++  ASSERT_TRUE(remote->SetSharedKey(0, TestKey32(4)));
++  Cryptor tx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, local, 0);
++  Cryptor rx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, local, 0);
++  Cryptor remote_tx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, remote, 0);
++
++  const uint32_t own_ssrc = 0x11111111u;
++  const uint32_t peer_ssrc = 0x22222222u;
++  const auto own_plain = AudioPayload(28, 1);
++  const auto peer_plain = AudioPayload(28, 2);
++  const auto own_wire = SealAudio(tx, own_plain, own_ssrc, 700);
++  const auto peer_wire = SealAudio(remote_tx, peer_plain, peer_ssrc, 700);
++
++  // The attacker reflects our own frame back at us: it decrypts (same key) but
++  // must be rejected. A genuine frame of the peer still gets through.
++  FeedAudio(rx, own_wire, own_ssrc, 700, FrameDirection::kReceiver);
++  FeedAudio(rx, peer_wire, peer_ssrc, 700, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.sink->WaitForCount(1));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), 1u);
++  EXPECT_EQ(rx.sink->Frame(0), peer_plain);
++  EXPECT_EQ(local->GetSharedKey("peer")->GetReplayCounters().refl, 1u);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
++  EXPECT_EQ(rx.observer->CountOf(FrameCryptionState::kMissingKey), 0u);
++}
++
++TEST(FrameCryptorReplay, CounterContinuesWhenTheSenderCryptorIsRecreated) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("jo", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("jo", 0, TestKey32(1)));
++  Cryptor rx(signaling.get(), "jo", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x0000A1B2u;
++  std::vector<std::vector<uint8_t>> wires;
++  {
++    Cryptor tx1(signaling.get(), "jo", CryptorMediaType::kAudioFrame, tx_provider, 0);
++    for (uint32_t i = 0; i < 3; ++i) {
++      wires.push_back(SealAudio(tx1, AudioPayload(22, 1), ssrc, 8000 + 960 * i));
++    }
++  }  // sender cryptor destroyed; the provider (and its counters) lives on
++  Cryptor tx2(signaling.get(), "jo", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  for (uint32_t i = 3; i < 6; ++i) {
++    wires.push_back(SealAudio(tx2, AudioPayload(22, 2), ssrc, 8000 + 960 * i));
++  }
++  for (uint32_t i = 0; i < 6; ++i) {
++    const std::vector<uint8_t> iv = IvOf(wires[i]);
++    EXPECT_EQ(Be32(iv, 4) - Be32(iv, 8), i) << "counter of frame " << i;
++    FeedAudio(rx, wires[i], ssrc, 0, FrameDirection::kReceiver);
++  }
++  ASSERT_TRUE(rx.sink->WaitForCount(6));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), 6u);
++  EXPECT_EQ(rx_provider->GetKey("jo")->GetReplayCounters().dup, 0u);
++}
++
++TEST(FrameCryptorReplay, CounterExhaustionDropsTheFrameAndReportsOnce) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("kim", 0, TestKey32(1)));
++  ASSERT_TRUE(rx_provider->SetKey("kim", 0, TestKey32(1)));
++  Cryptor tx(signaling.get(), "kim", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "kim", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  const uint32_t ssrc = 0x5A5A5A5Au;
++  tx_provider->GetKey("kim")->SetSendCounterForTesting(ssrc, 0xFFFFFFFEu);
++
++  const auto pa = AudioPayload(20, 1);
++  const auto pb = AudioPayload(20, 2);
++  const auto wa = SealAudio(tx, pa, ssrc, 100);  // counter 0xFFFFFFFE
++  const auto wb = SealAudio(tx, pb, ssrc, 200);  // counter 0xFFFFFFFF
++  EXPECT_EQ(Be32(IvOf(wa), 4) - Be32(IvOf(wa), 8), 0xFFFFFFFEu);
++  EXPECT_EQ(Be32(IvOf(wb), 4) - Be32(IvOf(wb), 8), 0xFFFFFFFFu);
++
++  // Exhausted: dropped, nothing reaches the sink, kEncryptionFailed once.
++  FeedAudio(tx, AudioPayload(20, 3), ssrc, 300, FrameDirection::kSender);
++  FeedAudio(tx, AudioPayload(20, 4), ssrc, 400, FrameDirection::kSender);
++  ASSERT_TRUE(tx.observer->WaitFor(FrameCryptionState::kEncryptionFailed));
++  signaling.Flush();
++  EXPECT_EQ(tx.sink->Count(), 2u);
++  EXPECT_EQ(tx.observer->CountOf(FrameCryptionState::kEncryptionFailed), 1u);
++  EXPECT_GE(tx_provider->GetKey("kim")->GetReplayCounters().exhausted, 1u);
++
++  // The last two counters are valid on the receiver (window top = 2^32 - 1).
++  FeedAudio(rx, wa, ssrc, 100, FrameDirection::kReceiver);
++  FeedAudio(rx, wb, ssrc, 200, FrameDirection::kReceiver);
++  FeedAudio(rx, wb, ssrc, 200, FrameDirection::kReceiver);
++  FeedAudio(rx, wa, ssrc, 100, FrameDirection::kReceiver);
++  // A frame of another ssrc (own counter 0) closes the sequence.
++  const auto ps = AudioPayload(20, 5);
++  const auto ws = SealAudio(tx, ps, ssrc + 1, 500);
++  FeedAudio(rx, ws, ssrc + 1, 500, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.sink->WaitForCount(3));
++  signaling.Flush();
++  EXPECT_EQ(rx.sink->Count(), 3u);
++  EXPECT_EQ(rx.sink->Frame(0), pa);
++  EXPECT_EQ(rx.sink->Frame(1), pb);
++  EXPECT_EQ(rx.sink->Frame(2), ps);
++}
++
++TEST(FrameCryptorReplay, KeySwitchKeepsTheWindowAndLateOldSlotFramesAreAccepted) {
++  ReplayTestThread signaling;
++  auto tx_provider = MakeHkdfProvider(false);
++  auto rx_provider = MakeHkdfProvider(false);
++  ASSERT_TRUE(tx_provider->SetKey("lee", 1, TestKey32(10)));
++  ASSERT_TRUE(tx_provider->SetKey("lee", 2, TestKey32(20)));
++  ASSERT_TRUE(rx_provider->SetKey("lee", 1, TestKey32(10)));
++  ASSERT_TRUE(rx_provider->SetKey("lee", 2, TestKey32(20)));
++  Cryptor tx(signaling.get(), "lee", CryptorMediaType::kAudioFrame, tx_provider, 1);
++  Cryptor rx(signaling.get(), "lee", CryptorMediaType::kAudioFrame, rx_provider, 1);
++  const uint32_t ssrc = 0x0BADF00Du;
++  std::vector<std::vector<uint8_t>> plains;
++  std::vector<std::vector<uint8_t>> wires;
++  for (uint32_t i = 0; i < 2; ++i) {
++    plains.push_back(AudioPayload(24, static_cast<uint8_t>(i)));
++    wires.push_back(SealAudio(tx, plains.back(), ssrc, 100 + 960 * i));
++  }
++  tx.transformer->SetKeyIndex(2);  // sender moves to the next slot
++  for (uint32_t i = 2; i < 4; ++i) {
++    plains.push_back(AudioPayload(24, static_cast<uint8_t>(i)));
++    wires.push_back(SealAudio(tx, plains.back(), ssrc, 100 + 960 * i));
++  }
++  // Counters keep increasing across the key switch.
++  EXPECT_EQ(wires[2][wires[2].size() - 1], 2);
++  EXPECT_EQ(Be32(IvOf(wires[2]), 4) - Be32(IvOf(wires[2]), 8), 2u);
++
++  const size_t order[] = {2, 3, 0, 1};  // slot-2 frames first, then late slot-1
++  size_t expected = 0;
++  for (size_t idx : order) {
++    FeedAudio(rx, wires[idx], ssrc, 0, FrameDirection::kReceiver);
++    ++expected;
++    ASSERT_TRUE(rx.sink->WaitForCount(expected));
++    EXPECT_EQ(rx.sink->Frame(expected - 1), plains[idx]);
++  }
++  FeedAudio(rx, wires[1], ssrc, 0, FrameDirection::kReceiver);  // replay: dropped
++  signaling.Flush();
++  // Wait until the drop was processed via a sentinel frame.
++  const auto sentinel_plain = AudioPayload(24, 99);
++  const auto sentinel = SealAudio(tx, sentinel_plain, ssrc, 100 + 960 * 4);
++  FeedAudio(rx, sentinel, ssrc, 0, FrameDirection::kReceiver);
++  ASSERT_TRUE(rx.sink->WaitForCount(expected + 1));
++  EXPECT_EQ(rx.sink->Count(), expected + 1);
++
++  // Window GC through the real provider: retiring slot 1 keeps the window
++  // (slot 2 still authenticates), retiring slot 2 as well collects it.
++  auto handler = rx_provider->GetKey("lee");
++  ASSERT_EQ(handler->ReplayWindowCountForTesting(), 1u);
++  rx_provider->SetKey("lee", 1, std::vector<uint8_t>(32, 0));
++  EXPECT_EQ(handler->ReplayWindowCountForTesting(), 1u);
++  rx_provider->SetKey("lee", 2, std::vector<uint8_t>(32, 0));
++  EXPECT_EQ(handler->ReplayWindowCountForTesting(), 0u);
++  // Re-installing the zero key is idempotent: nothing to collect, no crash.
++  rx_provider->SetKey("lee", 2, std::vector<uint8_t>(32, 0));
++  EXPECT_EQ(handler->ReplayWindowCountForTesting(), 0u);
++}
++
++// ---------------------------------------------------------------------------
++// FrameCryptorKat: the shared frame-crypto KAT (m150/kat/
++// group-calls-v2-frame-crypto.json, the same file desktop, Android and iOS
++// pin) run against the REAL FrameCryptorTransformer. Closes review item L3
++// (no test ever ran native decryptFrame over any vector).
++// The vectors reach this file through api/crypto/frame_crypto_kat_vectors.inc,
++// generated by m150/ci/kat2inc.py (it verifies the pinned sha256 of the JSON).
++// ---------------------------------------------------------------------------
++#if defined(__has_include)
++#if __has_include("api/crypto/frame_crypto_kat_vectors.inc")
++#define Q_FRAME_KAT_PRESENT 1
++#endif
++#endif
++#ifndef Q_FRAME_KAT_PRESENT
++#define Q_FRAME_KAT_PRESENT 0
++#endif
++
++#if Q_FRAME_KAT_PRESENT
++
++namespace {
++
++#include "api/crypto/frame_crypto_kat_vectors.inc"
++
++std::vector<uint8_t> FromHex(const char* hex) {
++  std::vector<uint8_t> out;
++  const size_t n = std::strlen(hex);
++  for (size_t i = 0; i + 1 < n; i += 2) {
++    auto nibble = [](char c) -> uint8_t {
++      return static_cast<uint8_t>(c <= '9' ? c - '0' : c - 'a' + 10);
++    };
++    out.push_back(static_cast<uint8_t>((nibble(hex[i]) << 4) | nibble(hex[i + 1])));
++  }
++  return out;
++}
++
++CryptorMediaType KatMediaType(const KatFrame& f) {
++  return f.codec == kKatOpus ? CryptorMediaType::kAudioFrame : CryptorMediaType::kVideoFrame;
++}
++
++std::unique_ptr<TransformableFrameInterface> KatMakeFrame(
++    const KatFrame& f,
++    std::vector<uint8_t> data,
++    FrameDirection direction) {
++  if (f.codec == kKatOpus) {
++    return std::make_unique<TestAudioFrame>(std::move(data), f.ssrc, f.rtp_ts,
++                                            direction);
++  }
++  return std::make_unique<TestVideoFrame>(
++      std::move(data), f.ssrc, f.rtp_ts, direction,
++      f.codec == kKatH264 ? VideoCodecType::kVideoCodecH264
++                          : VideoCodecType::kVideoCodecVP8,
++      f.key_frame);
++}
++
++// Fresh receiver provider holding exactly `f`'s key, then open `wire`.
++bool KatOpen(Thread* signaling,
++             const KatFrame& f,
++             const std::vector<uint8_t>& wire,
++             std::vector<uint8_t>* plain) {
++  auto provider = MakeHkdfProvider(false);
++  provider->SetKey(f.participant, f.key_index, FromHex(f.key_hex));
++  Cryptor rx(signaling, f.participant, KatMediaType(f), provider, f.key_index,
++             f.ssrc);
++  rx.Feed(KatMakeFrame(f, wire, FrameDirection::kReceiver));
++  if (!rx.sink->WaitForCount(1, 10000)) {
++    return false;
++  }
++  *plain = rx.sink->Frame(0);
++  return true;
++}
++
++// Fresh sender provider with the send counter set through the test seam.
++bool KatSeal(Thread* signaling,
++             const KatFrame& f,
++             std::vector<uint8_t>* wire) {
++  auto provider = MakeHkdfProvider(false);
++  provider->SetKey(f.participant, f.key_index, FromHex(f.key_hex));
++  provider->GetKey(f.participant)->SetSendCounterForTesting(f.ssrc, f.counter);
++  Cryptor tx(signaling, f.participant, KatMediaType(f), provider, f.key_index,
++             f.ssrc);
++  tx.Feed(KatMakeFrame(f, FromHex(f.plaintext_hex), FrameDirection::kSender));
++  if (!tx.sink->WaitForCount(1, 10000)) {
++    return false;
++  }
++  *wire = tx.sink->Frame(0);
++  return true;
++}
++
++// Independent RBSP unescape of header(U) || tail, to check wireUnescaped.
++std::vector<uint8_t> KatUnescape(const std::vector<uint8_t>& wire, size_t header) {
++  std::vector<uint8_t> out(wire.begin(), wire.begin() + header);
++  for (size_t i = header; i < wire.size();) {
++    if (i + 2 < wire.size() && wire[i] == 0 && wire[i + 1] == 0 &&
++        wire[i + 2] == 3) {
++      out.push_back(0);
++      out.push_back(0);
++      i += 3;
++    } else {
++      out.push_back(wire[i++]);
++    }
++  }
++  return out;
++}
++
++// Delivers `f` to a fresh receiver cryptor of the SHARED `provider` (the
++// replay window lives in the participant's handler, so every cryptor of the
++// participant sees the same window) and classifies what happened. A fresh
++// cryptor starts with no cached failure state, so every verdict is observable:
++//   ok             -> the sink gets the frame
++//   decrypt_failed -> observer kDecryptionFailed
++//   missing_key    -> observer kMissingKey
++//   duplicate / too_old / reflected / cap -> the matching handler counter moves
++//                     and NOTHING else happens (no state, no output).
++std::string KatClassify(ReplayTestThread& signaling,
++                        scoped_refptr<DefaultKeyProviderImpl> provider,
++                        const std::string& participant,
++                        const KatFrame& f,
++                        const std::vector<uint8_t>& wire,
++                        std::vector<uint8_t>* plain,
++                        std::string* problem) {
++  auto handler = provider->GetKey(participant);
++  ReplayCounters before;
++  if (handler != nullptr) {
++    before = handler->GetReplayCounters();
++  }
++  Cryptor rx(signaling.get(), participant, KatMediaType(f), provider, 0, f.ssrc);
++  rx.Feed(KatMakeFrame(f, wire, FrameDirection::kReceiver));
++  std::string verdict = "timeout";
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++  while (std::chrono::steady_clock::now() < deadline) {
++    if (rx.sink->Count() > 0) {
++      verdict = "ok";
++      break;
++    }
++    if (rx.observer->CountOf(FrameCryptionState::kDecryptionFailed) > 0) {
++      verdict = "decrypt_failed";
++      break;
++    }
++    if (rx.observer->CountOf(FrameCryptionState::kMissingKey) > 0) {
++      verdict = "missing_key";
++      break;
++    }
++    if (handler != nullptr) {
++      const ReplayCounters c = handler->GetReplayCounters();
++      if (c.dup != before.dup) {
++        verdict = "duplicate";
++        break;
++      }
++      if (c.old != before.old) {
++        verdict = "too_old";
++        break;
++      }
++      if (c.refl != before.refl) {
++        verdict = "reflected";
++        break;
++      }
++      if (c.cap != before.cap) {
++        verdict = "cap";
++        break;
++      }
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++  }
++  signaling.Flush();
++  // Side effects must match the verdict exactly.
++  const size_t failed = rx.observer->CountOf(FrameCryptionState::kDecryptionFailed);
++  const size_t missing = rx.observer->CountOf(FrameCryptionState::kMissingKey);
++  if (verdict == "ok") {
++    if (failed != 0 || missing != 0) *problem = "ok frame produced a failure state";
++    if (rx.sink->Count() != 1) *problem = "ok frame produced no single output";
++    *plain = rx.sink->Frame(0);
++  } else {
++    if (rx.sink->Count() != 0) *problem = verdict + " frame produced output";
++    if (verdict != "decrypt_failed" && failed != 0) *problem = verdict + " produced kDecryptionFailed";
++    if (verdict != "missing_key" && missing != 0) *problem = verdict + " produced kMissingKey";
++  }
++  if (handler != nullptr) {
++    const ReplayCounters c = handler->GetReplayCounters();
++    const uint64_t moved = (c.dup - before.dup) + (c.old - before.old) +
++                           (c.refl - before.refl) + (c.cap - before.cap);
++    const bool replay_verdict = verdict == "duplicate" || verdict == "too_old" ||
++                                verdict == "reflected" || verdict == "cap";
++    if (moved != (replay_verdict ? 1u : 0u)) *problem = "unexpected replay counter movement";
++  }
++  return verdict;
++}
++
++const KatFrame* KatFind(const KatFrame* frames, size_t n, const std::string& id) {
++  for (size_t i = 0; i < n; ++i) {
++    if (id == frames[i].id) return &frames[i];
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++TEST(FrameCryptorKat, VectorFileIsComplete) {
++  EXPECT_EQ(std::size(kKatCases), kKatExpectedCases);
++  EXPECT_EQ(std::size(kKatCounterCases), kKatExpectedCounterCases);
++  EXPECT_EQ(std::size(kKatReplayFrames), kKatExpectedReplayFrames);
++  EXPECT_EQ(std::size(kKatScenarios), kKatExpectedScenarios);
++  EXPECT_EQ(std::size(kKatRingScenarios), kKatExpectedRingScenarios);
++}
++
++TEST(FrameCryptorKat, EveryCaseOpensToThePlaintext) {
++  ReplayTestThread signaling;
++  for (const KatFrame& f : kKatCases) {
++    std::vector<uint8_t> plain;
++    ASSERT_TRUE(KatOpen(signaling.get(), f, FromHex(f.wire_hex), &plain)) << f.id;
++    EXPECT_EQ(plain, FromHex(f.plaintext_hex)) << f.id;
++  }
++}
++
++TEST(FrameCryptorKat, EveryCaseResealsByteForByte) {
++  ReplayTestThread signaling;
++  for (const KatFrame& f : kKatCases) {
++    std::vector<uint8_t> wire;
++    ASSERT_TRUE(KatSeal(signaling.get(), f, &wire)) << f.id;
++    EXPECT_EQ(wire, FromHex(f.wire_hex)) << f.id;
++  }
++}
++
++TEST(FrameCryptorKat, CounterCasesOpenAndResealByteForByte) {
++  ReplayTestThread signaling;
++  for (const KatFrame& f : kKatCounterCases) {
++    std::vector<uint8_t> plain;
++    ASSERT_TRUE(KatOpen(signaling.get(), f, FromHex(f.wire_hex), &plain)) << f.id;
++    EXPECT_EQ(plain, FromHex(f.plaintext_hex)) << f.id;
++
++    std::vector<uint8_t> wire;
++    ASSERT_TRUE(KatSeal(signaling.get(), f, &wire)) << f.id;
++    EXPECT_EQ(wire, FromHex(f.wire_hex)) << f.id;
++
++    if (f.codec == kKatH264 && std::strlen(f.wire_unescaped_hex) > 0) {
++      // The escaped wire differs from the unescaped body (the IV holds 00 00 01
++      // and must be unescaped before it is read) and unescapes to it exactly.
++      EXPECT_NE(FromHex(f.wire_hex), FromHex(f.wire_unescaped_hex)) << f.id;
++      EXPECT_EQ(KatUnescape(FromHex(f.wire_hex), 6), FromHex(f.wire_unescaped_hex))
++          << f.id;
++    }
++  }
++}
++
++TEST(FrameCryptorKat, RingScenarios) {
++  ReplayTestThread signaling;
++  std::vector<std::pair<int, std::string>> installed;
++  int current = -1;
++  for (const KatRingStep& s : kKatRingSteps) {
++    if (s.scenario != current) {
++      current = s.scenario;
++      installed.clear();
++    }
++    const KatScenario& sc = kKatRingScenarios[s.scenario];
++    if (s.kind == 0) {
++      installed.emplace_back(s.key_index, s.key_hex);
++      continue;
++    }
++    // Every ring frame has counter 0 on the same ssrc: each one is opened on a
++    // fresh provider that holds the keys installed so far (see casesNote).
++    auto provider = MakeHkdfProvider(false);
++    provider->SetKey(sc.participant, 0, std::vector<uint8_t>());  // empty handler
++    for (const auto& k : installed) {
++      provider->SetKey(sc.participant, k.first, FromHex(k.second.c_str()));
++    }
++    const KatFrame& f = kKatCases[s.frame];
++    std::vector<uint8_t> plain;
++    std::string problem;
++    const std::string verdict = KatClassify(signaling, provider, sc.participant, f,
++                                            FromHex(f.wire_hex), &plain, &problem);
++    EXPECT_EQ(problem, "") << sc.name << " " << f.id;
++    if (s.kind == 1) {
++      EXPECT_EQ(verdict, "ok") << sc.name << " " << f.id;
++      EXPECT_EQ(plain, FromHex(f.plaintext_hex)) << sc.name << " " << f.id;
++    } else {
++      EXPECT_EQ(verdict, s.reason) << sc.name << " " << f.id;
++    }
++  }
++}
++
++TEST(FrameCryptorKat, ReplayScenarios) {
++  ReplayTestThread signaling;
++  for (size_t si = 0; si < std::size(kKatScenarios); ++si) {
++    const KatScenario& sc = kKatScenarios[si];
++    auto provider = MakeHkdfProvider(false);
++    // Create the participant's handler up front (an empty ring: slot refused),
++    // then register the scenario's local send ssrcs on it (reflection guard).
++    provider->SetKey(sc.participant, 0, std::vector<uint8_t>());
++    auto handler = provider->GetKey(sc.participant);
++    ASSERT_NE(handler, nullptr) << sc.name;
++    for (int i = 0; i < sc.local_ssrc_count; ++i) {
++      ASSERT_TRUE(handler->NextSendCounter(sc.local_ssrcs[i]).has_value());
++    }
++    size_t delivered = 0;
++    for (const KatStep& st : kKatSteps) {
++      if (st.scenario != static_cast<int>(si)) continue;
++      if (st.deliver[0] == '\0') {
++        provider->SetKey(st.participant, st.key_index, FromHex(st.key_hex));
++        continue;
++      }
++      const KatFrame* f = KatFind(kKatReplayFrames, std::size(kKatReplayFrames),
++                                  st.deliver);
++      ASSERT_NE(f, nullptr) << sc.name << " " << st.deliver;
++      std::vector<uint8_t> plain;
++      std::string problem;
++      const std::string verdict = KatClassify(signaling, provider, st.participant,
++                                              *f, FromHex(f->wire_hex), &plain,
++                                              &problem);
++      ++delivered;
++      EXPECT_EQ(problem, "") << sc.name << " step " << delivered << " " << st.deliver;
++      EXPECT_EQ(verdict, st.expect) << sc.name << " step " << delivered << " "
++                                    << st.deliver;
++      if (verdict == "ok") {
++        EXPECT_EQ(plain, FromHex(f->plaintext_hex)) << sc.name << " " << st.deliver;
++      }
++    }
++    EXPECT_GT(delivered, 0u) << sc.name;
++  }
++}
++
++#else  // !Q_FRAME_KAT_PRESENT
++
++TEST(FrameCryptorKat, VectorsAreMissing) {
++  FAIL() << "api/crypto/frame_crypto_kat_vectors.inc is missing: run "
++            "m150/ci/kat2inc.py after apply-series.sh and before gn gen";
++}
++
++#endif  // Q_FRAME_KAT_PRESENT
++
+ }  // namespace webrtc

@@ -2,7 +2,7 @@ name: test-webrtc-m150-patches
 
 # Free, fast CI: builds the M150 patch series for host x64 Linux
 # (rtc_include_tests=true) in the two configurations that matter
-# (rtc_qaudion_transport_strict=true/false) and runs the T1-T6 unit tests
+# (rtc_qaudion_transport_strict=true/false) and runs the T1-T9 unit tests
 # from webrtc-plan.md v2 §6.1. Does NOT build any shippable artifact (no
 # Android/iOS toolchain here) - see build-m150-android.yml / build-m150-ios.yml
 # for that. Meant to run on every patch-series PR, well before a 3-5h mobile
@@ -37,7 +37,7 @@ env:
   # depot_tools is pinned inside m150/ci/sync.sh itself (no override).
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
-  # T1-T6 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
+  # T1-T9 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
   # workflow, build-m150-windows.yml).
 
 jobs:
@@ -65,6 +65,11 @@ jobs:
           set -euo pipefail
           bash ctrl/m150/apply-series.sh "$WORKDIR/src" android
 
+      - name: Generate frame-crypto KAT include (sha256-pinned shared vectors, T7)
+        run: |
+          set -euo pipefail
+          python3 ctrl/m150/ci/kat2inc.py ctrl/m150/kat/group-calls-v2-frame-crypto.json "$WORKDIR/src/api/crypto/frame_crypto_kat_vectors.inc"
+
       - name: Fetch Opus DNN weights
         run: |
           set -euo pipefail
@@ -83,7 +88,7 @@ jobs:
           # and "passed" without running anything.
           autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests
 
-      - name: Run T1-T6 (${{ matrix.config }})
+      - name: Run T1-T9 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
         env:
           CONFIG: ${{ matrix.config }}
