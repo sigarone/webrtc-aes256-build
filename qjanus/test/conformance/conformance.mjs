@@ -779,6 +779,31 @@ await check('sessions per token over WebSockets: N sockets succeed, N+1 is refus
   for (const c of [...cs, extra, next]) c.close();
 });
 
+await check('sessions per token: reconnect overlap - the old session (socket dropped, still in the reclaim window) and the new one of the same member coexist within N; claiming the old one takes no slot; destroying it frees exactly one', async () => {
+  // what a client does when its socket drops: it reclaims the old session, and if that fails it opens a new one
+  // (media_join mints a new token, but the bare token format can also repeat the very same string)
+  const t = uniq();
+  const old = await ws({ token: t }); await old.create(); const oldSid = old.sid;
+  old.close();
+  await sleep(300);
+  const fresh = await ws({ token: t });
+  assert.equal((await fresh.send({ janus: 'create' })).janus, 'success', 'the new session while the old one is still reclaimable: 2 of N');
+  // the old session is claimed on yet another socket: still no extra slot
+  const claimer = await ws({ token: t });
+  assert.equal((await claimer.claim(oldSid)).janus, 'success');
+  assert.equal((await claimer.keepalive()).janus, 'ack');
+  // two sessions of this token are live: N-2 more fit, then the limit
+  const more = [];
+  for (let i = 0; i < MAXS - 2; i++) { const c = await ws({ token: t }); await c.create(); more.push(c); }
+  const over = await ws({ token: t });
+  assert.equal((await over.send({ janus: 'create' })).error.code, 473, 'the claim added nothing: exactly N sessions are live');
+  // the old session ends (the member left): one slot comes back, once
+  assert.equal((await claimer.destroy()).janus, 'success');
+  assert.equal((await over.send({ janus: 'create' })).janus, 'success');
+  assert.equal((await over.send({ janus: 'create' })).error.code, 473, 'exactly one slot was freed');
+  for (const c of [fresh, claimer, over, ...more]) c.close();
+});
+
 if (SLOW) {
   await check('sessions per token: a dropped socket keeps its slots for reclaim_session_timeout (the session can be claimed), then frees them', async () => {
     const t = uniq();

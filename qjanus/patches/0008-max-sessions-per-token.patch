@@ -25,13 +25,14 @@ index 55eee13..4be04cd 100644
  
  /*! \brief Helper method to get a string representation of an API error code
 diff --git a/src/janus.c b/src/janus.c
-index 8fc10b7..6c29ce6 100644
+index 8fc10b7..902bf13 100644
 --- a/src/janus.c
 +++ b/src/janus.c
-@@ -300,6 +300,45 @@ static uint reclaim_session_timeout = DEFAULT_RECLAIM_SESSION_TIMEOUT;
+@@ -300,6 +300,53 @@ static uint reclaim_session_timeout = DEFAULT_RECLAIM_SESSION_TIMEOUT;
   * server to grow too much, or because we're draining the server. */
  static gboolean accept_new_sessions = TRUE;
  
++/* qjanus:token-sessions begin (qjanus/test/token-sessions compiles exactly this block) */
 +/* qjanus: at most N sessions may be live at the same time for the same signed token string, so that
 + * a token that is still valid (up to its expiry) after its holder was removed from a call cannot be
 + * used to open sessions without limit. A session counts for the token it was CREATED with; Janus
@@ -45,6 +46,12 @@ index 8fc10b7..6c29ce6 100644
 + * is a leaf: it may be taken while sessions_mutex is held, never the other way around */
 +static GHashTable *token_sessions = NULL;
 +static janus_mutex token_sessions_mutex = JANUS_MUTEX_INITIALIZER;
++static void janus_token_sessions_init(void) {
++	janus_mutex_lock(&token_sessions_mutex);
++	if(token_sessions == NULL)
++		token_sessions = g_hash_table_new_full(g_str_hash, g_str_equal, (GDestroyNotify)g_free, NULL);
++	janus_mutex_unlock(&token_sessions_mutex);
++}
 +static gboolean janus_token_sessions_acquire(const char *token) {
 +	gboolean ok = FALSE;
 +	janus_mutex_lock(&token_sessions_mutex);
@@ -70,11 +77,12 @@ index 8fc10b7..6c29ce6 100644
 +	}
 +	janus_mutex_unlock(&token_sessions_mutex);
 +}
++/* qjanus:token-sessions end */
 +
  /* We don't hold (trickle) candidates indefinitely either: by default, we
   * only store them for 45 seconds. After that, they're discarded, in order
   * to avoid leaks or orphaned media details. This means that, if for instance
-@@ -345,6 +384,7 @@ static json_t *janus_info(const char *transaction) {
+@@ -345,6 +392,7 @@ static json_t *janus_info(const char *transaction) {
  	json_object_set_new(info, "accepting-new-sessions", accept_new_sessions ? json_true() : json_false());
  	json_object_set_new(info, "session-timeout", json_integer(global_session_timeout));
  	json_object_set_new(info, "reclaim-session-timeout", json_integer(reclaim_session_timeout));
@@ -82,7 +90,7 @@ index 8fc10b7..6c29ce6 100644
  	json_object_set_new(info, "candidates-timeout", json_integer(candidates_timeout));
  	json_object_set_new(info, "server-name", json_string(server_name ? server_name : JANUS_SERVER_NAME));
  	/* qjanus: the info reply is served to unauthenticated peers: no addresses, no build details */
-@@ -662,6 +702,7 @@ static void janus_session_free(const janus_refcount *session_ref) {
+@@ -662,6 +710,7 @@ static void janus_session_free(const janus_refcount *session_ref) {
  		janus_request_destroy(session->source);
  		session->source = NULL;
  	}
@@ -90,7 +98,7 @@ index 8fc10b7..6c29ce6 100644
  	janus_mutex_destroy(&session->mutex);
  	g_free(session);
  }
-@@ -764,7 +805,7 @@ static gboolean janus_status_sessions(gpointer user_data) {
+@@ -764,7 +813,7 @@ static gboolean janus_status_sessions(gpointer user_data) {
  	return TRUE;
  }
  
@@ -99,7 +107,7 @@ index 8fc10b7..6c29ce6 100644
  	janus_session *session = NULL;
  	if(session_id == 0) {
  		while(session_id == 0) {
-@@ -789,6 +830,9 @@ janus_session *janus_session_create(guint64 session_id) {
+@@ -789,6 +838,9 @@ janus_session *janus_session_create(guint64 session_id) {
  	session->last_activity = janus_get_monotonic_time();
  	session->transport_gone_time = 0;
  	session->ice_handles = NULL;
@@ -109,7 +117,7 @@ index 8fc10b7..6c29ce6 100644
  	janus_mutex_init(&session->mutex);
  	janus_mutex_lock(&sessions_mutex);
  	g_hash_table_insert(sessions, janus_uint64_dup(session->session_id), session);
-@@ -834,6 +878,10 @@ gint janus_session_destroy(janus_session *session) {
+@@ -834,6 +886,10 @@ gint janus_session_destroy(janus_session *session) {
  	JANUS_LOG(LOG_INFO, "Destroying session %"SCNu64"; %p\n", session_id, session);
  	if(!g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
  		return 0;
@@ -120,7 +128,7 @@ index 8fc10b7..6c29ce6 100644
  	janus_session_handles_clear(session);
  	/* The session will actually be destroyed when the counter gets to 0 */
  	janus_refcount_decrease(&session->ref);
-@@ -1134,9 +1182,29 @@ int janus_process_incoming_request(janus_request *request) {
+@@ -1134,9 +1190,29 @@ int janus_process_incoming_request(janus_request *request) {
  			}
  		}
  
@@ -151,7 +159,7 @@ index 8fc10b7..6c29ce6 100644
  			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNKNOWN, "Memory error");
  			goto jsondone;
  		}
-@@ -5069,6 +5137,17 @@ gint main(int argc, char *argv[]) {
+@@ -5069,6 +5145,17 @@ gint main(int argc, char *argv[]) {
  		}
  	}
  
@@ -169,11 +177,11 @@ index 8fc10b7..6c29ce6 100644
  	/* Check if a custom reclaim session timeout value was specified */
  	item = janus_config_get(config, config_general, janus_config_type_item, "reclaim_session_timeout");
  	if(item && item->value) {
-@@ -5535,6 +5614,7 @@ gint main(int argc, char *argv[]) {
+@@ -5535,6 +5622,7 @@ gint main(int argc, char *argv[]) {
  
  	/* Sessions */
  	sessions = g_hash_table_new_full(g_int64_hash, g_int64_equal, (GDestroyNotify)g_free, NULL);
-+	token_sessions = g_hash_table_new_full(g_str_hash, g_str_equal, (GDestroyNotify)g_free, NULL);
++	janus_token_sessions_init();
  	/* Start the sessions timeout watchdog */
  	sessions_watchdog_context = g_main_context_new();
  	GMainLoop *watchdog_loop = g_main_loop_new(sessions_watchdog_context, FALSE);

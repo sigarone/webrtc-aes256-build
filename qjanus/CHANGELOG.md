@@ -26,7 +26,10 @@ open unlimited Janus sessions with it; now it can hold only a few.
   keepalive / attach / a message with a refreshed token work on a full token without moving a slot, a dropped socket keeps
   its slots for the reclaim window and a `claim` keeps one, idle sessions time out and free theirs; the rendering of
   `max_sessions_per_token` (default, override, malformed values refused) on a clean Ubuntu 24.04. The test tokens carry a
-  random descriptor so that parallel clients do not share a counter.
+  random descriptor so that parallel clients do not share a counter. The old and the new session of a reconnecting member
+  (old socket dropped, still reclaimable) coexist within N and a `claim` of the old one takes no slot. The counter block
+  of the patched `janus.c` is also compiled on its own and run under AddressSanitizer + LeakSanitizer + UBSan and under
+  ThreadSanitizer (balanced acquire/release, no underflow, no key leak, empty table after 20 000 tokens, 8 threads).
 
 Upgrade (per node; the DTLS key and fingerprint, the token secret, the admin key and the ICE interface stay):
 
