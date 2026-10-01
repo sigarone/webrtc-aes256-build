@@ -53,6 +53,7 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/qaudion_tuning.h"
 #include "rtc_base/ssl_adapter.h"
+#include "rtc_base/thread.h"
 
 namespace {
 
@@ -342,9 +343,22 @@ int main() {
   Check(adm != nullptr, "dummy audio device module");
   auto apm = webrtc::BuiltinAudioProcessingBuilder().Build(env);
 
+  // Own, running threads. With null threads the factory would use the calling
+  // thread as signaling thread and every observer would wait for a message
+  // loop this program does not run.
+  std::unique_ptr<webrtc::Thread> network_thread =
+      webrtc::Thread::CreateWithSocketServer();
+  std::unique_ptr<webrtc::Thread> worker_thread = webrtc::Thread::Create();
+  std::unique_ptr<webrtc::Thread> signaling_thread = webrtc::Thread::Create();
+  network_thread->SetName("smoke-network", nullptr);
+  worker_thread->SetName("smoke-worker", nullptr);
+  signaling_thread->SetName("smoke-signaling", nullptr);
+  network_thread->Start();
+  worker_thread->Start();
+  signaling_thread->Start();
+
   auto factory = webrtc::CreatePeerConnectionFactory(
-      /*network_thread=*/nullptr, /*worker_thread=*/nullptr,
-      /*signaling_thread=*/nullptr, adm,
+      network_thread.get(), worker_thread.get(), signaling_thread.get(), adm,
       webrtc::CreateBuiltinAudioEncoderFactory(),
       webrtc::CreateBuiltinAudioDecoderFactory(),
       /*video_encoder_factory=*/nullptr, /*video_decoder_factory=*/nullptr,
@@ -465,6 +479,9 @@ int main() {
   a.pc = nullptr;
   b.pc = nullptr;
   factory = nullptr;
+  signaling_thread->Stop();
+  worker_thread->Stop();
+  network_thread->Stop();
   webrtc::CleanupSSL();
 
   if (g_failures != 0) {
