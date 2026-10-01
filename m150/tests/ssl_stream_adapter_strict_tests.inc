@@ -181,6 +181,9 @@ TEST_F(QaudionStrictDtlsTest, StockDtls12ClientIsRefusedByAProtocolVersionAlert)
   RawStockDtlsClient stock(DTLS1_2_VERSION, "SRTP_AES128_CM_SHA1_80");
   SetDtlsSrtpCryptoSuites({kSrtpAeadAes256Gcm}, false);
   SetPeerIdentitiesByDigest(true, true);
+  // The fixture's own (never started) client adapter would also read from the
+  // pipe the raw client reads from; it is not part of this test.
+  client_ssl_.reset();
   server_ssl_->SetServerRole();
   ASSERT_EQ(0, server_ssl_->StartSSL());
 

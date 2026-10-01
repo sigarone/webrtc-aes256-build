@@ -3,7 +3,7 @@ name: dev-s0-tests
 # TEMPORARY, branch-only (feat/m150-windows-s0): builds and runs ONLY the new
 # S0 tests (T6, T11) through a small dev target (rtc_base_unittests + test
 # main), so a compile or logic error shows up in minutes instead of after the
-# 75-minute rtc_unittests build. Deleted before the PR merges.
+# 75-minute rtc_unittests build. Deleted before the PR merges. (rev 2)
 
 on:
   push:
