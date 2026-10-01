@@ -75,6 +75,11 @@ jobs:
           set -euo pipefail
           bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
+      - name: Add the Q-Audion unit tests (T6 tuning, T11 strict negatives; not part of the shipped series)
+        run: |
+          set -euo pipefail
+          python3 ctrl/m150/ci/apply-tests.py "$WORKDIR/src"
+
       - name: Build host x64 test binaries (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
         env:

@@ -44,10 +44,12 @@ T4_FILTER="*AudioDecoderOpusTest*Plc*:*AudioDecoderOpusTest*Fec*"
 # AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
 # sits next to (SetTargetBitrate must not clobber an active override).
 T5_FILTER="AudioEncoderOpusTest.ConfigComplexityAdaptation"
-# T6 (BuildInfo/transport markers): rtc_base/qaudion_tuning.{h,cc} (P8) is a
-# brand-new file with no existing unittest - still a genuine TODO for whoever
-# adds rtc_base/qaudion_tuning_unittest.cc.
-T6_FILTER=""
+# T6 (BuildInfo/transport markers, runtime tuning API): rtc_base/
+# qaudion_tuning_unittest.cc, added to rtc_base_unittests by m150/ci/
+# apply-tests.py (the tests are not part of the shipped patch series). Both
+# configs: the marker and the pinned/tighten-only semantics differ by
+# QAUDION_TRANSPORT_STRICT inside the test itself.
+T6_FILTER="QaudionTuning.*"
 # T7-T9 (P12, frame anti-replay). Unlike T1/T2 these run in BOTH configs: the
 # FrameCryptor code path is identical in strict and switchable builds.
 # T7 (KAT): the real FrameCryptorTransformer opens every wire vector of the
@@ -69,6 +71,13 @@ T9_FILTER="FrameCryptor.KeyProvider:KeyProvider.*:DataPacketCryptor.*"
 # the remote certificate was known, plus the upstream cache test it must not
 # break. Both configs.
 T10_FILTER="RTCStatsCollectorTest*CertificateStatsCache*"
+# T11 (strict transport, negative tests): a stock-like peer (DTLS 1.2 only,
+# AES-128 SRTP only, no DTLS-SRTP) must NOT connect to a strict peer, plus the
+# positive controls (strict peers negotiate DTLS 1.3 / TLS_AES_256_GCM_SHA384 /
+# AEAD_AES_256_GCM / X25519MLKEM768) and the strict CryptoOptions. Spliced into
+# ssl_stream_adapter_unittest.cc by m150/ci/apply-tests.py. Strict config only
+# (the tests are compiled out of the switchable one).
+T11_FILTER="*QaudionStrict*"
 
 any=0
 # <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
@@ -81,7 +90,8 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
             "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER" \
             "T7:rtc_unittests:$T7_FILTER" "T8:rtc_unittests:$T8_FILTER" \
             "T9:rtc_unittests:$T9_FILTER" \
-            "T10:peerconnection_unittests:$T10_FILTER"; do
+            "T10:peerconnection_unittests:$T10_FILTER" \
+            "T11:rtc_unittests:$T11_FILTER"; do
   name=${spec%%:*}
   rest=${spec#*:}
   bin=${rest%%:*}
@@ -92,6 +102,10 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   fi
   if [ "$CONFIG" = strict ] && { [ "$name" = T1 ] || [ "$name" = T2 ]; }; then
     echo "::notice::$name: upstream-behaviour test, intentionally changed by P6/P7 in strict builds - run in the switchable config only"
+    continue
+  fi
+  if [ "$CONFIG" = switchable ] && [ "$name" = T11 ]; then
+    echo "::notice::$name: strict-transport negative tests, compiled out of the switchable config - run in the strict config only"
     continue
   fi
   n=$("$OUT/$bin$EXE" "--gtest_filter=$filt" --gtest_list_tests | grep -c '^  ' || true)
@@ -105,6 +119,6 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   any=$((any + 1))
 done
 if [ "$any" -eq 0 ]; then
-  echo "::warning::no T1-T10 filters ran - build-only smoke passed, no tests ran"
+  echo "::warning::no T1-T11 filters ran - build-only smoke passed, no tests ran"
 fi
 echo "run-tests: $any filter group(s) passed ($CONFIG)"

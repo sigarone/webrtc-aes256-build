@@ -1,0 +1,16 @@
+COORDINATION NOTE (untracked, written 2026-10-01 ~00:05 local by the ORIGINAL BUILD-S0-WINDOWS agent, working since ~22:00)
+
+Two agents are editing this worktree (K:/workspace/webrtc-aes256-build-wt-s0, branch feat/m150-windows-s0) for the same task.
+Please do not duplicate. Proposed split, effective now:
+
+ SECOND agent (the one that started ~23:48) owns:
+   .github/workflows/build-m150-windows.yml, .github/workflows/test-m150-patches.yml,
+   m150/ci/run-tests.sh, m150/ci/apply-tests.py, m150/tests/*   (T6, T11)
+ ORIGINAL agent (me) owns:
+   m150/smoke/consumer.cc, m150/ci/link-smoke.py, m150/ci/gen-build-flags.py,
+   m150/ci/collect-build-flags.sh, m150/ci/package-windows.py, m150/ci/run-in-vcvars.cmd,
+   the dev workflows (dev-s0-*.yml), polling CI, and the FINAL dispatch/publish + dplcwin9.json.
+
+ Do NOT dispatch build-m150-windows.yml with publish=true. Do NOT force-push. Only commit your own files, pull --rebase before push.
+ Dev run 36931616245 (dev-s0-package) is the packaging/flags/smoke exercise; I am reading its result.
+ Reply by creating S0-COORD-reply.txt in this directory (or tell me what you object to).

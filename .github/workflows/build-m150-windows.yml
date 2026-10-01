@@ -2,21 +2,34 @@ name: build-webrtc-windows-m150-hardened
 
 # Builds libwebrtc M150 for Windows x64 (target_os=win, target_cpu=x64,
 # Chromium's clang-cl, static library) with the same Q-Audion patch series
-# as Android/iOS (m150/series, P1-P8 + P4a + P10), gates it (m150/gates.sh
-# windows, G1-G9 re-expressed for a COFF static library), runs the T1-T6
-# unit tests on Windows in the strict configuration, then publishes ONE
-# release with sha256 + build-provenance attestation.
+# as Android/iOS (m150/series, P1-P12 + P4a + P10), gates it (m150/gates.sh
+# windows, G1-G9 re-expressed for a COFF static library), runs the T1-T11
+# unit tests on Windows in the strict configuration, proves with an
+# OUT-OF-TREE consumer (link smoke) that the published files are enough to
+# compile, link and run against the library, then publishes ONE release with
+# sha256 + build-provenance attestation.
+#
+# Release files: webrtc.lib, libcxx.lib (the libc++ runtime objects webrtc.lib
+# does not carry), webrtc-headers.zip (public headers + Chromium's libc++
+# headers), build-flags.json (defines, include dirs, ABI flags, STL, CRT,
+# toolchain versions - generated from the real GN build), BUILDINFO.json,
+# PINS.txt, SHA256SUMS.
 #
 # Job graph (same privilege split as build-m150-android.yml - the job that
 # compiles untrusted patched C++ never holds release/attestation rights):
 #   precheck (contents: read)          - validate inputs, refuse an existing tag
 #   build    (contents: read)  <- precheck   compile webrtc.lib, gates, upload
-#   test     (contents: read)  <- precheck   rtc_unittests + modules_unittests
-#                                            (strict), runs in PARALLEL with build
+#   test     (contents: read)  <- precheck   rtc_unittests + modules_unittests +
+#                                            peerconnection_unittests (strict),
+#                                            runs in PARALLEL with build
+#   link-smoke (contents: read) <- [precheck, build]   consumer compiled and
+#                                            linked from the release files only,
+#                                            two PeerConnections over loopback
 #   publish  (contents: write, id-token: write, attestations: write)
-#                              <- [precheck, build, test]   ONLY on a manual
-#                                            dispatch with publish=true and
-#                                            only when build AND test are green
+#                              <- [precheck, build, test, link-smoke]   ONLY on
+#                                            a manual dispatch with publish=true
+#                                            and only when build, test AND
+#                                            link-smoke are green
 #
 # No cache on purpose: the pinned checkout (gclient src + toolchains) is tens
 # of GB, far above the 10 GB per-repo Actions cache limit, so sync (~17 min)
@@ -155,11 +168,21 @@ jobs:
           cmd //c "autoninja.bat -C out/win-x64 webrtc api/crypto:frame_crypto_transformer"
           ls -l out/win-x64/obj/webrtc.lib
 
-      - name: Stage webrtc.lib + headers
+      - name: Build the libc++ runtime objects (webrtc.lib does not carry them)
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          # GN's libc++ is a source_set that only executables get from
+          # build/config:common_deps; a consumer of webrtc.lib has to link
+          # these objects itself, so they ship as libcxx.lib.
+          cmd //c "autoninja.bat -C out/win-x64 buildtools/third_party/libc++:libc++"
+
+      - name: Stage webrtc.lib + libcxx.lib + headers
         run: |
           set -euo pipefail
           py=python; command -v python3 >/dev/null 2>&1 && py=python3
-          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out obj/api/crypto/frame_crypto_transformer/frame_crypto_transformer.obj
+          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out --libcxx obj/api/crypto/frame_crypto_transformer/frame_crypto_transformer.obj
 
       - name: Gate G1-G9 (windows)
         run: |
@@ -180,8 +203,14 @@ jobs:
           "$py" ctrl/m150/buildinfo.py windows plain --pins > out/PINS.txt
           cat out/PINS.txt out/BUILDINFO.json
 
-      - name: SHA256SUMS (covers webrtc.lib, headers, BUILDINFO.json, PINS.txt)
-        run: (cd out && sha256sum webrtc.lib webrtc-headers.zip BUILDINFO.json PINS.txt > SHA256SUMS && cat SHA256SUMS && ls -l)
+      - name: build-flags.json (generated from the real GN build, BEFORE SHA256SUMS)
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          bash ctrl/m150/ci/collect-build-flags.sh "$WORKDIR/src" out/win-x64 flags-raw "$GN_ARGS" out/build-flags.json
+
+      - name: SHA256SUMS (covers webrtc.lib, libcxx.lib, headers, build-flags.json, BUILDINFO.json, PINS.txt)
+        run: (cd out && sha256sum webrtc.lib libcxx.lib webrtc-headers.zip build-flags.json BUILDINFO.json PINS.txt > SHA256SUMS && cat SHA256SUMS && ls -l)
 
       - name: Upload build artifact (workflow-scoped only - no repo/release access in this job)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -232,6 +261,12 @@ jobs:
           py=python; command -v python3 >/dev/null 2>&1 && py=python3
           "$py" ctrl/m150/ci/kat2inc.py ctrl/m150/kat/group-calls-v2-frame-crypto.json "$WORKDIR/src/api/crypto/frame_crypto_kat_vectors.inc"
 
+      - name: Add the Q-Audion unit tests (T6 tuning, T11 strict negatives; not part of the shipped series)
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          "$py" ctrl/m150/ci/apply-tests.py "$WORKDIR/src"
+
       - name: Build test binaries (x64, strict)
         working-directory: C:/w/src
         run: |
@@ -242,17 +277,68 @@ jobs:
           cmd //c "gn.bat gen out/test-strict"
           cmd //c "autoninja.bat -C out/test-strict rtc_unittests modules_unittests peerconnection_unittests"
 
-      - name: Run T1-T10 (strict)
+      - name: Run T1-T11 (strict)
         working-directory: C:/w/src
         run: |
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/ctrl/m150/ci/run-tests.sh" out/test-strict strict .exe
 
+  link-smoke:
+    needs: [precheck, build]
+    # What a consumer gets - webrtc.lib, libcxx.lib, webrtc-headers.zip and
+    # build-flags.json, nothing from the GN tree - must be enough to compile,
+    # link and RUN a small out-of-tree program that creates two PeerConnections
+    # in one process with the strict factory and connects them by loopback with
+    # an audio track and a data channel, then asserts DTLS 1.3,
+    # TLS_AES_256_GCM_SHA384, AEAD_AES_256_GCM and X25519MLKEM768. A failure
+    # here stops the release (publish needs this job).
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout this repo (smoke program and driver)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-x64
+          path: out
+
+      - name: Re-verify SHA256SUMS
+        working-directory: out
+        run: sha256sum -c SHA256SUMS
+
+      - name: Fetch the compiler package named by build-flags.json (sha256-verified)
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          url=$("$py" -c "import json; print(json.load(open('out/build-flags.json'))['toolchain']['clang_package_url'])")
+          sha=$("$py" -c "import json; print(json.load(open('out/build-flags.json'))['toolchain']['clang_package_sha256'])")
+          case "$url" in https://commondatastorage.googleapis.com/chromium-browser-clang/Win/clang-*.tar.xz) ;; *) echo "::error::unexpected clang package url"; exit 1 ;; esac
+          case "$sha" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;; *) echo "::error::build-flags.json carries no clang package sha256"; exit 1 ;; esac
+          curl -fsSL -o clang.tar.xz "$url"
+          echo "$sha *clang.tar.xz" | sha256sum -c -
+          mkdir -p C:/clang
+          tar -xJf clang.tar.xz -C C:/clang
+          ls C:/clang/bin | head -30
+
+      - name: Compile, link and run the out-of-tree consumer
+        run: cmd //c "ctrl\\m150\\ci\\run-in-vcvars.cmd python ctrl/m150/ci/link-smoke.py out C:/clang C:/smoke ctrl/m150/smoke/consumer.cc"
+
   publish:
-    needs: [precheck, build, test]
-    # Only a manual dispatch with publish=true, and only when BOTH build (with
-    # its gates) and test succeeded. A push run never publishes.
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && needs.build.result == 'success' && needs.test.result == 'success' }}
+    needs: [precheck, build, test, link-smoke]
+    # Only a manual dispatch with publish=true, and only when build (with its
+    # gates), test AND the consumer link smoke succeeded. A push run never
+    # publishes.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && needs.build.result == 'success' && needs.test.result == 'success' && needs['link-smoke'].result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -289,7 +375,7 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: "out/webrtc.lib\nout/webrtc-headers.zip\nout/SHA256SUMS"
+          subject-path: "out/webrtc.lib\nout/libcxx.lib\nout/webrtc-headers.zip\nout/build-flags.json\nout/SHA256SUMS"
 
       - name: Create release (new tag only, never overwritten)
         env:
@@ -300,6 +386,6 @@ jobs:
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --notes "M150 Windows x64 static library (webrtc.lib, clang-cl, strict transport) + public headers, source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. Gates G1-G9 and T3-T6 unit tests passed on Windows. See BUILDINFO.json, PINS.txt and the build-provenance attestation." \
+            --notes "M150 Windows x64 static library (webrtc.lib, clang-cl, strict transport) + libcxx.lib (libc++ runtime objects) + public headers incl. libc++ + build-flags.json, source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. Gates G1-G9, tests T1-T11 and the out-of-tree consumer link smoke passed on Windows. See BUILDINFO.json, PINS.txt, build-flags.json and the build-provenance attestation." \
             out/* \
             || echo "::warning::GITHUB_TOKEN could not create release $TAG (HTTP 403 seen 2026-09-29). The artifact is attested and sha256-verified; the maintainer publishes it from this run with a personal token."

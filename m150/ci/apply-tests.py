@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
-"""apply-tests.py - add the Q-Audion unit tests (T6, T10) to a patched checkout.
+"""apply-tests.py - add the Q-Audion unit tests of m150/tests to a patched checkout.
 
 usage: apply-tests.py <webrtc_src> [--dev-target]
 
-The tests are NOT part of the patch series (m150/series): the series is what
-ships in the libraries, the tests only run in CI. They are added to the
-checkout AFTER apply-series.sh and BEFORE `gn gen`:
+The tests are NOT part of the shipped patch series (m150/series): they only
+exist in the test jobs, so the patch set that BUILDINFO.json lists and the
+binaries stay exactly what the apps get.
 
-  * m150/tests/qaudion_tuning_unittest.cc is copied to rtc_base/ and listed in
-    rtc_base_unittests (BUILD.gn)                                      -> T6
-  * m150/tests/ssl_stream_adapter_strict_tests.inc is spliced into
-    rtc_base/ssl_stream_adapter_unittest.cc (inside its anonymous namespace,
-    so it uses that file's DTLS fixtures)                             -> T10
+  T6   rtc_base/qaudion_tuning_unittest.cc (new file): the runtime tuning API
+       and the "Q-AUDION build m150 transport=..." marker of P8.
+  T11  m150/tests/ssl_stream_adapter_strict_tests.inc is spliced into
+       rtc_base/ssl_stream_adapter_unittest.cc (strict configuration only,
+       guarded by QAUDION_TRANSPORT_STRICT inside the include): a stock-like
+       peer (DTLS 1.2 only, AES-128 SRTP only, no DTLS-SRTP) must not connect
+       to a strict peer, plus positive controls and the strict CryptoOptions.
 
-Every edit is anchored and verified; an anchor that is not found is an error
-(a silent no-op would leave the required tests out of the run). Running it
-twice on the same tree is also an error.
+Both are compiled into rtc_base_unittests, i.e. into rtc_unittests. Every
+anchor is checked: a moved anchor fails the job instead of silently skipping
+a test. Idempotent (a second run changes nothing).
 
---dev-target  additionally defines //rtc_base:qaudion_dev_unittests (an
-              executable made of rtc_base_unittests only) so a dev workflow can
-              build and run just these tests in minutes. Never used by the
-              release workflows.
-
-exit: 0 ok | 1 anchor missing / already applied | 2 usage
+  --dev-target  also define a small test executable (qaudion_dev_unittests =
+                rtc_base_unittests + test main) so the tests can be built and
+                run in minutes. Used by the branch-only dev workflow, never by
+                the release workflows.
+exit: 0 ok | 1 anchor missing / unexpected content | 2 usage
 """
 import os
-import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = os.path.join(os.path.dirname(HERE), "tests")
+MARK_INC = "// Q-Audion strict-transport tests (T11)."
 
 
 def die(msg):
@@ -47,90 +48,117 @@ def write(path, text):
         f.write(text)
 
 
-def insert_after(text, anchor, new_line, start=0, end=None):
-    """Insert new_line (with the indentation of anchor's line) after the first
-    line equal to anchor inside text[start:end]."""
-    end = len(text) if end is None else end
-    i = text.find(anchor, start, end)
-    if i < 0:
-        die("anchor not found: %r" % anchor.strip())
-    line_start = text.rfind("\n", 0, i) + 1
-    indent = text[line_start:i]
-    eol = text.find("\n", i)
-    if eol < 0:
-        die("anchor at end of file: %r" % anchor.strip())
-    return text[:eol + 1] + indent + new_line + "\n" + text[eol + 1:]
-
-
-def block_bounds(text, header):
-    """[start, end) of the brace block that opens right after `header`."""
-    h = text.find(header)
-    if h < 0:
-        die("block not found: %r" % header)
-    open_i = text.find("{", h)
+def block_end(text, start):
+    """Index just after the '}' that closes the '{' found at/after start."""
+    i = text.index("{", start)
     depth = 0
-    for j in range(open_i, len(text)):
-        c = text[j]
+    while i < len(text):
+        c = text[i]
         if c == "{":
             depth += 1
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return open_i, j + 1
-    die("unbalanced block: %r" % header)
+                return i + 1
+        i += 1
+    die("unbalanced braces in rtc_base/BUILD.gn")
+
+
+def insert_after_line(text, anchor_line, new_line, lo, hi):
+    """Insert new_line (same indent as the anchor) after the first line equal
+    to anchor_line (stripped) found in text[lo:hi]."""
+    pos = lo
+    while True:
+        nl = text.find("\n", pos, hi)
+        if nl == -1:
+            die("anchor not found: %s" % anchor_line.strip())
+        line = text[pos:nl]
+        if line.strip() == anchor_line.strip():
+            indent = line[: len(line) - len(line.lstrip())]
+            return text[: nl + 1] + indent + new_line + "\n" + text[nl + 1:], len(indent + new_line) + 1
+        pos = nl + 1
+
+
+def patch_build_gn(src, dev_target):
+    path = os.path.join(src, "rtc_base", "BUILD.gn")
+    text = read(path)
+    if "qaudion_tuning_unittest.cc" in text:
+        print("apply-tests: rtc_base/BUILD.gn already patched")
+        return
+    start = text.find('rtc_library("rtc_base_unittests") {')
+    if start == -1:
+        die('rtc_library("rtc_base_unittests") not found in rtc_base/BUILD.gn')
+    end = block_end(text, start)
+    block = text[start:end]
+    s0 = block.find("sources = [")
+    d0 = block.find("deps = [")
+    if s0 == -1 or d0 == -1 or d0 < s0:
+        die("sources/deps lists of rtc_base_unittests not found")
+    # sources: right after openssl_stream_adapter_unittest.cc (first list)
+    block, grown = insert_after_line(block, '"openssl_stream_adapter_unittest.cc",',
+                                     '"qaudion_tuning_unittest.cc",', s0, d0)
+    d0 += grown
+    # deps: right after :null_socket_server
+    block, _ = insert_after_line(block, '":null_socket_server",', '":qaudion_tuning",', d0, len(block))
+    text = text[:start] + block + text[end:]
+    if dev_target:
+        end = start + len(block)
+        extra = (
+            '\n    # branch-only dev target (apply-tests.py --dev-target)\n'
+            '    rtc_test("qaudion_dev_unittests") {\n'
+            '      testonly = true\n'
+            '      deps = [\n'
+            '        ":rtc_base_unittests",\n'
+            '        "../test:test_main",\n'
+            '      ]\n'
+            '    }\n')
+        text = text[:end] + extra + text[end:]
+    write(path, text)
+    print("apply-tests: rtc_base/BUILD.gn patched")
+
+
+def patch_ssl_test(src):
+    path = os.path.join(src, "rtc_base", "ssl_stream_adapter_unittest.cc")
+    text = read(path)
+    if MARK_INC in text:
+        print("apply-tests: ssl_stream_adapter_unittest.cc already patched")
+        return
+    crlf = "\r\n" in text
+    if crlf:
+        text = text.replace("\r\n", "\n")
+    inc = read(os.path.join(TESTS, "ssl_stream_adapter_strict_tests.inc")).replace("\r\n", "\n")
+    if MARK_INC not in inc:
+        die("marker missing from ssl_stream_adapter_strict_tests.inc")
+    # includes (sorted position)
+    a = "#include <openssl/digest.h>\n"
+    if a not in text:
+        die("anchor '#include <openssl/digest.h>' not found")
+    text = text.replace(a, "#include <openssl/bio.h>\n" + a + "#include <openssl/err.h>\n", 1)
+    # splice before the two closing namespaces at the end of the file
+    tail = "}  // namespace\n}  // namespace webrtc\n"
+    idx = text.rfind(tail)
+    if idx == -1 or text[idx + len(tail):].strip():
+        die("closing namespaces not found at the end of ssl_stream_adapter_unittest.cc")
+    text = text[:idx] + inc + ("\n" if not inc.endswith("\n\n") else "") + text[idx:]
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    write(path, text)
+    print("apply-tests: ssl_stream_adapter_unittest.cc patched")
 
 
 def main():
     args = [a for a in sys.argv[1:] if a != "--dev-target"]
-    dev = "--dev-target" in sys.argv
+    dev = len(args) != len(sys.argv) - 1
     if len(args) != 1:
         print(__doc__, file=sys.stderr)
         return 2
     src = args[0]
-
-    # --- T6: new test file + BUILD.gn wiring -------------------------------
+    if not os.path.isdir(os.path.join(src, "rtc_base")):
+        die("%s is not a webrtc checkout" % src)
     dst = os.path.join(src, "rtc_base", "qaudion_tuning_unittest.cc")
-    if os.path.exists(dst):
-        die("already applied (rtc_base/qaudion_tuning_unittest.cc exists)")
-    shutil.copyfile(os.path.join(TESTS, "qaudion_tuning_unittest.cc"), dst)
-
-    gn_path = os.path.join(src, "rtc_base", "BUILD.gn")
-    gn = read(gn_path)
-    b0, b1 = block_bounds(gn, 'rtc_library("rtc_base_unittests")')
-    gn = insert_after(gn, '"openssl_stream_adapter_unittest.cc",',
-                      '"qaudion_tuning_unittest.cc",', b0, b1)
-    # the block moved by one inserted line; recompute
-    b0, b1 = block_bounds(gn, 'rtc_library("rtc_base_unittests")')
-    gn = insert_after(gn, '":null_socket_server",', '":qaudion_tuning",', b0, b1)
-    if dev:
-        gn = gn.rstrip("\n") + (
-            "\n\nif (rtc_include_tests && !build_with_chromium) {\n"
-            "  rtc_test(\"qaudion_dev_unittests\") {\n"
-            "    testonly = true\n"
-            "    deps = [ \":rtc_base_unittests\" ]\n"
-            "  }\n"
-            "}\n")
-    write(gn_path, gn)
-
-    # --- T10: spliced into the existing SSL stream adapter test file -------
-    ut_path = os.path.join(src, "rtc_base", "ssl_stream_adapter_unittest.cc")
-    ut = read(ut_path)
-    if "QaudionStrictDtlsTest" in ut:
-        die("already applied (ssl_stream_adapter_unittest.cc)")
-    ut = insert_after(ut, "#include <openssl/digest.h>", "#include <openssl/bio.h>")
-    ut = insert_after(ut, "#include <openssl/evp.h>  // IWYU pragma: keep",
-                      "#include <openssl/err.h>")
-    ut = insert_after(ut, '#include "rtc_base/message_digest.h"',
-                      '#include "rtc_base/qaudion_tuning.h"')
-    tail = "}  // namespace\n}  // namespace webrtc"
-    k = ut.rfind(tail)
-    if k < 0:
-        die("end-of-file namespace anchor not found in ssl_stream_adapter_unittest.cc")
-    inc = read(os.path.join(TESTS, "ssl_stream_adapter_strict_tests.inc"))
-    ut = ut[:k] + inc.rstrip("\n") + "\n\n" + ut[k:]
-    write(ut_path, ut)
-    print("apply-tests: T6 (rtc_base/qaudion_tuning_unittest.cc) and T10 "
-          "(ssl_stream_adapter_unittest.cc) added%s" % (" + dev target" if dev else ""))
+    write(dst, read(os.path.join(TESTS, "qaudion_tuning_unittest.cc")).replace("\r\n", "\n"))
+    patch_build_gn(src, dev)
+    patch_ssl_test(src)
     return 0
 
 

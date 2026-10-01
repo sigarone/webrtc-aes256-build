@@ -1,0 +1,67 @@
+name: dev-s0-tests
+
+# TEMPORARY, branch-only (feat/m150-windows-s0): builds and runs ONLY the new
+# S0 tests (T6, T11) through a small dev target (rtc_base_unittests + test
+# main), so a compile or logic error shows up in minutes instead of after the
+# 75-minute rtc_unittests build. Deleted before the PR merges.
+
+on:
+  push:
+    branches: [feat/m150-windows-s0]
+    paths: [".github/workflows/dev-s0-tests.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKDIR: C:/w
+      DEPOT_TOOLS_UPDATE: "0"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      GYP_MSVS_OVERRIDE_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      vs2022_install: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      WINDOWSSDKDIR: C:\Program Files (x86)\Windows Kits\10
+      NINJA_STATUS: "[%f/%t %es] "
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync
+        env:
+          WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "ba469aa2093b-qaudion-m150" win
+
+      - name: Apply series, weights, tests (with the dev target)
+        run: |
+          set -euo pipefail
+          bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
+          bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+          python ctrl/m150/ci/apply-tests.py "$WORKDIR/src" --dev-target
+          python ctrl/m150/ci/apply-tests.py "$WORKDIR/src" --dev-target   # idempotent
+
+      - name: Build the dev test target (strict)
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          mkdir -p out/test-strict
+          echo 'target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=true rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true' | tr ' ' '\n' > out/test-strict/args.gn
+          cmd //c "gn.bat gen out/test-strict"
+          cmd //c "autoninja.bat -C out/test-strict qaudion_dev_unittests"
+
+      - name: Run T6 and T11
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          out/test-strict/qaudion_dev_unittests.exe --gtest_filter='QaudionTuning.*:*QaudionStrict*' --gtest_list_tests
+          out/test-strict/qaudion_dev_unittests.exe --gtest_filter='QaudionTuning.*:*QaudionStrict*'
