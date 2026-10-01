@@ -15,7 +15,7 @@ DSYMS=$2
 [ -d "$DSYMS" ] || { echo "::error::check-dsym-uuids: $DSYMS not found" >&2; exit 2; }
 command -v dwarfdump >/dev/null 2>&1 || { echo "::error::check-dsym-uuids: dwarfdump not available" >&2; exit 2; }
 
-SLICES=$(find "$XC" -type f \( -name 'WebRTC' -o -name 'LiveKitWebRTC' \))
+SLICES=$(find "$XC" -type f -name 'WebRTC')
 [ -n "$SLICES" ] || { echo "::error::check-dsym-uuids: no Mach-O slice found under $XC" >&2; exit 1; }
 
 fail=0

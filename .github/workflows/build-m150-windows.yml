@@ -226,6 +226,12 @@ jobs:
       - name: Fetch Opus DNN weights
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
+      - name: Generate frame-crypto KAT include (sha256-pinned shared vectors, T7)
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          "$py" ctrl/m150/ci/kat2inc.py ctrl/m150/kat/group-calls-v2-frame-crypto.json "$WORKDIR/src/api/crypto/frame_crypto_kat_vectors.inc"
+
       - name: Build test binaries (x64, strict)
         working-directory: C:/w/src
         run: |
@@ -236,7 +242,7 @@ jobs:
           cmd //c "gn.bat gen out/test-strict"
           cmd //c "autoninja.bat -C out/test-strict rtc_unittests modules_unittests"
 
-      - name: Run T1-T6 (strict)
+      - name: Run T1-T9 (strict)
         working-directory: C:/w/src
         run: |
           set -euo pipefail

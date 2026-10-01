@@ -1,12 +1,12 @@
 #!/bin/sh
-# gates.sh - binary gates G1-G10 for the four M150 build variants (plan
+# gates.sh - binary gates G1-G10 for the M150 builds (Android, iOS, Windows; plan
 # webrtc-plan.md v2 §2.5). Stops at the FIRST failing gate (fail closed,
 # same convention as ci/assert-no-key-strings.sh: an inconclusive check is a
 # failure, never a pass-by-default).
 #
-# usage: gates.sh <android|ios|windows> <plain|lk> <artifact> <dnn_dir> <ssl_h>
+# usage: gates.sh <android|ios|windows> <plain> <artifact> <dnn_dir> <ssl_h>
 #   <platform>  android | ios | windows
-#   <variant>   plain | lk
+#   <variant>   plain (the only variant: the LiveKit-prefixed -lk variant is gone)
 #   <artifact>  android: path to the built .aar
 #               ios:     path to the built .xcframework directory
 #               windows: path to the staged directory holding webrtc.lib (a
@@ -28,7 +28,7 @@ SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SELF_DIR/.." && pwd)
 ASSERT_NO_KEY="$REPO_ROOT/ci/assert-no-key-strings.sh"
 
-usage() { echo "usage: $0 <android|ios|windows> <plain|lk> <artifact> <dnn_dir> <ssl_h>" >&2; exit 2; }
+usage() { echo "usage: $0 <android|ios|windows> <plain> <artifact> <dnn_dir> <ssl_h>" >&2; exit 2; }
 [ $# -eq 5 ] || usage
 PLATFORM=$1
 VARIANT=$2
@@ -37,8 +37,7 @@ DNN_DIR=$4
 SSL_H=$5
 
 case "$PLATFORM" in android|ios|windows) ;; *) echo "::error::gates: platform must be android|ios|windows" >&2; exit 2 ;; esac
-[ "$PLATFORM" != windows ] || [ "$VARIANT" = plain ] || { echo "::error::gates: windows has only the plain (strict) variant" >&2; exit 2; }
-case "$VARIANT" in plain|lk) ;; *) echo "::error::gates: variant must be plain|lk" >&2; exit 2 ;; esac
+case "$VARIANT" in plain) ;; *) echo "::error::gates: variant must be plain (the -lk variant is gone)" >&2; exit 2 ;; esac
 [ -e "$ARTIFACT" ] || { echo "::error::gates: artifact not found: $ARTIFACT" >&2; exit 2; }
 [ -f "$ASSERT_NO_KEY" ] || { echo "::error::gates: missing $ASSERT_NO_KEY" >&2; exit 2; }
 
@@ -123,7 +122,7 @@ else
   [ -d "$ARTIFACT" ] || { echo "::error::gates: ios artifact must be the .xcframework directory" >&2; exit 2; }
   # Mach-O slices only: the dSYM DWARF companions share the file name but
   # carry no __cstring data, so the mandatory positive control never matches.
-  BINARIES=$(find "$ARTIFACT" -type f \( -name 'WebRTC' -o -name 'LiveKitWebRTC' \) -not -path '*.dSYM/*')
+  BINARIES=$(find "$ARTIFACT" -type f -name 'WebRTC' -not -path '*.dSYM/*')
   [ -n "$BINARIES" ] || gate_fail "G1-G5 setup (no Mach-O slice found under $ARTIFACT)"
 fi
 echo "gates: scanning $(printf '%s\n' $BINARIES | wc -l | tr -d ' ') binary file(s):"
@@ -145,25 +144,23 @@ gate_ok G1
 # ---------------------------------------------------------------------------
 # G2 - transport strictness marker (P6/P7 self-report via qaudion_tuning).
 #   plain: '!AESGCM+AES256' absent AND 'transport=strict' present somewhere.
-#   lk:    'transport=switchable' present somewhere (upstream-default at
-#          build time; the app can only tighten it at runtime via P8).
+#   (the LiveKit-prefixed -lk variant, which was 'transport=switchable', is gone)
 # ---------------------------------------------------------------------------
 echo "::group::G2: transport marker ($VARIANT)"
 any_hit() { lit=$1; for f in $BINARIES; do grep -a -q -F -- "$lit" "$f" && return 0; done; return 1; }
-if [ "$VARIANT" = plain ]; then
-  if any_hit '!AESGCM+AES256'; then gate_fail "G2 (plain build must not contain the relaxed-cipher marker '!AESGCM+AES256')"; fi
-  any_hit 'transport=strict' || gate_fail "G2 (plain build missing 'transport=strict')"
-else
-  any_hit 'transport=switchable' || gate_fail "G2 (lk build missing 'transport=switchable')"
-fi
+if any_hit '!AESGCM+AES256'; then gate_fail "G2 (plain build must not contain the relaxed-cipher marker '!AESGCM+AES256')"; fi
+any_hit 'transport=strict' || gate_fail "G2 (plain build missing 'transport=strict')"
 echo "::endgroup::"
 gate_ok G2
 
 # ---------------------------------------------------------------------------
-# G3 - Q-AUDION self-verification log lines present (dtls, opus-dec, opus-enc)
+# G3 - Q-AUDION self-verification log lines present (dtls, opus-dec, opus-enc,
+# frame-replay). 'Q-AUDION frame-replay' is the P12 receiver anti-replay drop
+# line (api/crypto/frame_crypto_transformer.cc): its presence proves the
+# replay window is compiled into every shipped binary.
 # ---------------------------------------------------------------------------
 echo "::group::G3: Q-AUDION self-check lines"
-for lit in 'Q-AUDION dtls' 'Q-AUDION opus-dec' 'Q-AUDION opus-enc'; do
+for lit in 'Q-AUDION dtls' 'Q-AUDION opus-dec' 'Q-AUDION opus-enc' 'Q-AUDION frame-replay'; do
   any_hit "$lit" || gate_fail "G3 (missing self-check line: $lit)"
 done
 echo "::endgroup::"
@@ -332,7 +329,7 @@ gate_ok G7
 
 # ---------------------------------------------------------------------------
 # G8 - P8 runtime API present: Android classes.jar has
-# setQaudionOpusEncoderComplexity under org/webrtc/ or livekit/org/webrtc/,
+# setQaudionOpusEncoderComplexity under org/webrtc/,
 # AND the .so has the matching JNI symbol/string. iOS: the umbrella header
 # under Headers/ declares it, and the selector is in the binary.
 # ---------------------------------------------------------------------------
@@ -354,11 +351,11 @@ if [ "$PLATFORM" = windows ]; then
 elif [ "$PLATFORM" = android ]; then
   CJ="$AAR_SCAN/classes.jar"
   [ -f "$CJ" ] || gate_fail "G8 (no classes.jar in AAR)"
-  unzip -l "$CJ" | grep -qE '(livekit/)?org/webrtc/PeerConnectionFactory\.class' || gate_fail "G8 (PeerConnectionFactory.class not found in classes.jar)"
+  unzip -l "$CJ" | grep -qE 'org/webrtc/PeerConnectionFactory\.class' || gate_fail "G8 (PeerConnectionFactory.class not found in classes.jar)"
   # The Java method lives in classes.jar; the .so only carries the jni_zero
   # native export, e.g. Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionOpusEncoderComplexity
   # (capital S after the 'native' prefix), so match the .so case-insensitively.
-  PCF_CLASS=$(unzip -l "$CJ" | awk '{print $4}' | grep -E '^(livekit/)?org/webrtc/PeerConnectionFactory\.class$' | head -1)
+  PCF_CLASS=$(unzip -l "$CJ" | awk '{print $4}' | grep -E '^org/webrtc/PeerConnectionFactory\.class$' | head -1)
   unzip -p "$CJ" "$PCF_CLASS" | grep -a -q -F 'setQaudionOpusEncoderComplexity' || gate_fail "G8 (PeerConnectionFactory.class lacks setQaudionOpusEncoderComplexity)"
   found=0
   for f in $BINARIES; do

@@ -14,29 +14,23 @@ remain the rollback path.
 |---|---|---|
 | `m150/series` | yes | read-only |
 | `m150/patches/*` | yes | read-only |
-| `.github/workflows/*`, `m150/*.sh`, `m150/lk/*`, `m150/README.md` | read-only | yes |
+| `.github/workflows/*`, `m150/*.sh`, `m150/ci/*`, `m150/kat/*`, `m150/README.md` | read-only | yes |
 
 ## Layout
 
 ```
 m150/series                 <- SOURCE-PATCH author's apply order (does not exist yet)
-m150/patches/P1..P8-*.patch <- SOURCE-PATCH author's patches (P1-P3 exist; P4-P8 in progress)
-m150/apply-series.sh        <- reads series, applies it, then the LK patch below if requested
+m150/patches/P1..P12-*.patch <- SOURCE-PATCH author's patches (P12 = frame anti-replay window)
+m150/apply-series.sh        <- reads series and applies it
 m150/fetch-opus-dnn-weights.sh
 m150/gates.sh                <- G1-G9, see webrtc-plan.md §2.5
 m150/buildinfo.py
 m150/ci/sync.sh              <- pinned depot_tools + gclient sync + hard pin verification
-m150/ci/package-android.sh   <- plain passthrough / lk shadow-relocate+rename
+m150/ci/package-android.sh   <- plain passthrough + G1 spot-check
+m150/ci/kat2inc.py          <- shared frame-crypto KAT (sha256-pinned) -> api/crypto/frame_crypto_kat_vectors.inc (T7)
+m150/kat/group-calls-v2-frame-crypto.json <- the KAT file (byte-identical copy; desktop, Android and iOS pin the same hash)
 m150/ios/reclaim-disk.sh
 m150/ios/check-dsym-uuids.sh
-m150/lk/jni_prefix.patch     <- from webrtc-sdk/webrtc-build@66ed9c7 (MIT); one sdk/android/BUILD.gn
-                                hunk re-based on the pinned tree (same +/- lines, new context)
-m150/lk/apple_prefix.patch   <- idem; plus two build_ios_libs.py lines so the LK binary name
-                                (LiveKitWebRTC) is also used for the lipo/dSYM merge
-m150/lk/xcframework.sh       <- vendored (build/apple/xcframework.sh); NOT used by the M150
-                                workflows (it builds 11 non-arm64 slices and ignores GN args) -
-                                ios-lk is built with build_ios_libs.py like ios
-m150/lk/LICENSE.webrtc-build <- idem (LICENSE)
 ```
 
 ## Pins (all resolved 2026-09-28, from webrtc-sdk/webrtc's own DEPS at the
@@ -50,7 +44,6 @@ source author ever moves `webrtc_ref`)
 | `third_party/opus/src` | `55513e81d8f606bd75d0ff773d2144e5f2a732f5` |
 | Opus DNN weights tarball | `https://media.xiph.org/opus/models/opus_data-160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58.tar.gz` |
 | Opus DNN weights sha256 | `160753e983198f29f1aae67c54caa0e30bd90f1ce916a52f15bdad2df8e35e58` (verified live 2026-09-28 by downloading the tarball into a local scratch directory and running `sha256sum` - exact match; the hash is also the tarball's own file-name suffix, i.e. self-describing per upstream `dnn/download_model.sh`) |
-| `webrtc-sdk/webrtc-build` (for `m150/lk/*`) | `66ed9c7` (as given by the plan; vendored files match) |
 | depot_tools | **NOT YET PINNED** - see "Open items" |
 
 These three constants (webrtc/boringssl/opus SHAs) are duplicated in
@@ -70,18 +63,20 @@ curl -fsSL https://raw.githubusercontent.com/webrtc-sdk/webrtc/<new_ref>/DEPS | 
 # and opus SHAs already, cross-checked against a live api.github.com lookup).
 ```
 
-## Build variants and how they differ
+## Build variants
 
 | Variant | GN arg | Extra patch |
 |---|---|---|
 | `android` (plain) | `rtc_qaudion_transport_strict=true` | none |
-| `android-lk` | `rtc_qaudion_transport_strict=false` | `m150/lk/jni_prefix.patch` + shadow-relocate/rename |
 | `ios` (plain) | `rtc_qaudion_transport_strict=true` | none |
-| `ios-lk` | `rtc_qaudion_transport_strict=false` | `m150/lk/apple_prefix.patch` (then `build_ios_libs.py`, same as `ios`) |
+| `windows` (plain, x64) | `rtc_qaudion_transport_strict=true` | none |
 
-P1-P8 (from `m150/series`) apply identically to all four variants - only the
-GN strict flag and the LK-only prefixing patch differ. `apply-series.sh`
-enforces this split; it is NOT encoded per-line in `series` itself.
+The LiveKit-prefixed `-lk` variants (and their prefixing patches) are gone:
+the apps no longer use LiveKit. P1-P12 (from `m150/series`) apply identically
+to every variant. `apply-series.sh` enforces this; it is NOT encoded per-line
+in `series` itself. (`test-webrtc-m150-patches` still builds a `switchable`
+config next to `strict`, because that is the only place the upstream-behaviour
+T1/T2 tests can run.)
 
 ## Dispatching a build
 
@@ -92,12 +87,13 @@ enforces this split; it is NOT encoded per-line in `series` itself.
    orchestrator must do publicly" below).
 2. Actions -> `build-webrtc-android-m150-hardened` (or `-ios-`) -> Run
    workflow, fill in `release_suffix` (e.g. `a256-dplc-1`).
-3. Both `plain` and `lk` variants build in parallel (matrix), then publish to
-   `webrtc-android-m150-<suffix>` and `webrtc-android-lk-m150-<suffix>`
-   (iOS: `webrtc-ios-m150-<suffix>` / `webrtc-ios-lk-m150-<suffix>`).
+3. The build publishes to `webrtc-android-m150-<suffix>` (iOS:
+   `webrtc-ios-m150-<suffix>`).
 
 `test-webrtc-m150-patches` (ubuntu, free) should be green first - it applies
-the same series against a host x64 build in both GN configs and runs T1-T6.
+the same series against a host x64 build in both GN configs and runs T1-T9
+(T7-T9: P12 - shared KAT through the real FrameCryptorTransformer, replay
+window, upstream FrameCryptor gtests).
 
 ## Open items (for the orchestrator / source-patch author, not done here)
 
@@ -115,9 +111,9 @@ the same series against a host x64 build in both GN configs and runs T1-T6.
    the long comment in `gates.sh` for the fallback plan if `symbol_level=1`
    turns out to strip the weight-array names entirely.
 4. **G7 size baselines** exist only for `android-plain` (13,648,040 B, this
-   repo's own shipped M144 artifact). `android-lk`/`ios-plain`/`ios-lk` have
-   no M144 build in this workspace to diff against, so G7 is
-   informational-only for those three until a real baseline is pinned.
+   repo's own shipped M144 artifact). `ios-plain` has no M144 build in this
+   workspace to diff against, so G7 is informational-only for it until a real
+   baseline is pinned.
 5. **Weights tarball resilience.** `media.xiph.org` is the only source right
    now (matches upstream `dnn/download_model.sh` itself). The plan mentions
    "mirrored later as a release asset" - that is a publish action, out of

@@ -1,23 +1,23 @@
 name: build-webrtc-android-m150-hardened
 
-# Builds BOTH Android M150 variants (plain org.webrtc + LiveKit-prefixed) in
-# one dispatch, gates them (m150/gates.sh, G1-G9), then publishes each to its
-# OWN new release tag with sha256 + attestation.
+# Builds the Android M150 AAR (plain org.webrtc; the LiveKit-prefixed -lk
+# variant is gone) in one dispatch, gates it (m150/gates.sh, G1-G10), then
+# publishes it to a NEW release tag with sha256 + attestation.
 #
 # Job graph (finding #16 - a single job that both builds untrusted patched
 # C++ AND holds contents:write/id-token:write/attestations:write is a
 # privilege-escalation surface: a malicious patch or a supply-chain-
 # compromised build tool would run with release/attestation rights):
-#   precheck (contents: read)          - validate inputs, refuse if either
+#   precheck (contents: read)          - validate inputs, refuse if the
 #                                         release tag already exists
 #   build   (contents: read)  <- needs precheck
-#     matrix variant: [plain, lk]      - compiles, gates, uploads a workflow
+#                                      - compiles, gates, uploads a workflow
 #                                         artifact only (no repo/release
 #                                         access at all in this job)
 #   publish (contents: write,
 #            id-token: write,
 #            attestations: write) <- needs [precheck, build]
-#     matrix variant: [plain, lk]      - downloads the build job's artifact,
+#                                      - downloads the build job's artifact,
 #                                         RE-VERIFIES sha256 against
 #                                         SHA256SUMS, re-checks the tag is
 #                                         still free (race with a concurrent
@@ -38,7 +38,7 @@ on:
         description: "fork to sync from (must already carry webrtc_ref at exactly ba469aa2093ba950066258ca0a59a6fbd1295582 - Appendix B of webrtc-plan.md)"
         default: "https://github.com/sigarone/webrtc.git"
       release_suffix:
-        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-android[-lk]-m150-<this> - must not already exist)"
+        description: "appended to the tag, e.g. a256-dplc-1 (the FULL tag - webrtc-android-m150-<this> - must not already exist)"
         required: true
 
 env:
@@ -59,7 +59,6 @@ jobs:
       contents: read
     outputs:
       tag_plain: ${{ steps.tags.outputs.tag_plain }}
-      tag_lk: ${{ steps.tags.outputs.tag_lk }}
     steps:
       - name: Validate dispatch inputs (charset allow-list, fail closed)
         run: |
@@ -73,14 +72,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "tag_plain=webrtc-android-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "tag_lk=webrtc-android-lk-m150-${IN_SUFFIX}" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if either release or git tag already exists (never overwrite a shipped rollback asset)
+      - name: Refuse if the release or git tag already exists (never overwrite a shipped rollback asset)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for t in "webrtc-android-m150-${IN_SUFFIX}" "webrtc-android-lk-m150-${IN_SUFFIX}"; do
+          for t in "webrtc-android-m150-${IN_SUFFIX}"; do
             if gh release view "$t" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "::error::release tag '$t' already exists - use a new release_suffix"
               exit 1
@@ -101,27 +99,20 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [plain, lk]
     env:
       WORKDIR: /home/runner/webrtc
-      GN_STRICT: ${{ matrix.variant == 'plain' && 'true' || 'false' }}
+      GN_STRICT: "true"
       # Never let a depot_tools wrapper self-update past the pin in sync.sh.
       DEPOT_TOOLS_UPDATE: "0"
       # Root cause of runs 36547153188/36598248775/36621762942/36627163222
-      # ("build (lk)" always dying with the runner lost, no retrievable
+      # (the retired lk leg dying with the runner lost, no retrievable
       # log): the Actions runner's OWN worker crashed with an unhandled
       # System.IO.IOException ("No space left on device") writing its
       # _diag trace log to /home/runner/actions-runner/... on the ROOT
       # filesystem (confirmed via the check-run annotation on run
-      # 36627163222) - not a script-level failure at all. build-livekit-
-      # android.yml (M144, the workflow this lk path was ported from)
-      # already routes depot_tools/vpython/pip caches onto the large build
-      # volume instead of root's default $HOME/.cache; this workflow never
-      # picked that up, so gclient sync + vpython3 (used by both variants,
-      # not just lk) have been writing those caches onto root all along.
+      # 36627163222) - not a script-level failure at all. depot_tools,
+      # vpython and pip caches are routed onto the large build volume
+      # instead of root's default $HOME/.cache.
       CIPD_CACHE_DIR: /home/runner/webrtc/.cipd
       XDG_CACHE_HOME: /home/runner/webrtc/.cache
       PIP_CACHE_DIR: /home/runner/webrtc/.pipcache
@@ -131,20 +122,15 @@ jobs:
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
         with:
           # root-reserve-mb is "space to be left free on the root
-          # filesystem" - requested 4096 (4G) on the last 4 runs. The lk
-          # leg's own log for those runs isn't retrievable (the runner that
-          # crashed never flushed it), but the build(plain) leg's log IS
-          # retrievable and runs the identical "Maximize build space" step
-          # on an identical runner image right before it: its own "Disk
-          # space report after modification" showed root at 100M avail
-          # immediately afterward, before any of this workflow's own steps
-          # ran. Whatever accounts for that ~4G gap (rounding, filesystem
-          # reserve blocks, or something else in that pinned action
-          # version), it is a reasonable proxy for what lk's runner saw too,
-          # so the fix here is margin, not precision: ask for 16384 (16G)
-          # instead. The build volume has 71G free at 24% used (this build
-          # uses ~22-24G of it), so giving 12G more of that back to root
-          # costs nothing.
+          # filesystem" - requested 4096 (4G) on earlier runs. The build
+          # log's own "Disk space report after modification" showed root at
+          # 100M avail immediately afterward, before any of this workflow's
+          # own steps ran. Whatever accounts for that ~4G gap (rounding,
+          # filesystem reserve blocks, or something else in that pinned
+          # action version), the fix here is margin, not precision: ask for
+          # 16384 (16G) instead. The build volume has 71G free at 24% used
+          # (this build uses ~22-24G of it), so giving 12G more of that back
+          # to root costs nothing.
           root-reserve-mb: 16384
           swap-size-mb: 12288
           remove-dotnet: 'true'
@@ -165,8 +151,8 @@ jobs:
           WEBRTC_FORK_URL: ${{ env.IN_FORK_URL }}
         run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "$IN_WEBRTC_REF" android,unix
 
-      - name: Apply patch series (variant=android${{ matrix.variant == 'lk' && '-lk' || '' }})
-        run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" "android${{ matrix.variant == 'lk' && '-lk' || '' }}"
+      - name: Apply patch series (variant=android)
+        run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" android
 
       - name: Fetch Opus DNN weights (sha256-pinned)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
@@ -184,47 +170,23 @@ jobs:
             --extra-gn-args "$GN_ARGS"
           ls -lh "$RUNNER_TEMP/raw.aar"
 
-      - name: Set up Java + Gradle (lk packaging only, harmless no-op for plain)
-        if: matrix.variant == 'lk'
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Gradle 7.6 (lk packaging only)
-        if: matrix.variant == 'lk'
-        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
-        with:
-          gradle-version: '7.6'
-
-      - name: Package (plain passthrough / lk shadow-relocate+rename)
-        # Stage-level safety net on top of package-android.sh's own internal
-        # `timeout 20m` around the lk gradle invocation (runs 36547153188 /
-        # 36598248775 hung here ~30 min with the runner lost and no log): if
-        # the internal timeout somehow doesn't fire (e.g. the runner itself
-        # stops scheduling processes under memory pressure), this bounds the
-        # whole step instead of silently eating the job's 350-minute budget.
-        # plain finishes in well under a minute; 25 gives the lk leg's
-        # internal 20m timeout room to fire and still report before this
-        # outer limit would kill the step.
-        timeout-minutes: 25
+      - name: Package (plain passthrough + G1 spot-check)
         run: |
           set -euo pipefail
-          # The root fs keeps only ~4 GB after maximize-build-space and the
-          # Gradle/JDK caches of the lk leg filled /tmp (ENOSPC, run
-          # 36534186215). Unpack on the large build volume instead and drop the
-          # ninja object dirs, which are no longer needed once raw.aar exists.
+          # The root fs keeps only ~4 GB after maximize-build-space: work on
+          # the large build volume and drop the ninja object dirs, which are
+          # no longer needed once raw.aar exists.
           export TMPDIR="$WORKDIR/tmp"; mkdir -p "$TMPDIR"
           find "$WORKDIR/src/out" -mindepth 2 -maxdepth 2 -type d -name obj -exec rm -rf {} + 2>/dev/null || true
           df -h / "$WORKDIR" | sed 's/^/disk: /'
           mkdir -p out
-          bash ctrl/m150/ci/package-android.sh "${{ matrix.variant }}" "$RUNNER_TEMP/raw.aar" out/
+          bash ctrl/m150/ci/package-android.sh plain "$RUNNER_TEMP/raw.aar" out/
 
       - name: Gate G1-G9
         run: |
           set -euo pipefail
           AAR=$(find out -maxdepth 1 -name '*.aar')
-          bash ctrl/m150/gates.sh android "${{ matrix.variant }}" "$AAR" \
+          bash ctrl/m150/gates.sh android plain "$AAR" \
             "$WORKDIR/src/third_party/opus/src/dnn" \
             "$WORKDIR/src/third_party/boringssl/src/include/openssl/ssl.h"
 
@@ -233,7 +195,7 @@ jobs:
           RUNNER_IMAGE: ${{ runner.name }}-ubuntu-latest
         run: |
           set -euo pipefail
-          python3 ctrl/m150/buildinfo.py android "${{ matrix.variant }}" > out/BUILDINFO.json
+          python3 ctrl/m150/buildinfo.py android plain > out/BUILDINFO.json
           cat out/BUILDINFO.json
 
       - name: SHA256SUMS (covers the AAR AND BUILDINFO.json)
@@ -242,16 +204,15 @@ jobs:
       - name: Upload build artifact (workflow-scoped only - no repo/release access in this job)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: android-${{ matrix.variant }}
+          name: android-plain
           path: out/*
           if-no-files-found: error
 
   publish:
     needs: [precheck, build]
-    # Publish each variant that built and passed its gates, even if the other
-    # matrix leg failed: a leg whose build failed never uploaded its artifact
-    # (the upload is the build job's last step, after the gates), so its
-    # publish leg fails closed at the download below.
+    # A build that failed never uploaded its artifact (the upload is the build
+    # job's last step, after the gates), so a failed build fails closed at the
+    # download below.
     if: ${{ !cancelled() && needs.precheck.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -259,15 +220,11 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [plain, lk]
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: android-${{ matrix.variant }}
+          name: android-plain
           path: out
 
       - name: Re-verify SHA256SUMS (do not trust the artifact store blindly)
@@ -279,7 +236,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ matrix.variant == 'lk' && needs.precheck.outputs.tag_lk || needs.precheck.outputs.tag_plain }}"
+          TAG="${{ needs.precheck.outputs.tag_plain }}"
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release tag '$TAG' now exists (created concurrently?) - refusing to publish over it"
             exit 1
@@ -304,6 +261,6 @@ jobs:
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --notes "M150 Android AAR (${{ matrix.variant }}), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
+            --notes "M150 Android AAR (plain), source webrtc-sdk/webrtc@ba469aa2093b, BoringSSL@f91f1447, Opus@55513e81. See BUILDINFO.json and the build-provenance attestation." \
             out/* \
             || echo "::warning::GITHUB_TOKEN could not create release $TAG (HTTP 403 seen 2026-09-29). The artifact is attested and sha256-verified; the maintainer publishes it from this run with a personal token."

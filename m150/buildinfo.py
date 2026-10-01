@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """buildinfo.py - emit BUILDINFO.json to stdout for one M150 build job.
 
-Usage: buildinfo.py <android|ios|windows> <plain|lk> [--pins]
+Usage: buildinfo.py <android|ios|windows> <plain> [--pins]
 
   --pins  print the plain-text PINS list (source/tool pins) instead of the JSON.
   windows has only the plain variant (x64, strict transport).
@@ -16,7 +16,6 @@ Reads (relative to this script's own directory, i.e. m150/ in this repo -
 NOT the webrtc checkout):
   series           - source-patch author's apply order (dir + patch name)
   patches/*        - hashed for provenance
-  lk/*.patch        - hashed too, for -lk variants
 
 Reads from the environment (set by the calling workflow step, see
 build-m150-android.yml / build-m150-ios.yml):
@@ -93,21 +92,6 @@ def patch_hashes(series, variant):
             "sha256": sha256_file(p) if os.path.isfile(p) else None,
             "present": os.path.isfile(p),
         })
-    if variant == "lk":
-        lk_name = None
-        platform = sys.argv[1] if len(sys.argv) > 1 else ""
-        if platform == "android":
-            lk_name = "jni_prefix.patch"
-        elif platform == "ios":
-            lk_name = "apple_prefix.patch"
-        if lk_name:
-            p = os.path.join(SELF_DIR, "lk", lk_name)
-            result.append({
-                "name": "lk/" + lk_name,
-                "apply_dir": ".",
-                "sha256": sha256_file(p) if os.path.isfile(p) else None,
-                "present": os.path.isfile(p),
-            })
     return result
 
 
@@ -127,8 +111,8 @@ def cross_check(env_name, pinned):
 def main():
     args = [a for a in sys.argv[1:] if a != "--pins"]
     want_pins = len(args) != len(sys.argv) - 1
-    if len(args) != 2 or args[0] not in ("android", "ios", "windows") or args[1] not in ("plain", "lk")             or (args[0] == "windows" and args[1] != "plain"):
-        print("usage: %s <android|ios|windows> <plain|lk> [--pins]" % sys.argv[0], file=sys.stderr)
+    if len(args) != 2 or args[0] not in ("android", "ios", "windows") or args[1] != "plain":
+        print("usage: %s <android|ios|windows> <plain> [--pins]" % sys.argv[0], file=sys.stderr)
         return 2
 
     platform, variant = args[0], args[1]

@@ -1,12 +1,11 @@
 #!/bin/sh
 # apply-series.sh - apply the M150 patch series to a webrtc-sdk/webrtc
-# checkout, then (for the two LiveKit variants) the L-A / L-I prefixing
-# patch this repo vendors under m150/lk/.
+# checkout.
 #
 # Ownership split (do not violate, see the plan's "SHARED CONTRACT"):
 #   - m150/series and m150/patches/* belong to the SOURCE-PATCH author.
 #     This script only READS them.
-#   - m150/lk/*, and this script itself, belong to the PIPELINE author.
+#   - this script itself belongs to the PIPELINE author.
 #
 # m150/series format, one line per patch:
 #   <dir relative to <src>> <patch file name>   [# comment]
@@ -21,17 +20,17 @@
 # m150/patches/, resolved relative to this script's own directory (not cwd),
 # so apply-series.sh can be invoked from anywhere.
 #
-# The series applies to ALL FOUR variants unconditionally (matrix 2.2: P1-P8
-# are "si" everywhere) - there is no per-variant column in the series file.
-# Variant selection only affects the LiveKit-only L-A/L-I patch, added below.
+# The series applies to every variant unconditionally - there is no
+# per-variant column in the series file (the LiveKit-prefixed -lk variants and
+# their prefixing patch are gone).
 #
 # Fails CLOSED: `git apply --check` runs first for every patch (source series
-# first, in order, then the LK patch if applicable) - if ANY check fails, we
+# first, in order) - if ANY check fails, we
 # stop before applying anything so the tree is never left half-patched. A
 # missing/empty series file, an unsafe dir/filename, or a `--check` failure
 # all exit non-zero.
 #
-# usage: apply-series.sh <src_dir> <android|android-lk|ios|ios-lk|win>
+# usage: apply-series.sh <src_dir> <android|ios|win>
 # ("win" = Windows x64 desktop: the plain series, no LiveKit patch.)
 # exit: 0 clean apply | 1 patch/context problem | 2 usage/contract problem
 set -eu
@@ -39,10 +38,9 @@ set -eu
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SERIES="$SELF_DIR/series"
 PATCH_DIR="$SELF_DIR/patches"
-LK_DIR="$SELF_DIR/lk"
 
 usage() {
-  echo "usage: $0 <src_dir> <android|android-lk|ios|ios-lk|win>" >&2
+  echo "usage: $0 <src_dir> <android|ios|win>" >&2
   exit 2
 }
 
@@ -51,8 +49,8 @@ SRC=$1
 VARIANT=$2
 
 case "$VARIANT" in
-  android|android-lk|ios|ios-lk|win) ;;
-  *) echo "::error::apply-series: unknown variant '$VARIANT' (want android|android-lk|ios|ios-lk|win)" >&2; exit 2 ;;
+  android|ios|win) ;;
+  *) echo "::error::apply-series: unknown variant '$VARIANT' (want android|ios|win)" >&2; exit 2 ;;
 esac
 
 [ -d "$SRC" ] || { echo "::error::apply-series: src_dir '$SRC' does not exist" >&2; exit 2; }
@@ -126,20 +124,6 @@ if [ "$N" -eq 0 ]; then
   echo "::error::apply-series: $SERIES has zero patch lines - nothing to apply" >&2
   exit 2
 fi
-
-# --- LiveKit prefixing patch, appended to the plan for -lk variants --------
-case "$VARIANT" in
-  android-lk)
-    LK_PATCH="$LK_DIR/jni_prefix.patch"
-    [ -f "$LK_PATCH" ] || { echo "::error::apply-series: $LK_PATCH missing (m150/lk/ vendoring incomplete)" >&2; exit 2; }
-    printf '%s\t%s\t%s\n' "$SRC" "$LK_PATCH" "lk/jni_prefix.patch" >> "$PLAN_TMP"
-    ;;
-  ios-lk)
-    LK_PATCH="$LK_DIR/apple_prefix.patch"
-    [ -f "$LK_PATCH" ] || { echo "::error::apply-series: $LK_PATCH missing (m150/lk/ vendoring incomplete)" >&2; exit 2; }
-    printf '%s\t%s\t%s\n' "$SRC" "$LK_PATCH" "lk/apple_prefix.patch" >> "$PLAN_TMP"
-    ;;
-esac
 
 echo "apply-series: $(wc -l < "$PLAN_TMP" | tr -d ' ') patch(es) planned for variant=$VARIANT"
 
