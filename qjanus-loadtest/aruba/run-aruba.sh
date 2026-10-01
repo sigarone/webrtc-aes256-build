@@ -88,7 +88,8 @@ for c in python python3 py; do
 done
 [ -n "$PY" ] || die "no python 3 on this machine"
 
-jget() { "$PY" -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {"d": d}))' "$1"; }
+# (the python of Windows prints CRLF: strip the CR, it would end up in URLs)
+jget() { "$PY" -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {}, {"d": d}))' "$1" | tr -d '\r'; }
 
 SEED=""
 INSTALLED=0
@@ -204,12 +205,12 @@ run_scenario() {                                    # run_scenario NAME
 fetch_artifacts() {                                 # fetch_artifacts DIR: artifacts of $RUN_ID
   local dir=$1 line name url n
   gh_api GET "/actions/runs/$RUN_ID/artifacts?per_page=100" \
-    | "$PY" -c 'import json,sys; [print(a["name"], a["archive_download_url"]) for a in json.load(sys.stdin)["artifacts"] if not a["expired"]]' > "$dir/artifacts.txt" || return 0
+    | "$PY" -c 'import json,sys; [print(a["name"], a["archive_download_url"]) for a in json.load(sys.stdin)["artifacts"] if not a["expired"]]' | tr -d '\r' > "$dir/artifacts.txt" || return 0
   while read -r name url; do
     [ -n "$name" ] || continue
     n=$dir/$name
     mkdir -p "$n"
-    curl -sSL -m 300 -H "Authorization: Bearer $GH_TOKEN" -o "$n.zip" "$url" && "$PY" -m zipfile -e "$n.zip" "$n" && rm -f "$n.zip"
+    curl -sSL --retry 3 --retry-all-errors -m 300 -H "Authorization: Bearer $GH_TOKEN" -o "$n.zip" "$url" && "$PY" -m zipfile -e "$n.zip" "$n" && rm -f "$n.zip"
   done < "$dir/artifacts.txt"
   line=$(ls "$dir" | tr '\n' ' ')
   log "artifacts in $dir: $line"
@@ -250,6 +251,8 @@ cleanup() {
 }
 
 # ----------------------------------------------------------------------------- main
+# sourced for a check of the functions (ARUBA_SOURCE_ONLY=1): define them and stop here
+if [ "${ARUBA_SOURCE_ONLY:-0}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 command -v gh > /dev/null || die "gh not found"
 GH_TOKEN=$(gh auth token) || die "gh is not logged in"
 export GH_TOKEN
