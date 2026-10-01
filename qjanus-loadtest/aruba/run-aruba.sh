@@ -118,11 +118,14 @@ install_node() {
 }
 
 start_node_jobs() {
+  # setsid -f forks and returns at once; nothing is backgrounded with '&' in the remote shell, so no
+  # subshell keeps the ssh channel open (with '&' on a whole && list the subshell waited for the
+  # guard and held the session until the connection was reset - seen on 2026-10-02 at 00:19).
   rsh "cd $RDIR && rm -f guard/ABORT guard/STOP \
-    && QJANUS_LOADTEST_SEED_FILE=$RDIR/seed setsid nohup python3 aruba_tool.py guard --out $RDIR/guard > guard.log 2>&1 < /dev/null & \
-    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/janus.csv --process qjanus,janus --interval 2 --duration 28800 --quiet > sampler-janus.log 2>&1 < /dev/null & \
-    cd $RDIR && setsid nohup bash node-sampler.sh --out $RDIR/bcrypto.csv --process bcrypto-lite --interval 2 --duration 28800 --quiet > sampler-bc.log 2>&1 < /dev/null & \
-    sleep 12; cat $RDIR/guard.log" || return 1
+    && QJANUS_LOADTEST_SEED_FILE=$RDIR/seed setsid -f nohup python3 aruba_tool.py guard --out $RDIR/guard > guard.log 2>&1 < /dev/null \
+    && setsid -f nohup bash node-sampler.sh --out $RDIR/janus.csv --process qjanus,janus --interval 2 --duration 28800 --quiet > sampler-janus.log 2>&1 < /dev/null \
+    && setsid -f nohup bash node-sampler.sh --out $RDIR/bcrypto.csv --process bcrypto-lite --interval 2 --duration 28800 --quiet > sampler-bc.log 2>&1 < /dev/null \
+    ; sleep 12; cat $RDIR/guard.log" < /dev/null || return 1
   node_alive || return 1
 }
 
