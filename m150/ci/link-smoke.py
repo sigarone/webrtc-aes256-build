@@ -11,8 +11,8 @@ usage: link-smoke.py <artifact_dir> <clang_root> <work_dir> <consumer.cc>
   <consumer.cc>   the program to build
 
 The ONLY inputs of the compile and link are the four release files plus the
-runner's own MSVC / Windows SDK environment (INCLUDE / LIB, as set by
-vcvars64.bat). No path or flag is taken from the GN build tree.
+runner's own MSVC / Windows SDK environment (INCLUDE / LIB, imported from
+vcvars64.bat unless already set). No path or flag is taken from the GN build tree.
 
 exit: 0 the program printed SMOKE-OK and returned 0 | 1 any failure
 """
@@ -33,16 +33,40 @@ def run(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 
+VCVARS = "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Auxiliary/Build/vcvars64.bat"
+
+
+def import_msvc_environment():
+    """INCLUDE / LIB / PATH of the runner's MSVC + Windows SDK (what vcvars64
+    sets). Skipped when the caller already runs inside such an environment."""
+    if os.environ.get("INCLUDE") and os.environ.get("LIB"):
+        return
+    if not os.path.isfile(VCVARS):
+        die("no vcvars64.bat at the expected location and INCLUDE/LIB not set")
+    bat = VCVARS.replace("/", "\\")
+    r = subprocess.run('cmd /c ""%s" >nul && set"' % bat, shell=True,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die("vcvars64.bat failed")
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            os.environ[k] = v
+    if not os.environ.get("INCLUDE") or not os.environ.get("LIB"):
+        die("INCLUDE/LIB still empty after vcvars64")
+
+
 def main():
     if len(sys.argv) != 5:
+        print("link-smoke: expected 4 arguments, got %d: %r" % (len(sys.argv) - 1, sys.argv[1:]),
+              file=sys.stderr)
         print(__doc__, file=sys.stderr)
         return 2
     art, clang, work, src = [os.path.abspath(a) for a in sys.argv[1:5]]
     for need in ("webrtc.lib", "libcxx.lib", "webrtc-headers.zip", "build-flags.json"):
         if not os.path.isfile(os.path.join(art, need)):
             die("release file missing: " + need)
-    if not os.environ.get("INCLUDE") or not os.environ.get("LIB"):
-        die("INCLUDE/LIB not set - run inside a vcvars64 environment")
+    import_msvc_environment()
     flags = json.load(open(os.path.join(art, "build-flags.json"), encoding="utf-8"))
     if flags.get("schema") != "qaudion-webrtc-buildflags/1":
         die("unexpected build-flags schema")
