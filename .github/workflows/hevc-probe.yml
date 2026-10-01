@@ -109,6 +109,8 @@ jobs:
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item build/Release/hevc-probe.exe dist/hevc-probe.exe
           Copy-Item runner-report.json dist/ci-runner-report.json
+          Copy-Item engine/tools/hevc-probe/run-probe.cmd dist/run-probe.cmd
+          Copy-Item engine/tools/hevc-probe/README.md dist/README.md
           $h = (Get-FileHash -Algorithm SHA256 dist/hevc-probe.exe).Hash.ToLower()
           Set-Content -Path dist/hevc-probe.exe.sha256 -Value "$h  hevc-probe.exe" -Encoding ascii
           Get-Content dist/hevc-probe.exe.sha256
@@ -121,5 +123,7 @@ jobs:
             dist/hevc-probe.exe
             dist/hevc-probe.exe.sha256
             dist/ci-runner-report.json
+            dist/run-probe.cmd
+            dist/README.md
           retention-days: 30
           if-no-files-found: error
