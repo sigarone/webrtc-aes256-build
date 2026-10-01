@@ -137,6 +137,7 @@ jobs:
             ccache-v1-${{ matrix.config }}-
 
       - name: Build host x64 test binaries (${{ matrix.config }})
+        id: build
         working-directory: /home/runner/webrtc/src
         env:
           STRICT: ${{ matrix.config == 'strict' && 'true' || 'false' }}
@@ -176,7 +177,10 @@ jobs:
           bash "$GITHUB_WORKSPACE/ctrl/m150/ci/run-tests.sh" "out/test-${CONFIG}" "$CONFIG"
 
       - name: Save ccache (${{ matrix.config }})
-        if: ${{ always() && env.NO_CCACHE != 'true' && steps.ccache.outputs.cache-hit != 'true' }}
+        # Save once the build step succeeded (also when a later test step fails,
+        # the objects are fine); a cancelled or half-finished build must not leave
+        # an incomplete cache under the exact key, which would never be rewritten.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.NO_CCACHE != 'true' && steps.ccache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/ccache

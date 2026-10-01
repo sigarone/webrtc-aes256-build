@@ -68,7 +68,9 @@ T9_FILTER="FrameCryptor.KeyProvider:KeyProvider.*:DataPacketCryptor.*"
 # T10 (P9): the certificate stats cache must not keep a pair taken before
 # the remote certificate was known, plus the upstream cache test it must not
 # break. Both configs.
-T10_FILTER="RTCStatsCollectorTest*CertificateStatsCache*"
+# Both are TEST_P: the full gtest name is "<instantiation>/RTCStatsCollectorTest.<name>/<n>",
+# so the filter needs the leading wildcard (without it the filter matched nothing).
+T10_FILTER="*RTCStatsCollectorTest*CertificateStatsCache*"
 
 any=0
 # <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
