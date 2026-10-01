@@ -79,11 +79,9 @@ void Require(bool ok, const char* what, const std::string& detail = "") {
   Check(ok, what);
   if (!ok) {
     if (!detail.empty()) {
-      std::printf("[smoke]   reason: %s
-", detail.c_str());
+      std::printf("[smoke]   reason: %s\n", detail.c_str());
     }
-    std::printf("[smoke] FAILED (stopping at a required step)
-");
+    std::printf("[smoke] FAILED (stopping at a required step)\n");
     std::fflush(stdout);
     std::exit(1);
   }
