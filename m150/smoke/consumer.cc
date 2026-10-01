@@ -28,6 +28,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(WEBRTC_WIN)
+#include <winsock2.h>
+#endif
+
 #include "api/audio/audio_device.h"
 #include "api/audio/builtin_audio_processing_builder.h"
 #include "api/audio/create_audio_device_module.h"
@@ -335,6 +339,12 @@ int main() {
     webrtc::LogMessage::LogToDebug(webrtc::LS_WARNING);
     webrtc::LogMessage::SetLogToStderr(true);
   }
+#if defined(WEBRTC_WIN)
+  // A standalone Windows program must start Winsock itself (the library's
+  // sockets do not, outside of a browser process).
+  WSADATA wsa_data;
+  Check(WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0, "winsock started");
+#endif
   webrtc::InitializeSSL();
 
   webrtc::Environment env = webrtc::CreateEnvironment();
@@ -449,8 +459,8 @@ int main() {
       set_remote_a);
   Require(set_remote_a->Wait(), "offerer remote description set", set_remote_a->error());
 
-  const bool connected = a.connected_.WaitFor(seconds(40)) &&
-                         b.connected_.WaitFor(seconds(40));
+  const bool connected = a.connected_.WaitFor(seconds(30)) &&
+                         b.connected_.WaitFor(seconds(5));
   Check(connected, "both peers connected over loopback");
 
   if (connected) {
@@ -484,10 +494,14 @@ int main() {
   network_thread->Stop();
   webrtc::CleanupSSL();
 
-  if (g_failures != 0) {
+  const int rc = g_failures != 0 ? 1 : 0;
+  if (rc != 0) {
     std::printf("[smoke] FAILED (%d check(s))\n", g_failures);
-    return 1;
+  } else {
+    std::printf("[smoke] SMOKE-OK\n");
   }
-  std::printf("[smoke] SMOKE-OK\n");
-  return 0;
+  std::fflush(stdout);
+  // The verdict is out; leave without running static destructors so a slow or
+  // stuck library teardown cannot turn a passed run into a timeout.
+  std::_Exit(rc);
 }
