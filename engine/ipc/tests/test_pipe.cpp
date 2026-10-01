@@ -202,6 +202,97 @@ QTEST(pipe_acl_is_current_user_only) {
   ExpectOnlyCurrentUser(dacl);
 }
 
+namespace {
+
+std::wstring CurrentUserSidText() {
+  std::wstring out;
+  HANDLE t = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return out;
+  DWORD need = 0;
+  GetTokenInformation(t, TokenUser, nullptr, 0, &need);
+  std::vector<BYTE> buf(need);
+  if (GetTokenInformation(t, TokenUser, buf.data(), need, &need)) {
+    LPWSTR text = nullptr;
+    if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &text)) {
+      out = text;
+      LocalFree(text);
+    }
+  }
+  CloseHandle(t);
+  return out;
+}
+
+// Creates a pipe the way a buggy or hostile setup could: with the given DACL text, or with the
+// process default DACL (null), or with a NULL DACL (everyone gets everything).
+enum class TestDacl { Default, NullDacl, Sddl };
+
+HANDLE CreatePipeWithDacl(TestDacl kind, const std::wstring& sddl) {
+  const std::wstring name = UniqueName();
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof sa;
+  SECURITY_DESCRIPTOR null_dacl_sd{};
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  SECURITY_ATTRIBUTES* attrs = nullptr;
+  if (kind == TestDacl::NullDacl) {
+    if (!InitializeSecurityDescriptor(&null_dacl_sd, SECURITY_DESCRIPTOR_REVISION)) return INVALID_HANDLE_VALUE;
+    if (!SetSecurityDescriptorDacl(&null_dacl_sd, TRUE, nullptr, FALSE)) return INVALID_HANDLE_VALUE;
+    sa.lpSecurityDescriptor = &null_dacl_sd;
+    attrs = &sa;
+  } else if (kind == TestDacl::Sddl) {
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+      return INVALID_HANDLE_VALUE;
+    }
+    sa.lpSecurityDescriptor = sd;
+    attrs = &sa;
+  }
+  const HANDLE h = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, attrs);
+  if (sd != nullptr) LocalFree(sd);
+  return h;
+}
+
+}  // namespace
+
+QTEST(pipe_dacl_verifier_accepts_only_exactly_one_allow_entry_for_the_user) {
+  const std::wstring me = CurrentUserSidText();
+  CHECK(!me.empty());
+
+  // Positive control: exactly what the server creates.
+  HANDLE good = CreatePipeWithDacl(TestDacl::Sddl, L"D:P(A;;FRFW;;;" + me + L")");
+  CHECK(good != INVALID_HANDLE_VALUE);
+  if (good != INVALID_HANDLE_VALUE) {
+    CHECK(VerifyPipeDacl(good));
+    CloseHandle(good);
+  }
+
+  struct Bad {
+    const char* what;
+    TestDacl kind;
+    std::wstring sddl;
+  };
+  const Bad bad[] = {
+      {"process default DACL", TestDacl::Default, L""},
+      {"NULL DACL", TestDacl::NullDacl, L""},
+      {"Everyone only", TestDacl::Sddl, L"D:P(A;;FRFW;;;WD)"},
+      {"System only", TestDacl::Sddl, L"D:P(A;;FRFW;;;SY)"},
+      {"user plus Everyone", TestDacl::Sddl, L"D:P(A;;FRFW;;;" + me + L")(A;;FRFW;;;WD)"},
+      {"user plus Network", TestDacl::Sddl, L"D:P(A;;FRFW;;;" + me + L")(A;;FRFW;;;NU)"},
+      {"deny entry for the user", TestDacl::Sddl, L"D:P(D;;FRFW;;;" + me + L")"},
+      {"empty DACL", TestDacl::Sddl, L"D:P"},
+  };
+  for (const Bad& b : bad) {
+    HANDLE h = CreatePipeWithDacl(b.kind, b.sddl);
+    if (h == INVALID_HANDLE_VALUE) {
+      std::fprintf(stderr, "  could not create the test pipe for: %s\n", b.what);
+      CHECK(false);
+      continue;
+    }
+    if (VerifyPipeDacl(h)) std::fprintf(stderr, "  accepted a bad DACL: %s\n", b.what);
+    CHECK(!VerifyPipeDacl(h));
+    CloseHandle(h);
+  }
+}
+
 QTEST(pipe_second_server_with_the_same_name_is_refused) {
   const std::wstring name = UniqueName();
   std::unique_ptr<PipeServer> a, b;
