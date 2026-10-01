@@ -29,6 +29,7 @@
 
 #include "api/audio/audio_device.h"
 #include "api/audio/builtin_audio_processing_builder.h"
+#include "api/audio/create_audio_device_module.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/audio_options.h"
@@ -306,7 +307,7 @@ int main() {
   webrtc::InitializeSSL();
 
   webrtc::Environment env = webrtc::CreateEnvironment();
-  auto adm = webrtc::AudioDeviceModule::Create(
+  auto adm = webrtc::CreateAudioDeviceModule(
       env, webrtc::AudioDeviceModule::kDummyAudio);
   Check(adm != nullptr, "dummy audio device module");
   auto apm = webrtc::BuiltinAudioProcessingBuilder().Build(env);
