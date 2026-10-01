@@ -10,7 +10,7 @@
 // when "now" (whole seconds) is greater than the expiry, so a token is valid
 // up to and including its expiry second.
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 /** Realm string Janus checks for the core session token. */
 export const TOKEN_REALM = 'janus';
@@ -39,6 +39,9 @@ function hmacBase64(secret, hash, data) {
  * @param {string[]} [o.plugins]  plugin packages the token may attach to
  * @param {'sha1'|'sha256'} [o.hash='sha256']
  * @param {number} [o.nowMs=Date.now()]  clock override (tests)
+ * @param {boolean} [o.nonce=false]  append a random descriptor ("n.<hex>", ignored by Janus) so that this token is its
+ *   own string: qjanus (patch 0008) allows only a few live sessions per distinct token string, and tokens minted
+ *   within the same second with the same ttl are otherwise the same string. Bots and admin sessions use it.
  * @returns {string}
  */
 export function mintSessionToken({
@@ -47,6 +50,7 @@ export function mintSessionToken({
   plugins = [VIDEOROOM_PLUGIN],
   hash = 'sha256',
   nowMs = Date.now(),
+  nonce = false,
 } = {}) {
   if (typeof secret !== 'string' || secret.length === 0) {
     throw new TypeError('token secret must be a non-empty string');
@@ -62,7 +66,7 @@ export function mintSessionToken({
   }
   const h = normalizeHash(hash);
   const expiry = Math.floor(nowMs / 1000 + ttlSec);
-  const data = [expiry, TOKEN_REALM, ...plugins].join(',');
+  const data = [expiry, TOKEN_REALM, ...plugins, ...(nonce ? [`n.${randomBytes(6).toString('hex')}`] : [])].join(',');
   return `${data}:${hmacBase64(secret, h, data)}`;
 }
 

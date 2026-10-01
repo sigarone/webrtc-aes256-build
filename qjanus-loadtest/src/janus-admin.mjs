@@ -167,6 +167,7 @@ export class JanusAdmin {
       ttlSec: this.tokenTtlSec,
       hash: this.hash,
       nowMs: this._now(),
+      nonce: true,
     });
   }
 
