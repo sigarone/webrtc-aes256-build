@@ -1,0 +1,104 @@
+name: hevc-probe
+
+# Builds the HEVC capability probe (engine/tools/hevc-probe), runs it once on
+# the hosted runner (which has no GPU: "no hardware encoder" is the expected
+# answer and the probe must not crash) and publishes the exe plus its sha256 as
+# a workflow artifact so that it can be run on real hardware.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'engine/tools/hevc-probe/**'
+      - '.github/workflows/hevc-probe.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'engine/tools/hevc-probe/**'
+      - '.github/workflows/hevc-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Configure and build (MSVC, static CRT)
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 12)
+          cmake -S engine/tools/hevc-probe -B build -G "Visual Studio 17 2022" -A x64 "-DPROBE_GIT_SHA=$sha"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build --config Release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Item build/Release/hevc-probe.exe | Format-List Name, Length
+
+      - name: Check that the CRT is linked statically
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path (Join-Path $vs 'VC\Tools\MSVC') -Recurse -Filter dumpbin.exe |
+            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents build/Release/hevc-probe.exe
+          $deps | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt|ucrtbase') {
+            throw 'the probe depends on a dynamic CRT'
+          }
+
+      - name: Run on the hosted runner (expected - no hardware encoder - and no crash)
+        shell: cmd
+        run: |
+          build\Release\hevc-probe.exe > runner-report.json
+          if errorlevel 1 exit /b 1
+          if not exist build\Release\hevc-probe-report.json exit /b 1
+
+      - name: Validate the report
+        shell: pwsh
+        run: |
+          $txt = Get-Content runner-report.json -Raw
+          $rep = $txt | ConvertFrom-Json
+          $rep.summary | Format-List
+          $rep.media_foundation | Format-List
+          $rep.adapters | Format-Table description, vendor_id, dedicated_memory_mb
+          if ($rep.tool.name -ne 'hevc-probe') { throw 'unexpected report' }
+          # The file next to the exe must carry the same document.
+          $file = Get-Content build/Release/hevc-probe-report.json -Raw
+          if ($file.Trim() -ne $txt.Trim()) { throw 'stdout and report file differ' }
+          # Privacy: nothing machine- or user-specific may appear in the report.
+          $secrets = @($env:COMPUTERNAME, $env:USERNAME, $env:USERPROFILE, $env:RUNNER_NAME, $env:GITHUB_WORKSPACE) |
+            Where-Object { $_ -and $_.Length -ge 4 }
+          foreach ($s in $secrets) {
+            if ($txt.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw 'report contains machine or user specific text' }
+          }
+          if ($txt -match '\\Users\\|[A-Za-z]:\\|[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}') { throw 'report contains a path or a MAC-like string' }
+          # The hosted runner has no GPU: a hardware encode must not be reported.
+          if ($rep.summary.hevc_hardware_encode_720p_ok) { throw 'unexpected hardware encode on the hosted runner' }
+
+      - name: Collect the artifact files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item build/Release/hevc-probe.exe dist/hevc-probe.exe
+          Copy-Item runner-report.json dist/ci-runner-report.json
+          $h = (Get-FileHash -Algorithm SHA256 dist/hevc-probe.exe).Hash.ToLower()
+          Set-Content -Path dist/hevc-probe.exe.sha256 -Value "$h  hevc-probe.exe" -Encoding ascii
+          Get-Content dist/hevc-probe.exe.sha256
+
+      - name: Upload the probe
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hevc-probe-windows-x64
+          path: |
+            dist/hevc-probe.exe
+            dist/hevc-probe.exe.sha256
+            dist/ci-runner-report.json
+          retention-days: 30
+          if-no-files-found: error
