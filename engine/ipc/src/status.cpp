@@ -33,6 +33,7 @@ const char* ErrName(Err e) noexcept {
     case Err::SchemaLength: return "schema_length";
     case Err::SchemaEnum: return "schema_enum";
     case Err::SchemaZeroKey: return "schema_zero_key";
+    case Err::SchemaText: return "schema_text";
     case Err::SessionNotHello: return "session_not_hello";
     case Err::SessionNonce: return "session_nonce";
     case Err::SessionHelloRepeat: return "session_hello_repeat";

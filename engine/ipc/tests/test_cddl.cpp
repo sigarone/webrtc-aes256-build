@@ -38,6 +38,7 @@ std::string DescribeType(const FieldSpec& f) {
     case FType::Uint: return "uint:" + Range(f.lo, f.hi);
     case FType::Bool: return "bool";
     case FType::Text: return "tstr:" + Range(f.lo, f.hi);
+    case FType::Sdp: return "sdp:" + Range(f.lo, f.hi);
     case FType::Bytes: return "bstr:" + Range(f.lo, f.hi) + (f.nonzero ? "!nonzero" : "");
     case FType::Enum: {
       std::string s = "enum:";
@@ -183,6 +184,7 @@ Cddl ParseCddl(const std::string& path) {
       r.id_rule = Trim(code.substr(4));
     } else {
       if (comment.find("nonzero") != std::string::npos) code += " !nonzero";
+      if (comment.find("sdp") != std::string::npos) code += " !sdp";
       r.lines.push_back(code);
     }
   }
@@ -198,10 +200,16 @@ std::string DescribeCddlFields(const Cddl& c, const std::vector<std::string>& li
 std::string CanonType(const Cddl& c, std::string t, bool* ok) {
   t = Trim(t);
   bool nonzero = false;
+  bool sdp = false;
   const size_t nz = t.find(" !nonzero");
   if (nz != std::string::npos) {
     nonzero = true;
     t = Trim(t.substr(0, nz));
+  }
+  const size_t sd = t.find(" !sdp");
+  if (sd != std::string::npos) {
+    sdp = true;
+    t = Trim(t.substr(0, sd));
   }
   std::smatch m;
   static const std::regex re_uint(R"(^(\d+)\.\.(\d+)$)");
@@ -233,7 +241,8 @@ std::string CanonType(const Cddl& c, std::string t, bool* ok) {
   }
   if (std::regex_match(t, m, re_uint)) return "uint:" + CanonRange(m[1], m[2]);
   if (std::regex_match(t, m, re_size_range)) {
-    return std::string(m[1]) + ":" + CanonRange(m[2], m[3]) + (nonzero ? "!nonzero" : "");
+    const std::string base = (sdp && m[1] == "tstr") ? "sdp" : std::string(m[1]);
+    return base + ":" + CanonRange(m[2], m[3]) + (nonzero ? "!nonzero" : "");
   }
   if (std::regex_match(t, m, re_size_exact)) {
     return std::string(m[1]) + ":" + CanonRange(m[2], m[2]) + (nonzero ? "!nonzero" : "");

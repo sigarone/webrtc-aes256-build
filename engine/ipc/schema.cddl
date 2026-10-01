@@ -19,6 +19,9 @@
 ; types, out-of-range values and messages travelling in the wrong direction are all rejected,
 ; and a rejected message ends the connection (fail closed).
 ;
+; Text fields (tstr) must not contain control characters (no NUL, no C0, no DEL). The fields marked
+; "; sdp" may additionally contain CR, LF and HT. Sizes are in bytes.
+;
 ; Ids: a request carries an id >= 1 chosen by the client. The reply echoes it. Events carry id 0.
 ; The "err" message may carry any id (0 when the failed message had no usable id).
 ;
@@ -36,6 +39,7 @@
 ;   types: handle | A..B | bool | tstr .size (A..B) | bstr .size (A..B) | bstr .size N
 ;          | "x" / "y" | [A*B tstr .size (A..B)] | [A*B rule-name] | { A*B tstr .size (A..B) => scalar }
 ;   a trailing "; nonzero" on a byte string rejects the all-zero value
+;   a trailing "; sdp" on a text string allows CR, LF and HT in it
 
 handle = 1..4294967295
 req-id = 1..4294967295
@@ -155,7 +159,7 @@ set-local-description = {
   id: req-id,
   pc: handle,
   type: "offer" / "answer" / "pranswer" / "rollback",
-  sdp: tstr .size (0..262144),
+  sdp: tstr .size (0..262144), ; sdp
 }
 
 set-remote-description = {
@@ -164,7 +168,7 @@ set-remote-description = {
   id: req-id,
   pc: handle,
   type: "offer" / "answer" / "pranswer" / "rollback",
-  sdp: tstr .size (0..262144),
+  sdp: tstr .size (0..262144), ; sdp
 }
 
 ; An empty candidate string marks the end of candidates.
@@ -396,7 +400,7 @@ sdp-ready = {
   id: resp-id,
   pc: handle,
   type: "offer" / "answer",
-  sdp: tstr .size (1..262144),
+  sdp: tstr .size (1..262144), ; sdp
 }
 
 devices = {

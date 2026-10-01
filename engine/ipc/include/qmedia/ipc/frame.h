@@ -55,8 +55,11 @@ class FrameBuffer {
   size_t size_ = 0;
 };
 
-// Reads one frame into buf (wiping it first). timeout_ms bounds the whole frame.
-Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t timeout_ms);
+// Reads one frame into buf (wiping it first). idle_timeout_ms bounds the wait for the first byte
+// of the frame (kNoTimeout = wait forever). After that byte the rest of the frame must arrive
+// within kFrameBodyTimeoutMs, so a peer that stalls in the middle of a frame cannot hold the
+// reader forever.
+Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms);
 
 // Writes header and payload. Fails with FrameEmpty / FrameTooLarge for an invalid size.
 Err WriteFrame(ByteStream& s, std::span<const uint8_t> payload, uint32_t timeout_ms);

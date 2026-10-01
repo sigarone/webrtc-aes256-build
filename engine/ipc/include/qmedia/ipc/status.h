@@ -40,6 +40,7 @@ enum class Err : uint8_t {
   SchemaLength,
   SchemaEnum,
   SchemaZeroKey,
+  SchemaText,  // control character in a text field
   // session
   SessionNotHello,
   SessionNonce,

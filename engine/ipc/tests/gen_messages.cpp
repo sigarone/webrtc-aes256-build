@@ -30,7 +30,8 @@ Buf GenValue(const FieldSpec& f, const GenOptions& o) {
     case FType::Bool:
       ipc::cbor::PutBool(out, true);
       break;
-    case FType::Text: {
+    case FType::Text:
+    case FType::Sdp: {
       const std::string s(static_cast<size_t>(Pick(f.lo, f.hi, o)), 'a');
       ipc::cbor::PutStr(out, s);
       break;

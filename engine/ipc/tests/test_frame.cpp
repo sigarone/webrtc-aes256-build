@@ -159,3 +159,62 @@ QTEST(secure_primitives) {
   CHECK(std::memcmp(r1, r2, sizeof r1) != 0);  // 2^-256 false failure
   CHECK(!AllZero(r1, sizeof r1));
 }
+
+namespace {
+
+// Records the timeout of every read, so the idle/body split can be checked.
+class RecordingStream final : public ByteStream {
+ public:
+  explicit RecordingStream(Buf data, IoResult fail_after_first = IoResult::Ok)
+      : data_(std::move(data)), fail_(fail_after_first) {}
+  IoResult ReadExact(uint8_t* dst, size_t n, uint32_t timeout_ms) override {
+    timeouts.push_back(timeout_ms);
+    if (timeouts.size() > 1 && fail_ != IoResult::Ok) return fail_;
+    if (pos_ + n > data_.size()) return IoResult::Error;
+    std::memcpy(dst, data_.data() + pos_, n);
+    pos_ += n;
+    return IoResult::Ok;
+  }
+  IoResult WriteAll(const uint8_t*, size_t, uint32_t) override { return IoResult::Ok; }
+  std::vector<uint32_t> timeouts;
+
+ private:
+  Buf data_;
+  size_t pos_ = 0;
+  IoResult fail_;
+};
+
+}  // namespace
+
+QTEST(frame_idle_timeout_applies_to_the_first_byte_only) {
+  Buf wire = Header(3);
+  wire.resize(7, 0x41);
+  RecordingStream s(wire);
+  FrameBuffer buf;
+  CHECK_EQ(ReadFrame(s, buf, 1234), Err::Ok);
+  CHECK_EQ(s.timeouts.size(), 3u);  // first byte, rest of the header, payload
+  CHECK_EQ(s.timeouts[0], 1234u);   // the caller's idle timeout
+  CHECK(s.timeouts[1] <= kFrameBodyTimeoutMs && s.timeouts[1] > 0);
+  CHECK(s.timeouts[2] <= kFrameBodyTimeoutMs && s.timeouts[2] > 0);
+
+  RecordingStream forever(wire);
+  CHECK_EQ(ReadFrame(forever, buf, kNoTimeout), Err::Ok);
+  CHECK_EQ(forever.timeouts[0], kNoTimeout);        // idle wait is unbounded when asked
+  CHECK(forever.timeouts[1] <= kFrameBodyTimeoutMs);  // but a started frame never is
+}
+
+QTEST(frame_stall_inside_a_frame_times_out_and_wipes) {
+  FrameBuffer buf;
+  {
+    RecordingStream s(Header(8), IoResult::Timeout);  // stalls after the first header byte
+    CHECK_EQ(ReadFrame(s, buf, kNoTimeout), Err::IoTimeout);
+  }
+  {
+    Buf wire = Header(8);
+    wire.resize(4 + 8, 0x66);
+    // First read (1 byte) works, the second (rest of header) times out.
+    RecordingStream s(wire, IoResult::Timeout);
+    CHECK_EQ(ReadFrame(s, buf, kNoTimeout), Err::IoTimeout);
+    CHECK(buf.capacity() == 0 || AllZero(buf.raw(), buf.capacity()));
+  }
+}

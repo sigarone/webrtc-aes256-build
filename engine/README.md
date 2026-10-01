@@ -52,12 +52,18 @@ qaudion-media.exe --pipe \\.\pipe\<name> [--expect-client-pid <pid>]
    engine's standard input, which must be an anonymous pipe or a file. A console, the NUL device
    or any other handle is refused. The engine reads the nonce within 5 seconds.
 2. The engine creates the named pipe (one instance only, see below) and waits 15 seconds for one
-   client. With `--expect-client-pid` it also checks the client process id with
+   client. The host should pick a fresh random pipe name for every start (128 random bits). With `--expect-client-pid` it also checks the client process id with
    `GetNamedPipeClientProcessId`.
-3. The first message of the client must be `hello` carrying the same nonce. The engine compares it
+3. Before sending the hello, the host must check that the process at the other end of the pipe is
+   the child it started (`GetNamedPipeServerProcessId` equals the child's process id; the helper
+   `ConnectPipe` does this when given the id). Another process of the same user could have
+   created a pipe with that name first, and the hello carries the nonce. The engine in turn
+   refuses to start if the name is already taken (exit code 4) and, with `--expect-client-pid`,
+   refuses a client that is not the host.
+4. The first message of the client must be `hello` carrying the same nonce. The engine compares it
    in constant time. On any failure before a valid hello the engine closes the connection without
    sending a single byte and exits.
-4. Messages are then exchanged until the client sends `shutdown` or closes the pipe. The engine
+5. Messages are then exchanged until the client sends `shutdown` or closes the pipe. The engine
    exits when the connection ends: it serves exactly one client for exactly one lifetime.
 
 Exit codes are the only diagnostics the engine emits before the core is linked: 0 clean shutdown,
@@ -104,7 +110,12 @@ IPC hardening.
 - Unknown message kinds, unknown fields, missing fields, wrong types, out-of-range values, wrong
   direction and a repeated `hello` all end the connection. There is no lenient mode.
 - The decoder accepts only canonical CBOR, bounds depth (6) and the number of data items (4096),
-  rejects huge length claims from the header alone, and validates UTF-8 strictly.
+  rejects huge length claims from the header alone, and validates UTF-8 strictly. The validator
+  additionally refuses control characters (NUL, C0, DEL) in every text field, so an identifier
+  can neither truncate a C string nor smuggle a line break; only SDP may contain CR, LF and HT.
+- Timeouts: the first byte of the hello must arrive within 5 seconds, and once any frame has
+  started its remaining bytes must follow within 10 seconds, so a stalled peer cannot hold the
+  reader. Between messages the engine waits without limit for the host.
 - The pipe has a protected DACL with one allow entry for the current user SID (no Everyone,
   Network, Anonymous, Users, Administrators or System), `PIPE_REJECT_REMOTE_CLIENTS`,
   `FILE_FLAG_FIRST_PIPE_INSTANCE` and a maximum of one instance. The DACL is read back after

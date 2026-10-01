@@ -392,3 +392,56 @@ QTEST(message_builders_produce_valid_engine_messages) {
   ValidatedMessage m;
   CHECK_EQ(Check(BuildHello(1, nonce), Dir::ClientToEngine, &root, &m), Err::Ok);
 }
+
+QTEST(schema_text_fields_reject_control_characters) {
+  const MessageSpec& ik = Spec("install_key");
+  GenOptions o;
+  for (const char* bad : {"a\nb", "a\rb", "a\tb", "a\x01" "b", "a\x1f" "b", "a\x7f" "b"}) {
+    const Buf p = Str(bad);
+    CHECK_EQ(CheckC2E(GenMessageWith(ik, o, "participant", &p)), Err::SchemaText);
+  }
+  const Buf nul = Str(std::string("a\0b", 3));
+  CHECK_EQ(CheckC2E(GenMessageWith(ik, o, "participant", &nul)), Err::SchemaText);
+  const Buf utf8 = Str("caf\xC3\xA9 \xE2\x82\xAC");
+  CHECK_EQ(CheckC2E(GenMessageWith(ik, o, "participant", &utf8)), Err::Ok);
+
+  // ICE server URLs (array of text) and the candidate line
+  const MessageSpec& pc = Spec("pc_create");
+  cbor::MapBuilder srv;
+  srv.Raw("urls", cbor::ArrayBuilder().Add(Str("turn:h\n:1")).Finish());
+  const Buf urls = cbor::ArrayBuilder().Add(srv.Finish()).Finish();
+  GenOptions full;
+  full.full = true;
+  CHECK_EQ(CheckC2E(GenMessageWith(pc, full, "ice_servers", &urls)), Err::SchemaText);
+  const MessageSpec& cand = Spec("add_ice_candidate");
+  const Buf line = Str("candidate:1 1 udp 1 1.2.3.4 5 typ host\r\n");
+  CHECK_EQ(CheckC2E(GenMessageWith(cand, o, "candidate", &line)), Err::SchemaText);
+
+  // SDP may contain line breaks and tabs, but not NUL or other control characters.
+  const MessageSpec& sd = Spec("set_remote_description");
+  const Buf crlf = Str("v=0\r\na=b\tc\r\n");
+  CHECK_EQ(CheckC2E(GenMessageWith(sd, o, "sdp", &crlf)), Err::Ok);
+  const Buf sdp_nul = Str(std::string("v=0\r\n\0", 6));
+  CHECK_EQ(CheckC2E(GenMessageWith(sd, o, "sdp", &sdp_nul)), Err::SchemaText);
+  const Buf sdp_ctl = Str("v=0\r\n\x07");
+  CHECK_EQ(CheckC2E(GenMessageWith(sd, o, "sdp", &sdp_ctl)), Err::SchemaText);
+  const Buf sdp_del = Str("v=0\x7f");
+  CHECK_EQ(CheckC2E(GenMessageWith(sd, o, "sdp", &sdp_del)), Err::SchemaText);
+
+  // keys and text values of the stats scalar maps
+  const MessageSpec& st = Spec("stats");
+  auto entries_with = [&](Buf values) {
+    cbor::MapBuilder e;
+    e.Str("type", "t").Str("id", "x").Raw("values", std::move(values));
+    return cbor::ArrayBuilder().Add(e.Finish()).Finish();
+  };
+  GenOptions sfull;
+  sfull.full = true;
+  Value r1, r2, r3;
+  const Buf bad_key = entries_with(cbor::MapBuilder().Uint("a\nb", 1).Finish());
+  CHECK_EQ(Check(GenMessageWith(st, sfull, "entries", &bad_key), Dir::EngineToClient, &r1), Err::SchemaText);
+  const Buf bad_val = entries_with(cbor::MapBuilder().Str("a", "x\ny").Finish());
+  CHECK_EQ(Check(GenMessageWith(st, sfull, "entries", &bad_val), Dir::EngineToClient, &r2), Err::SchemaText);
+  const Buf good = entries_with(cbor::MapBuilder().Str("a", "x y").Finish());
+  CHECK_EQ(Check(GenMessageWith(st, sfull, "entries", &good), Dir::EngineToClient, &r3), Err::Ok);
+}

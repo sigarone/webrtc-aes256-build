@@ -25,6 +25,9 @@ constexpr FieldSpec Flag(SV n, bool req = true) {
 constexpr FieldSpec Str(SV n, uint64_t lo, uint64_t hi, bool req = true) {
   return FieldSpec{n, FType::Text, req, false, lo, hi, kNoEnums, kNoFields, FType::Uint, 0, 0};
 }
+constexpr FieldSpec Sdp(SV n, uint64_t lo, uint64_t hi, bool req = true) {
+  return FieldSpec{n, FType::Sdp, req, false, lo, hi, kNoEnums, kNoFields, FType::Uint, 0, 0};
+}
 constexpr FieldSpec Bin(SV n, uint64_t lo, uint64_t hi, bool req = true, bool nonzero = false) {
   return FieldSpec{n, FType::Bytes, req, nonzero, lo, hi, kNoEnums, kNoFields, FType::Uint, 0, 0};
 }
@@ -74,7 +77,7 @@ constexpr FieldSpec kFPcCreate[] = {Hnd("session"), Hnd("cert"), En("ice_policy"
                                     ArrObj("ice_servers", 0, 8, kFIceServer, false)};
 constexpr FieldSpec kFPc[] = {Hnd("pc")};
 constexpr FieldSpec kFCreateOffer[] = {Hnd("pc"), Flag("ice_restart", false)};
-constexpr FieldSpec kFSetDesc[] = {Hnd("pc"), En("type", kSdpType), Str("sdp", 0, 262144)};
+constexpr FieldSpec kFSetDesc[] = {Hnd("pc"), En("type", kSdpType), Sdp("sdp", 0, 262144)};
 constexpr FieldSpec kFCandidate[] = {Hnd("pc"), Str("candidate", 0, 2048), Str("mid", 0, 16, false),
                                      Num("mline_index", 0, 255, false)};
 constexpr FieldSpec kFInstallKey[] = {Hnd("session"), Str("participant", 1, 64), Num("slot", 0, 15),
@@ -113,7 +116,7 @@ constexpr FieldSpec kFTuning[] = {Hnd("pc"), Num("ptime_ms", 10, 120, false),
 constexpr FieldSpec kFErr[] = {En("code", kErrCode), Str("detail", 0, 128, false)};
 constexpr FieldSpec kFCertCreated[] = {Hnd("cert"), Bin("fingerprint", kFingerprintBytes,
                                                         kFingerprintBytes)};
-constexpr FieldSpec kFSdpReady[] = {Hnd("pc"), En("type", kSdpReadyType), Str("sdp", 1, 262144)};
+constexpr FieldSpec kFSdpReady[] = {Hnd("pc"), En("type", kSdpReadyType), Sdp("sdp", 1, 262144)};
 constexpr FieldSpec kFDevice[] = {Str("id", 0, 256), Str("name", 0, 128), En("kind", kDeviceKind),
                                   Flag("is_default"), Flag("is_communications", false)};
 constexpr FieldSpec kFDevices[] = {ArrObj("devices", 0, 64, kFDevice)};
@@ -196,6 +199,17 @@ constexpr MessageSpec kMessages[] = {
     {"pcm_frame", E2C, IdRule::Event, kFPcmFrame},
 };
 
+// UTF-8 is already validated by the decoder. Here: no NUL, no C0 control characters, no DEL, so a
+// text field can neither truncate a C string nor smuggle a line break into a log or a header.
+bool CleanText(std::span<const uint8_t> raw, bool allow_line_breaks) {
+  for (uint8_t b : raw) {
+    if (b >= 0x20 && b != 0x7F) continue;
+    if (allow_line_breaks && (b == '\t' || b == '\n' || b == '\r')) continue;
+    return false;
+  }
+  return true;
+}
+
 bool Contains(std::span<const SV> set, SV v) {
   for (SV s : set) {
     if (s == v) return true;
@@ -214,8 +228,10 @@ Err CheckValue(const FieldSpec& f, const Value& v) {
     case FType::Bool:
       return v.type == Value::Type::Bool ? Err::Ok : Err::SchemaType;
     case FType::Text:
+    case FType::Sdp:
       if (v.type != Value::Type::Text) return Err::SchemaType;
       if (v.raw.size() < f.lo || v.raw.size() > f.hi) return Err::SchemaLength;
+      if (!CleanText(v.raw, f.type == FType::Sdp)) return Err::SchemaText;
       return Err::Ok;
     case FType::Bytes: {
       if (v.type != Value::Type::Bytes) return Err::SchemaType;
@@ -239,6 +255,7 @@ Err CheckValue(const FieldSpec& f, const Value& v) {
         if (f.elem == FType::Text) {
           if (el.type != Value::Type::Text) return Err::SchemaType;
           if (el.raw.size() < f.elem_lo || el.raw.size() > f.elem_hi) return Err::SchemaLength;
+          if (!CleanText(el.raw, false)) return Err::SchemaText;
         } else {
           const Err e = CheckObject(f.object, el, false);
           if (e != Err::Ok) return e;
@@ -254,8 +271,12 @@ Err CheckValue(const FieldSpec& f, const Value& v) {
         const Value& k = v.items[i];
         const Value& val = v.items[i + 1];
         if (k.raw.empty() || k.raw.size() > kMaxScalarKeyBytes) return Err::SchemaLength;
+        if (!CleanText(k.raw, false)) return Err::SchemaText;
         if (val.type == Value::Type::Uint || val.type == Value::Type::Bool) continue;
-        if (val.type == Value::Type::Text && val.raw.size() <= kMaxScalarTextBytes) continue;
+        if (val.type == Value::Type::Text && val.raw.size() <= kMaxScalarTextBytes) {
+          if (!CleanText(val.raw, false)) return Err::SchemaText;
+          continue;
+        }
         return Err::SchemaType;
       }
       return Err::Ok;

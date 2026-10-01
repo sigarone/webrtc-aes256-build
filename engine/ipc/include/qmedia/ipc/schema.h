@@ -18,7 +18,9 @@ enum class Dir : uint8_t { ClientToEngine, EngineToClient };
 // Event carries id 0; Any accepts both (used by "err", which may be connection level).
 enum class IdRule : uint8_t { Request, Response, Event, Any };
 
-enum class FType : uint8_t { Uint, Bool, Text, Bytes, Enum, Object, Array, ScalarMap };
+// Text: UTF-8 without control characters (no NUL, no C0, no DEL). Sdp: the same, but CR, LF and HT
+// are allowed. Both are length-checked in bytes.
+enum class FType : uint8_t { Uint, Bool, Text, Sdp, Bytes, Enum, Object, Array, ScalarMap };
 
 struct FieldSpec {
   std::string_view name;

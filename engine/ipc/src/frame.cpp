@@ -56,13 +56,15 @@ uint8_t* FrameBuffer::Prepare(size_t n) {
   return data_.get();
 }
 
-Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t timeout_ms) {
+Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms) {
   buf.Wipe();
-  const Deadline deadline(timeout_ms);
 
   uint8_t hdr[kFrameHeaderBytes];
-  IoResult r = s.ReadExact(hdr, sizeof hdr, deadline.Remaining());
+  IoResult r = s.ReadExact(hdr, 1, idle_timeout_ms);
   if (r != IoResult::Ok) return MapIo(r);
+  const Deadline body(kFrameBodyTimeoutMs);
+  r = s.ReadExact(hdr + 1, sizeof hdr - 1, body.Remaining());
+  if (r != IoResult::Ok) return r == IoResult::Eof ? Err::IoError : MapIo(r);  // ended inside the header
 
   const uint32_t len = (static_cast<uint32_t>(hdr[0]) << 24) | (static_cast<uint32_t>(hdr[1]) << 16) |
                        (static_cast<uint32_t>(hdr[2]) << 8) | static_cast<uint32_t>(hdr[3]);
@@ -70,7 +72,7 @@ Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t timeout_ms) {
   if (len > kMaxFramePayload) return Err::FrameTooLarge;  // decided before reading the payload
 
   uint8_t* dst = buf.Prepare(len);
-  r = s.ReadExact(dst, len, deadline.Remaining());
+  r = s.ReadExact(dst, len, body.Remaining());
   if (r != IoResult::Ok) {
     buf.Wipe();
     return r == IoResult::Eof ? Err::IoTruncated : MapIo(r);

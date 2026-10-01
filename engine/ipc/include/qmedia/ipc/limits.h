@@ -32,5 +32,7 @@ inline constexpr uint32_t kNoTimeout = 0xFFFFFFFFu;
 inline constexpr uint32_t kHelloTimeoutMs = 5000;
 inline constexpr uint32_t kConnectTimeoutMs = 15000;
 inline constexpr uint32_t kNonceReadTimeoutMs = 5000;
+// Once the first byte of a frame has arrived the rest of it must follow within this time.
+inline constexpr uint32_t kFrameBodyTimeoutMs = 10000;
 
 }  // namespace qmedia::ipc

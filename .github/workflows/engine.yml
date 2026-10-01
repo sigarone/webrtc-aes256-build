@@ -182,7 +182,7 @@ jobs:
       - name: Unit tests and pipe tests (ACL, single client, nonce reject, oversize reject, real process)
         shell: pwsh
         run: |
-          ctest --test-dir build -C Release --output-on-failure
+          ctest --test-dir build -C Release --output-on-failure --verbose
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Engine executable hardening flags are present
