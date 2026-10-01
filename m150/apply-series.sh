@@ -24,11 +24,11 @@
 # per-variant column in the series file (the LiveKit-prefixed -lk variants and
 # their prefixing patch are gone).
 #
-# Fails CLOSED: `git apply --check` runs first for every patch (source series
-# first, in order) - if ANY check fails, we
-# stop before applying anything so the tree is never left half-patched. A
-# missing/empty series file, an unsafe dir/filename, or a `--check` failure
-# all exit non-zero.
+# Fails CLOSED: a sequential dry run (every patch, in series order, applied to a
+# throw-away copy of the index with `git apply --cached`) runs first - if ANY
+# patch fails there, we stop before applying anything so the tree is never left
+# half-patched. A missing/empty series file, an unsafe dir/filename, or a
+# dry-run failure all exit non-zero.
 #
 # usage: apply-series.sh <src_dir> <android|ios|win>
 # ("win" = Windows x64 desktop: the plain series, no LiveKit patch.)
@@ -127,15 +127,32 @@ fi
 
 echo "apply-series: $(wc -l < "$PLAN_TMP" | tr -d ' ') patch(es) planned for variant=$VARIANT"
 
-# --- pass 2: dry run every patch first (fail closed, nothing applied yet) --
-echo "::group::apply-series: git apply --check (dry run, all patches)"
-while IFS="$(printf '\t')" read -r root pf name; do
-  echo "-- check: $name  (root=$root)"
-  if ! git -C "$root" apply --check -v "$pf"; then
-    echo "::error::apply-series: --check failed for $name against $root - stopping before applying anything" >&2
-    exit 1
-  fi
-done < "$PLAN_TMP"
+# --- pass 2: dry run the WHOLE series first (fail closed, nothing applied) --
+# A plain `git apply --check` of every patch against the untouched tree cannot
+# work once two patches change the same file with overlapping context (P12 sits
+# on top of P1/P2/P3 in api/crypto/frame_crypto_transformer.{h,cc}). So the
+# series is applied IN ORDER to a throw-away COPY of each root's index
+# (`git apply --cached`); the working tree is not touched.
+echo "::group::apply-series: sequential dry run (git apply --cached on a throw-away index copy)"
+ROOTS_TMP=$(mktemp)
+cut -f1 "$PLAN_TMP" | awk '!seen[$0]++' > "$ROOTS_TMP"
+while IFS= read -r root; do
+  gitdir=$(git -C "$root" rev-parse --absolute-git-dir) || { echo "::error::apply-series: $root is not a git checkout" >&2; exit 1; }
+  [ -f "$gitdir/index" ] || { echo "::error::apply-series: no git index at $gitdir/index" >&2; exit 1; }
+  IDX=$(mktemp)
+  cp "$gitdir/index" "$IDX"
+  while IFS="$(printf '\t')" read -r r pf name; do
+    [ "$r" = "$root" ] || continue
+    echo "-- dry run: $name  (root=$root)"
+    if ! GIT_INDEX_FILE="$IDX" git -C "$root" apply --cached -v "$pf" < /dev/null; then
+      rm -f "$IDX" "$ROOTS_TMP"
+      echo "::error::apply-series: dry run failed for $name against $root (after the patches before it) - stopping before applying anything" >&2
+      exit 1
+    fi
+  done < "$PLAN_TMP"
+  rm -f "$IDX"
+done < "$ROOTS_TMP"
+rm -f "$ROOTS_TMP"
 echo "::endgroup::"
 
 # --- pass 3: real apply, in order ------------------------------------------

@@ -82,22 +82,23 @@ rtc_unittests, run by m150/ci/run-tests.sh as T7-T9 in both GN configs):
 
 
 diff --git a/api/crypto/BUILD.gn b/api/crypto/BUILD.gn
-index a455b74..b8ff536 100644
+index a455b74..d99082e 100644
 --- a/api/crypto/BUILD.gn
 +++ b/api/crypto/BUILD.gn
-@@ -105,6 +105,10 @@ if (rtc_include_tests) {
+@@ -105,6 +105,11 @@ if (rtc_include_tests) {
      deps = [
        ":crypto",
        ":frame_crypto_transformer",
 +      "..:frame_transformer_interface",
 +      "..:mock_transformable_audio_frame",
 +      "..:mock_transformable_video_frame",
++      "../../modules/rtp_rtcp:rtp_video_header",
 +      "../../rtc_base:threading",
        "//testing/gtest",
        "../../test:test_support",
      ]
 diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
-index 8671166..30bca2e 100644
+index 8671166..6eb3642 100644
 --- a/api/crypto/frame_crypto_transformer.cc
 +++ b/api/crypto/frame_crypto_transformer.cc
 @@ -21,11 +21,13 @@
@@ -443,7 +444,7 @@ index 8671166..30bca2e 100644
    return webrtc::Buffer(buf.Data(), buf.Length());
  }
  
-+// Q-Audion P12 (D7/§3.6): at most one line per 10 s per transformer, only
++// Q-Audion P12 (D7, design section 3.6): at most one line per 10 s per transformer, only
 +// when a drop counter moved. No ssrc, participant id, key index, key or IV.
 +// The literal "Q-AUDION frame-replay" is the build marker gates.sh (G3)
 +// checks for.
@@ -476,7 +477,7 @@ index 8671166..30bca2e 100644
    switch (algorithm_) {
      case Algorithm::kAesGcm:
 diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
-index 659fab4..d53c6a3 100644
+index 659fab4..da582f5 100644
 --- a/api/crypto/frame_crypto_transformer.h
 +++ b/api/crypto/frame_crypto_transformer.h
 @@ -18,7 +18,13 @@
@@ -493,7 +494,7 @@ index 659fab4..d53c6a3 100644
  
  #include "api/frame_transformer_interface.h"
  #include "api/make_ref_counted.h"
-@@ -50,14 +56,17 @@ struct KeyProviderOptions {
+@@ -50,22 +56,27 @@ struct KeyProviderOptions {
    int failure_tolerance;
    // key ring size should be between 1 and 255
    int key_ring_size;
@@ -511,9 +512,11 @@ index 659fab4..d53c6a3 100644
          key_ring_size(DEFAULT_KEYRING_SIZE),
 -        discard_frame_when_cryptor_not_ready(false),
          key_derivation_algorithm(kPBKDF2) {}
-   KeyProviderOptions(KeyProviderOptions& copy)
+-  KeyProviderOptions(KeyProviderOptions& copy)
++  KeyProviderOptions(const KeyProviderOptions& copy)
        : shared_key(copy.shared_key),
-@@ -66,6 +75,8 @@ struct KeyProviderOptions {
+         ratchet_salt(copy.ratchet_salt),
+         uncrypted_magic_bytes(copy.uncrypted_magic_bytes),
          ratchet_window_size(copy.ratchet_window_size),
          failure_tolerance(copy.failure_tolerance),
          key_ring_size(copy.key_ring_size),
@@ -701,7 +704,7 @@ index 659fab4..d53c6a3 100644
  
  class RTC_EXPORT EncryptedPacket : public webrtc::RefCountInterface {
 diff --git a/api/crypto/frame_crypto_transformer_unittest.cc b/api/crypto/frame_crypto_transformer_unittest.cc
-index de63b23..4c74187 100644
+index de63b23..f45f73a 100644
 --- a/api/crypto/frame_crypto_transformer_unittest.cc
 +++ b/api/crypto/frame_crypto_transformer_unittest.cc
 @@ -1,16 +1,293 @@
@@ -734,8 +737,8 @@ index de63b23..4c74187 100644
  
 +namespace {
 +
-+using Direction = TransformableFrameInterface::Direction;
-+using MediaType = FrameCryptorTransformer::MediaType;
++using FrameDirection = TransformableFrameInterface::Direction;
++using CryptorMediaType = FrameCryptorTransformer::MediaType;
 +
 +// 32-byte AES-256 key material. P1 refuses anything shorter.
 +std::vector<uint8_t> TestKey32(uint8_t seed = 0) {
@@ -832,13 +835,13 @@ index de63b23..4c74187 100644
 +};
 +
 +// The signaling thread the cryptors post observer callbacks to.
-+class SignalingThread {
++class ReplayTestThread {
 + public:
-+  SignalingThread() : thread_(Thread::Create()) {
++  ReplayTestThread() : thread_(Thread::Create()) {
 +    thread_->SetName("replay-signaling", nullptr);
 +    thread_->Start();
 +  }
-+  ~SignalingThread() { thread_->Stop(); }
++  ~ReplayTestThread() { thread_->Stop(); }
 +  Thread* get() { return thread_.get(); }
 +  // Everything posted before this call has run when it returns.
 +  void Flush() {
@@ -857,7 +860,7 @@ index de63b23..4c74187 100644
 +  TestAudioFrame(std::vector<uint8_t> data,
 +                 uint32_t ssrc,
 +                 uint32_t timestamp,
-+                 Direction direction)
++                 FrameDirection direction)
 +      : data_(std::move(data)),
 +        ssrc_(ssrc),
 +        timestamp_(timestamp),
@@ -868,13 +871,13 @@ index de63b23..4c74187 100644
 +  }
 +  uint32_t GetSsrc() const override { return ssrc_; }
 +  uint32_t GetTimestamp() const override { return timestamp_; }
-+  Direction GetDirection() const override { return direction_; }
++  FrameDirection GetDirection() const override { return direction_; }
 +
 + private:
 +  std::vector<uint8_t> data_;
 +  uint32_t ssrc_;
 +  uint32_t timestamp_;
-+  Direction direction_;
++  FrameDirection direction_;
 +};
 +
 +class TestVideoFrame : public MockTransformableVideoFrame {
@@ -882,7 +885,7 @@ index de63b23..4c74187 100644
 +  TestVideoFrame(std::vector<uint8_t> data,
 +                 uint32_t ssrc,
 +                 uint32_t timestamp,
-+                 Direction direction,
++                 FrameDirection direction,
 +                 VideoCodecType codec,
 +                 bool key_frame)
 +      : data_(std::move(data)),
@@ -898,7 +901,7 @@ index de63b23..4c74187 100644
 +  }
 +  uint32_t GetSsrc() const override { return ssrc_; }
 +  uint32_t GetTimestamp() const override { return timestamp_; }
-+  Direction GetDirection() const override { return direction_; }
++  FrameDirection GetDirection() const override { return direction_; }
 +  bool IsKeyFrame() const override { return key_frame_; }
 +  RTPVideoHeader& header() const override { return header_; }
 +
@@ -906,7 +909,7 @@ index de63b23..4c74187 100644
 +  std::vector<uint8_t> data_;
 +  uint32_t ssrc_;
 +  uint32_t timestamp_;
-+  Direction direction_;
++  FrameDirection direction_;
 +  bool key_frame_;
 +  mutable RTPVideoHeader header_;
 +};
@@ -915,7 +918,7 @@ index de63b23..4c74187 100644
 +struct Cryptor {
 +  Cryptor(Thread* signaling,
 +          const std::string& participant_id,
-+          MediaType type,
++          CryptorMediaType type,
 +          scoped_refptr<KeyProvider> provider,
 +          int key_index,
 +          uint32_t video_ssrc = 0) {
@@ -927,7 +930,7 @@ index de63b23..4c74187 100644
 +    transformer->SetKeyIndex(key_index);
 +    transformer->RegisterFrameCryptorTransformerObserver(observer);
 +    FrameTransformerInterface* iface = transformer.get();
-+    if (type == MediaType::kAudioFrame) {
++    if (type == CryptorMediaType::kAudioFrame) {
 +      iface->RegisterTransformedFrameCallback(sink);
 +    } else {
 +      iface->RegisterTransformedFrameSinkCallback(sink, video_ssrc);
@@ -958,7 +961,7 @@ index de63b23..4c74187 100644
 +               const std::vector<uint8_t>& data,
 +               uint32_t ssrc,
 +               uint32_t timestamp,
-+               Direction direction) {
++               FrameDirection direction) {
 +  c.Feed(std::make_unique<TestAudioFrame>(data, ssrc, timestamp, direction));
 +}
 +
@@ -968,7 +971,7 @@ index de63b23..4c74187 100644
 +                               uint32_t ssrc,
 +                               uint32_t timestamp) {
 +  const size_t before = tx.sink->Count();
-+  FeedAudio(tx, plain, ssrc, timestamp, Direction::kSender);
++  FeedAudio(tx, plain, ssrc, timestamp, FrameDirection::kSender);
 +  EXPECT_TRUE(tx.sink->WaitForCount(before + 1));
 +  return tx.sink->Frame(before);
 +}
@@ -1424,13 +1427,13 @@ index de63b23..4c74187 100644
 +// ---------------------------------------------------------------------------
 +
 +TEST(FrameCryptorReplay, AudioRoundTripAndIvLayout) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("alice", 3, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("alice", 3, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "alice", MediaType::kAudioFrame, tx_provider, 3);
-+  Cryptor rx(signaling.get(), "alice", MediaType::kAudioFrame, rx_provider, 3);
++  Cryptor tx(signaling.get(), "alice", CryptorMediaType::kAudioFrame, tx_provider, 3);
++  Cryptor rx(signaling.get(), "alice", CryptorMediaType::kAudioFrame, rx_provider, 3);
 +
 +  const uint32_t ssrc = 0x11223344u;
 +  const uint32_t ts0 = 4294967000u;  // the RTP timestamp wraps at i = 1
@@ -1447,7 +1450,7 @@ index de63b23..4c74187 100644
 +    EXPECT_EQ(Be32(iv, 4), ts);
 +    EXPECT_EQ(Be32(iv, 8), ts - i);  // counter = i, full width, mod 2^32
 +
-+    FeedAudio(rx, wire, ssrc, ts, Direction::kReceiver);
++    FeedAudio(rx, wire, ssrc, ts, FrameDirection::kReceiver);
 +    ASSERT_TRUE(rx.sink->WaitForCount(i + 1));
 +    EXPECT_EQ(rx.sink->Frame(i), plain);
 +  }
@@ -1457,22 +1460,22 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, Vp8KeyAndDeltaFramesRoundTrip) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("bob", 1, TestKey32(5)));
 +  ASSERT_TRUE(rx_provider->SetKey("bob", 1, TestKey32(5)));
 +  const uint32_t ssrc = 0x01020304u;
-+  Cryptor tx(signaling.get(), "bob", MediaType::kVideoFrame, tx_provider, 1,
++  Cryptor tx(signaling.get(), "bob", CryptorMediaType::kVideoFrame, tx_provider, 1,
 +             ssrc);
-+  Cryptor rx(signaling.get(), "bob", MediaType::kVideoFrame, rx_provider, 1,
++  Cryptor rx(signaling.get(), "bob", CryptorMediaType::kVideoFrame, rx_provider, 1,
 +             ssrc);
 +  for (int i = 0; i < 4; ++i) {
 +    const bool key_frame = (i % 2) == 0;
 +    const size_t clear = key_frame ? 10 : 3;
 +    std::vector<uint8_t> plain = AudioPayload(120, static_cast<uint8_t>(i + 9));
 +    const uint32_t ts = 90000 * (i + 1);
-+    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, Direction::kSender,
++    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, FrameDirection::kSender,
 +                                             VideoCodecType::kVideoCodecVP8,
 +                                             key_frame));
 +    ASSERT_TRUE(tx.sink->WaitForCount(i + 1));
@@ -1481,7 +1484,7 @@ index de63b23..4c74187 100644
 +    EXPECT_TRUE(std::equal(plain.begin(), plain.begin() + clear, wire.begin()));
 +    EXPECT_EQ(Be32(IvOf(wire), 8), ts - static_cast<uint32_t>(i));
 +
-+    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, Direction::kReceiver,
++    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, FrameDirection::kReceiver,
 +                                             VideoCodecType::kVideoCodecVP8,
 +                                             key_frame));
 +    ASSERT_TRUE(rx.sink->WaitForCount(i + 1));
@@ -1495,20 +1498,20 @@ index de63b23..4c74187 100644
 +// a receiver that reads the IV before unescaping reads a shifted IV and the
 +// frame never decrypts.
 +TEST(FrameCryptorReplay, H264FrameWhoseIvNeedsEscapingDecrypts) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("carol", 2, TestKey32(7)));
 +  ASSERT_TRUE(rx_provider->SetKey("carol", 2, TestKey32(7)));
 +  const uint32_t ssrc = 0x00000001u;
-+  Cryptor tx(signaling.get(), "carol", MediaType::kVideoFrame, tx_provider, 2,
++  Cryptor tx(signaling.get(), "carol", CryptorMediaType::kVideoFrame, tx_provider, 2,
 +             ssrc);
-+  Cryptor rx(signaling.get(), "carol", MediaType::kVideoFrame, rx_provider, 2,
++  Cryptor rx(signaling.get(), "carol", CryptorMediaType::kVideoFrame, rx_provider, 2,
 +             ssrc);
 +  for (int i = 0; i < 3; ++i) {
 +    const std::vector<uint8_t> plain = H264Idr(100, static_cast<uint8_t>(i));
 +    const uint32_t ts = 0x00000100u + i;  // 00 00 01 00 / 00 00 01 01 ...
-+    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, Direction::kSender,
++    tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, ts, FrameDirection::kSender,
 +                                             VideoCodecType::kVideoCodecH264,
 +                                             true));
 +    ASSERT_TRUE(tx.sink->WaitForCount(i + 1));
@@ -1518,7 +1521,7 @@ index de63b23..4c74187 100644
 +    EXPECT_GT(wire.size(), plain.size() + 16 + 12 + 2);
 +    EXPECT_TRUE(ContainsEmulationPrevention(wire, 6));
 +
-+    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, Direction::kReceiver,
++    rx.Feed(std::make_unique<TestVideoFrame>(wire, ssrc, ts, FrameDirection::kReceiver,
 +                                             VideoCodecType::kVideoCodecH264,
 +                                             true));
 +    ASSERT_TRUE(rx.sink->WaitForCount(i + 1)) << "frame " << i;
@@ -1529,23 +1532,23 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, H264FrameWithPlainIvRoundTrips) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("dave", 0, TestKey32(8)));
 +  ASSERT_TRUE(rx_provider->SetKey("dave", 0, TestKey32(8)));
 +  const uint32_t ssrc = 0x7A7B7C7Du;
-+  Cryptor tx(signaling.get(), "dave", MediaType::kVideoFrame, tx_provider, 0,
++  Cryptor tx(signaling.get(), "dave", CryptorMediaType::kVideoFrame, tx_provider, 0,
 +             ssrc);
-+  Cryptor rx(signaling.get(), "dave", MediaType::kVideoFrame, rx_provider, 0,
++  Cryptor rx(signaling.get(), "dave", CryptorMediaType::kVideoFrame, rx_provider, 0,
 +             ssrc);
 +  const std::vector<uint8_t> plain = H264Idr(300, 4);
-+  tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, 123456, Direction::kSender,
++  tx.Feed(std::make_unique<TestVideoFrame>(plain, ssrc, 123456, FrameDirection::kSender,
 +                                           VideoCodecType::kVideoCodecH264,
 +                                           true));
 +  ASSERT_TRUE(tx.sink->WaitForCount(1));
 +  rx.Feed(std::make_unique<TestVideoFrame>(tx.sink->Frame(0), ssrc, 123456,
-+                                           Direction::kReceiver,
++                                           FrameDirection::kReceiver,
 +                                           VideoCodecType::kVideoCodecH264,
 +                                           true));
 +  ASSERT_TRUE(rx.sink->WaitForCount(1));
@@ -1553,23 +1556,23 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, DuplicateIsDroppedSilently) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("erin", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("erin", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "erin", MediaType::kAudioFrame, tx_provider, 0);
-+  Cryptor rx(signaling.get(), "erin", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor tx(signaling.get(), "erin", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "erin", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x0A0B0C0Du;
 +  const auto p0 = AudioPayload(30, 1);
 +  const auto p1 = AudioPayload(30, 2);
 +  const auto w0 = SealAudio(tx, p0, ssrc, 1000);
 +  const auto w1 = SealAudio(tx, p1, ssrc, 1960);
 +
-+  FeedAudio(rx, w0, ssrc, 1000, Direction::kReceiver);
-+  FeedAudio(rx, w0, ssrc, 1000, Direction::kReceiver);  // exact duplicate
-+  FeedAudio(rx, w0, ssrc, 99999, Direction::kReceiver);  // rewritten metadata
-+  FeedAudio(rx, w1, ssrc, 1960, Direction::kReceiver);
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);  // exact duplicate
++  FeedAudio(rx, w0, ssrc, 99999, FrameDirection::kReceiver);  // rewritten metadata
++  FeedAudio(rx, w1, ssrc, 1960, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.sink->WaitForCount(2));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Count(), 2u);
@@ -1583,13 +1586,13 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, ReorderedFramesInsideTheWindowAreAcceptedOnce) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("fay", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("fay", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "fay", MediaType::kAudioFrame, tx_provider, 0);
-+  Cryptor rx(signaling.get(), "fay", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor tx(signaling.get(), "fay", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "fay", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x0F0E0D0Cu;
 +  std::vector<std::vector<uint8_t>> plains;
 +  std::vector<std::vector<uint8_t>> wires;
@@ -1600,13 +1603,13 @@ index de63b23..4c74187 100644
 +  const size_t order[] = {0, 2, 1, 4, 3, 9, 8, 7, 6, 5};
 +  size_t expected = 0;
 +  for (size_t idx : order) {
-+    FeedAudio(rx, wires[idx], ssrc, 5000, Direction::kReceiver);
++    FeedAudio(rx, wires[idx], ssrc, 5000, FrameDirection::kReceiver);
 +    ++expected;
 +    ASSERT_TRUE(rx.sink->WaitForCount(expected));
 +    EXPECT_EQ(rx.sink->Frame(expected - 1), plains[idx]);
 +  }
-+  FeedAudio(rx, wires[5], ssrc, 5000, Direction::kReceiver);  // late duplicate
-+  FeedAudio(rx, wires[10], ssrc, 5000, Direction::kReceiver);  // new frame
++  FeedAudio(rx, wires[5], ssrc, 5000, FrameDirection::kReceiver);  // late duplicate
++  FeedAudio(rx, wires[10], ssrc, 5000, FrameDirection::kReceiver);  // new frame
 +  ASSERT_TRUE(rx.sink->WaitForCount(expected + 1));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Count(), expected + 1);
@@ -1614,13 +1617,13 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, FramesOlderThanTheWindowAreDropped) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("gus", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("gus", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "gus", MediaType::kAudioFrame, tx_provider, 0);
-+  Cryptor rx(signaling.get(), "gus", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor tx(signaling.get(), "gus", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "gus", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x12121212u;
 +  std::vector<std::vector<uint8_t>> plains;
 +  std::vector<std::vector<uint8_t>> wires;
@@ -1628,10 +1631,10 @@ index de63b23..4c74187 100644
 +    plains.push_back(AudioPayload(20, static_cast<uint8_t>(i)));
 +    wires.push_back(SealAudio(tx, plains.back(), ssrc, 960 * i));
 +  }
-+  FeedAudio(rx, wires[299], ssrc, 0, Direction::kReceiver);  // top = 299
-+  FeedAudio(rx, wires[0], ssrc, 0, Direction::kReceiver);    // 299 behind: old
-+  FeedAudio(rx, wires[43], ssrc, 0, Direction::kReceiver);   // 256 behind: old
-+  FeedAudio(rx, wires[44], ssrc, 0, Direction::kReceiver);   // 255 behind: ok
++  FeedAudio(rx, wires[299], ssrc, 0, FrameDirection::kReceiver);  // top = 299
++  FeedAudio(rx, wires[0], ssrc, 0, FrameDirection::kReceiver);    // 299 behind: old
++  FeedAudio(rx, wires[43], ssrc, 0, FrameDirection::kReceiver);   // 256 behind: old
++  FeedAudio(rx, wires[44], ssrc, 0, FrameDirection::kReceiver);   // 255 behind: ok
 +  ASSERT_TRUE(rx.sink->WaitForCount(2));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Count(), 2u);
@@ -1642,26 +1645,26 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, SecondReceiverOfTheSameParticipantDropsTheReplay) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("hal", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("hal", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "hal", MediaType::kAudioFrame, tx_provider, 0);
++  Cryptor tx(signaling.get(), "hal", CryptorMediaType::kAudioFrame, tx_provider, 0);
 +  // Two receiver cryptors bound to the SAME participant (another mid, or a
 +  // re-created cryptor): they share the handler, hence the window.
-+  Cryptor rx_a(signaling.get(), "hal", MediaType::kAudioFrame, rx_provider, 0);
-+  Cryptor rx_b(signaling.get(), "hal", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor rx_a(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  Cryptor rx_b(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x33445566u;
 +  const auto p0 = AudioPayload(26, 1);
 +  const auto p1 = AudioPayload(26, 2);
 +  const auto w0 = SealAudio(tx, p0, ssrc, 100);
 +  const auto w1 = SealAudio(tx, p1, ssrc, 1060);
 +
-+  FeedAudio(rx_a, w0, ssrc, 100, Direction::kReceiver);
++  FeedAudio(rx_a, w0, ssrc, 100, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx_a.sink->WaitForCount(1));
-+  FeedAudio(rx_b, w0, ssrc, 100, Direction::kReceiver);  // replay onto "mid 2"
-+  FeedAudio(rx_b, w1, ssrc, 1060, Direction::kReceiver);
++  FeedAudio(rx_b, w0, ssrc, 100, FrameDirection::kReceiver);  // replay onto "mid 2"
++  FeedAudio(rx_b, w1, ssrc, 1060, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx_b.sink->WaitForCount(1));
 +  signaling.Flush();
 +  EXPECT_EQ(rx_b.sink->Count(), 1u);
@@ -1670,23 +1673,23 @@ index de63b23..4c74187 100644
 +  EXPECT_EQ(rx_a.observer->CountOf(FrameCryptionState::kDecryptionFailed), 0u);
 +
 +  // A brand-new receiver cryptor on the same provider is covered as well.
-+  Cryptor rx_c(signaling.get(), "hal", MediaType::kAudioFrame, rx_provider, 0);
-+  FeedAudio(rx_c, w1, ssrc, 1060, Direction::kReceiver);
++  Cryptor rx_c(signaling.get(), "hal", CryptorMediaType::kAudioFrame, rx_provider, 0);
++  FeedAudio(rx_c, w1, ssrc, 1060, FrameDirection::kReceiver);
 +  const auto w2 = SealAudio(tx, AudioPayload(26, 3), ssrc, 2020);
-+  FeedAudio(rx_c, w2, ssrc, 2020, Direction::kReceiver);
++  FeedAudio(rx_c, w2, ssrc, 2020, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx_c.sink->WaitForCount(1));
 +  signaling.Flush();
 +  EXPECT_EQ(rx_c.sink->Count(), 1u);
 +}
 +
 +TEST(FrameCryptorReplay, ForgedFramesNeitherAdvanceNorCreateAWindow) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("ivy", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("ivy", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "ivy", MediaType::kAudioFrame, tx_provider, 0);
-+  Cryptor rx(signaling.get(), "ivy", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor tx(signaling.get(), "ivy", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "ivy", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x21436587u;
 +  const auto p0 = AudioPayload(30, 1);
 +  const auto p1 = AudioPayload(30, 2);
@@ -1697,11 +1700,11 @@ index de63b23..4c74187 100644
 +  // no window may be created.
 +  std::vector<uint8_t> tampered = w0;
 +  tampered[3] ^= 0x40;
-+  FeedAudio(rx, tampered, ssrc, 1000, Direction::kReceiver);
++  FeedAudio(rx, tampered, ssrc, 1000, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.observer->WaitFor(FrameCryptionState::kDecryptionFailed));
 +  EXPECT_EQ(rx_provider->GetKey("ivy")->ReplayWindowCountForTesting(), 0u);
 +
-+  FeedAudio(rx, w0, ssrc, 1000, Direction::kReceiver);
++  FeedAudio(rx, w0, ssrc, 1000, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.sink->WaitForCount(1));
 +  EXPECT_EQ(rx_provider->GetKey("ivy")->ReplayWindowCountForTesting(), 1u);
 +
@@ -1710,8 +1713,8 @@ index de63b23..4c74187 100644
 +  std::vector<uint8_t> forged = w1;
 +  const size_t w2_off = forged.size() - 14 + 4;
 +  forged[w2_off] ^= 0x80;  // word 2 += 2^31, word 3 unchanged
-+  FeedAudio(rx, forged, ssrc, 1960, Direction::kReceiver);
-+  FeedAudio(rx, w1, ssrc, 1960, Direction::kReceiver);  // genuine counter 1
++  FeedAudio(rx, forged, ssrc, 1960, FrameDirection::kReceiver);
++  FeedAudio(rx, w1, ssrc, 1960, FrameDirection::kReceiver);  // genuine counter 1
 +  ASSERT_TRUE(rx.sink->WaitForCount(2));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Frame(1), p1);
@@ -1719,16 +1722,16 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, SharedKeyReflectionOfOwnFramesIsDropped) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  // Shared-key mode: sender and receiver cryptors of one call bind the SAME
 +  // participant id, hence the same handler (and the same key).
 +  auto local = MakeHkdfProvider(true);
 +  auto remote = MakeHkdfProvider(true);
 +  ASSERT_TRUE(local->SetSharedKey(0, TestKey32(4)));
 +  ASSERT_TRUE(remote->SetSharedKey(0, TestKey32(4)));
-+  Cryptor tx(signaling.get(), "peer", MediaType::kAudioFrame, local, 0);
-+  Cryptor rx(signaling.get(), "peer", MediaType::kAudioFrame, local, 0);
-+  Cryptor remote_tx(signaling.get(), "peer", MediaType::kAudioFrame, remote, 0);
++  Cryptor tx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, local, 0);
++  Cryptor rx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, local, 0);
++  Cryptor remote_tx(signaling.get(), "peer", CryptorMediaType::kAudioFrame, remote, 0);
 +
 +  const uint32_t own_ssrc = 0x11111111u;
 +  const uint32_t peer_ssrc = 0x22222222u;
@@ -1739,8 +1742,8 @@ index de63b23..4c74187 100644
 +
 +  // The attacker reflects our own frame back at us: it decrypts (same key) but
 +  // must be rejected. A genuine frame of the peer still gets through.
-+  FeedAudio(rx, own_wire, own_ssrc, 700, Direction::kReceiver);
-+  FeedAudio(rx, peer_wire, peer_ssrc, 700, Direction::kReceiver);
++  FeedAudio(rx, own_wire, own_ssrc, 700, FrameDirection::kReceiver);
++  FeedAudio(rx, peer_wire, peer_ssrc, 700, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.sink->WaitForCount(1));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Count(), 1u);
@@ -1751,28 +1754,28 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, CounterContinuesWhenTheSenderCryptorIsRecreated) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("jo", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("jo", 0, TestKey32(1)));
-+  Cryptor rx(signaling.get(), "jo", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor rx(signaling.get(), "jo", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x0000A1B2u;
 +  std::vector<std::vector<uint8_t>> wires;
 +  {
-+    Cryptor tx1(signaling.get(), "jo", MediaType::kAudioFrame, tx_provider, 0);
++    Cryptor tx1(signaling.get(), "jo", CryptorMediaType::kAudioFrame, tx_provider, 0);
 +    for (uint32_t i = 0; i < 3; ++i) {
 +      wires.push_back(SealAudio(tx1, AudioPayload(22, 1), ssrc, 8000 + 960 * i));
 +    }
 +  }  // sender cryptor destroyed; the provider (and its counters) lives on
-+  Cryptor tx2(signaling.get(), "jo", MediaType::kAudioFrame, tx_provider, 0);
++  Cryptor tx2(signaling.get(), "jo", CryptorMediaType::kAudioFrame, tx_provider, 0);
 +  for (uint32_t i = 3; i < 6; ++i) {
 +    wires.push_back(SealAudio(tx2, AudioPayload(22, 2), ssrc, 8000 + 960 * i));
 +  }
 +  for (uint32_t i = 0; i < 6; ++i) {
 +    const std::vector<uint8_t> iv = IvOf(wires[i]);
 +    EXPECT_EQ(Be32(iv, 4) - Be32(iv, 8), i) << "counter of frame " << i;
-+    FeedAudio(rx, wires[i], ssrc, 0, Direction::kReceiver);
++    FeedAudio(rx, wires[i], ssrc, 0, FrameDirection::kReceiver);
 +  }
 +  ASSERT_TRUE(rx.sink->WaitForCount(6));
 +  signaling.Flush();
@@ -1781,13 +1784,13 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, CounterExhaustionDropsTheFrameAndReportsOnce) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("kim", 0, TestKey32(1)));
 +  ASSERT_TRUE(rx_provider->SetKey("kim", 0, TestKey32(1)));
-+  Cryptor tx(signaling.get(), "kim", MediaType::kAudioFrame, tx_provider, 0);
-+  Cryptor rx(signaling.get(), "kim", MediaType::kAudioFrame, rx_provider, 0);
++  Cryptor tx(signaling.get(), "kim", CryptorMediaType::kAudioFrame, tx_provider, 0);
++  Cryptor rx(signaling.get(), "kim", CryptorMediaType::kAudioFrame, rx_provider, 0);
 +  const uint32_t ssrc = 0x5A5A5A5Au;
 +  tx_provider->GetKey("kim")->SetSendCounterForTesting(ssrc, 0xFFFFFFFEu);
 +
@@ -1799,8 +1802,8 @@ index de63b23..4c74187 100644
 +  EXPECT_EQ(Be32(IvOf(wb), 4) - Be32(IvOf(wb), 8), 0xFFFFFFFFu);
 +
 +  // Exhausted: dropped, nothing reaches the sink, kEncryptionFailed once.
-+  FeedAudio(tx, AudioPayload(20, 3), ssrc, 300, Direction::kSender);
-+  FeedAudio(tx, AudioPayload(20, 4), ssrc, 400, Direction::kSender);
++  FeedAudio(tx, AudioPayload(20, 3), ssrc, 300, FrameDirection::kSender);
++  FeedAudio(tx, AudioPayload(20, 4), ssrc, 400, FrameDirection::kSender);
 +  ASSERT_TRUE(tx.observer->WaitFor(FrameCryptionState::kEncryptionFailed));
 +  signaling.Flush();
 +  EXPECT_EQ(tx.sink->Count(), 2u);
@@ -1808,14 +1811,14 @@ index de63b23..4c74187 100644
 +  EXPECT_GE(tx_provider->GetKey("kim")->GetReplayCounters().exhausted, 1u);
 +
 +  // The last two counters are valid on the receiver (window top = 2^32 - 1).
-+  FeedAudio(rx, wa, ssrc, 100, Direction::kReceiver);
-+  FeedAudio(rx, wb, ssrc, 200, Direction::kReceiver);
-+  FeedAudio(rx, wb, ssrc, 200, Direction::kReceiver);
-+  FeedAudio(rx, wa, ssrc, 100, Direction::kReceiver);
++  FeedAudio(rx, wa, ssrc, 100, FrameDirection::kReceiver);
++  FeedAudio(rx, wb, ssrc, 200, FrameDirection::kReceiver);
++  FeedAudio(rx, wb, ssrc, 200, FrameDirection::kReceiver);
++  FeedAudio(rx, wa, ssrc, 100, FrameDirection::kReceiver);
 +  // A frame of another ssrc (own counter 0) closes the sequence.
 +  const auto ps = AudioPayload(20, 5);
 +  const auto ws = SealAudio(tx, ps, ssrc + 1, 500);
-+  FeedAudio(rx, ws, ssrc + 1, 500, Direction::kReceiver);
++  FeedAudio(rx, ws, ssrc + 1, 500, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.sink->WaitForCount(3));
 +  signaling.Flush();
 +  EXPECT_EQ(rx.sink->Count(), 3u);
@@ -1825,15 +1828,15 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorReplay, KeySwitchKeepsTheWindowAndLateOldSlotFramesAreAccepted) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  auto tx_provider = MakeHkdfProvider(false);
 +  auto rx_provider = MakeHkdfProvider(false);
 +  ASSERT_TRUE(tx_provider->SetKey("lee", 1, TestKey32(10)));
 +  ASSERT_TRUE(tx_provider->SetKey("lee", 2, TestKey32(20)));
 +  ASSERT_TRUE(rx_provider->SetKey("lee", 1, TestKey32(10)));
 +  ASSERT_TRUE(rx_provider->SetKey("lee", 2, TestKey32(20)));
-+  Cryptor tx(signaling.get(), "lee", MediaType::kAudioFrame, tx_provider, 1);
-+  Cryptor rx(signaling.get(), "lee", MediaType::kAudioFrame, rx_provider, 1);
++  Cryptor tx(signaling.get(), "lee", CryptorMediaType::kAudioFrame, tx_provider, 1);
++  Cryptor rx(signaling.get(), "lee", CryptorMediaType::kAudioFrame, rx_provider, 1);
 +  const uint32_t ssrc = 0x0BADF00Du;
 +  std::vector<std::vector<uint8_t>> plains;
 +  std::vector<std::vector<uint8_t>> wires;
@@ -1853,17 +1856,17 @@ index de63b23..4c74187 100644
 +  const size_t order[] = {2, 3, 0, 1};  // slot-2 frames first, then late slot-1
 +  size_t expected = 0;
 +  for (size_t idx : order) {
-+    FeedAudio(rx, wires[idx], ssrc, 0, Direction::kReceiver);
++    FeedAudio(rx, wires[idx], ssrc, 0, FrameDirection::kReceiver);
 +    ++expected;
 +    ASSERT_TRUE(rx.sink->WaitForCount(expected));
 +    EXPECT_EQ(rx.sink->Frame(expected - 1), plains[idx]);
 +  }
-+  FeedAudio(rx, wires[1], ssrc, 0, Direction::kReceiver);  // replay: dropped
++  FeedAudio(rx, wires[1], ssrc, 0, FrameDirection::kReceiver);  // replay: dropped
 +  signaling.Flush();
 +  // Wait until the drop was processed via a sentinel frame.
 +  const auto sentinel_plain = AudioPayload(24, 99);
 +  const auto sentinel = SealAudio(tx, sentinel_plain, ssrc, 100 + 960 * 4);
-+  FeedAudio(rx, sentinel, ssrc, 0, Direction::kReceiver);
++  FeedAudio(rx, sentinel, ssrc, 0, FrameDirection::kReceiver);
 +  ASSERT_TRUE(rx.sink->WaitForCount(expected + 1));
 +  EXPECT_EQ(rx.sink->Count(), expected + 1);
 +
@@ -1915,14 +1918,14 @@ index de63b23..4c74187 100644
 +  return out;
 +}
 +
-+MediaType KatMediaType(const KatFrame& f) {
-+  return f.codec == kKatOpus ? MediaType::kAudioFrame : MediaType::kVideoFrame;
++CryptorMediaType KatMediaType(const KatFrame& f) {
++  return f.codec == kKatOpus ? CryptorMediaType::kAudioFrame : CryptorMediaType::kVideoFrame;
 +}
 +
 +std::unique_ptr<TransformableFrameInterface> KatMakeFrame(
 +    const KatFrame& f,
 +    std::vector<uint8_t> data,
-+    Direction direction) {
++    FrameDirection direction) {
 +  if (f.codec == kKatOpus) {
 +    return std::make_unique<TestAudioFrame>(std::move(data), f.ssrc, f.rtp_ts,
 +                                            direction);
@@ -1943,7 +1946,7 @@ index de63b23..4c74187 100644
 +  provider->SetKey(f.participant, f.key_index, FromHex(f.key_hex));
 +  Cryptor rx(signaling, f.participant, KatMediaType(f), provider, f.key_index,
 +             f.ssrc);
-+  rx.Feed(KatMakeFrame(f, wire, Direction::kReceiver));
++  rx.Feed(KatMakeFrame(f, wire, FrameDirection::kReceiver));
 +  if (!rx.sink->WaitForCount(1, 10000)) {
 +    return false;
 +  }
@@ -1960,7 +1963,7 @@ index de63b23..4c74187 100644
 +  provider->GetKey(f.participant)->SetSendCounterForTesting(f.ssrc, f.counter);
 +  Cryptor tx(signaling, f.participant, KatMediaType(f), provider, f.key_index,
 +             f.ssrc);
-+  tx.Feed(KatMakeFrame(f, FromHex(f.plaintext_hex), Direction::kSender));
++  tx.Feed(KatMakeFrame(f, FromHex(f.plaintext_hex), FrameDirection::kSender));
 +  if (!tx.sink->WaitForCount(1, 10000)) {
 +    return false;
 +  }
@@ -1993,7 +1996,7 @@ index de63b23..4c74187 100644
 +//   missing_key    -> observer kMissingKey
 +//   duplicate / too_old / reflected / cap -> the matching handler counter moves
 +//                     and NOTHING else happens (no state, no output).
-+std::string KatClassify(SignalingThread& signaling,
++std::string KatClassify(ReplayTestThread& signaling,
 +                        scoped_refptr<DefaultKeyProviderImpl> provider,
 +                        const std::string& participant,
 +                        const KatFrame& f,
@@ -2006,7 +2009,7 @@ index de63b23..4c74187 100644
 +    before = handler->GetReplayCounters();
 +  }
 +  Cryptor rx(signaling.get(), participant, KatMediaType(f), provider, 0, f.ssrc);
-+  rx.Feed(KatMakeFrame(f, wire, Direction::kReceiver));
++  rx.Feed(KatMakeFrame(f, wire, FrameDirection::kReceiver));
 +  std::string verdict = "timeout";
 +  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 +  while (std::chrono::steady_clock::now() < deadline) {
@@ -2085,7 +2088,7 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorKat, EveryCaseOpensToThePlaintext) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  for (const KatFrame& f : kKatCases) {
 +    std::vector<uint8_t> plain;
 +    ASSERT_TRUE(KatOpen(signaling.get(), f, FromHex(f.wire_hex), &plain)) << f.id;
@@ -2094,7 +2097,7 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorKat, EveryCaseResealsByteForByte) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  for (const KatFrame& f : kKatCases) {
 +    std::vector<uint8_t> wire;
 +    ASSERT_TRUE(KatSeal(signaling.get(), f, &wire)) << f.id;
@@ -2103,7 +2106,7 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorKat, CounterCasesOpenAndResealByteForByte) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  for (const KatFrame& f : kKatCounterCases) {
 +    std::vector<uint8_t> plain;
 +    ASSERT_TRUE(KatOpen(signaling.get(), f, FromHex(f.wire_hex), &plain)) << f.id;
@@ -2124,7 +2127,7 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorKat, RingScenarios) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  std::vector<std::pair<int, std::string>> installed;
 +  int current = -1;
 +  for (const KatRingStep& s : kKatRingSteps) {
@@ -2160,7 +2163,7 @@ index de63b23..4c74187 100644
 +}
 +
 +TEST(FrameCryptorKat, ReplayScenarios) {
-+  SignalingThread signaling;
++  ReplayTestThread signaling;
 +  for (size_t si = 0; si < std::size(kKatScenarios); ++si) {
 +    const KatScenario& sc = kKatScenarios[si];
 +    auto provider = MakeHkdfProvider(false);
