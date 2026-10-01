@@ -138,11 +138,31 @@ def main():
     if r.returncode != 0:
         die("LINK failed (webrtc.lib + libcxx.lib + system libs do not link a consumer)")
 
-    r = run([exe], capture_output=True, text=True, timeout=240)
-    sys.stdout.write(r.stdout)
-    sys.stderr.write(r.stderr[-4000:])
-    if r.returncode != 0 or "[smoke] SMOKE-OK" not in r.stdout:
-        die("the program did not pass (exit %d)" % r.returncode)
+    # Own deadline: a hang must still show everything the program printed.
+    print("+ " + exe, flush=True)
+    p = subprocess.Popen([exe], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors="replace")
+    timed_out = False
+    try:
+        out, _ = p.communicate(timeout=150)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        p.kill()
+        out, _ = p.communicate()
+    lines = out.splitlines()
+    # smoke verdict lines first, then the tail of the library log
+    for l in lines:
+        if l.startswith("[smoke]"):
+            print(l)
+    tail = [l for l in lines if not l.startswith("[smoke]")][-80:]
+    if tail:
+        print("--- library log (last %d lines) ---" % len(tail))
+        for l in tail:
+            print(l)
+    if timed_out:
+        die("the program hung (killed after 150 s)")
+    if p.returncode != 0 or "[smoke] SMOKE-OK" not in out:
+        die("the program did not pass (exit %d)" % p.returncode)
     print("link-smoke: PASS")
     return 0
 
