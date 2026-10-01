@@ -82,6 +82,27 @@ jobs:
           # The hosted runner has no GPU: a hardware encode must not be reported.
           if ($rep.summary.hevc_hardware_encode_720p_ok) { throw 'unexpected hardware encode on the hosted runner' }
 
+      - name: Self-test of the encode and decode machinery (same pipeline, H.264)
+        shell: pwsh
+        run: |
+          # The hosted runner has no HEVC MFT, so the real encode and decode
+          # code path would go untested. The same pipeline run on H.264
+          # (software MFTs, in-box on desktop Windows) exercises it.
+          build/Release/hevc-probe.exe --codec h264 --out h264-selftest.json | Out-File -Encoding utf8 h264-selftest.json
+          $rep = Get-Content h264-selftest.json -Raw | ConvertFrom-Json
+          $rep.summary | Format-List
+          $rep.tests | Format-Table role, kind, mft, resolution, mode, d3d11_manager, ok, failed_stage, hresult, frames_in, frames_out, fps
+          $rep.tests | Where-Object { $_.notes } | ForEach-Object { $_.mft; $_.notes }
+          $enc = @($rep.encoders.mfts).Count
+          $dec = @($rep.decoders.mfts).Count
+          Write-Host "h264 encoder MFTs: $enc, decoder MFTs: $dec"
+          if ($enc -gt 0 -and $dec -gt 0) {
+            if (-not $rep.summary.h264_any_encode_720p_ok) { throw 'self-test: encode failed' }
+            if (-not $rep.summary.h264_decode_720p_ok) { throw 'self-test: decode failed' }
+          } else {
+            Write-Host '::warning::no H.264 MFT on this runner image: the encode/decode path was not exercised'
+          }
+
       - name: Collect the artifact files
         shell: pwsh
         run: |

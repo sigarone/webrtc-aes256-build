@@ -15,7 +15,9 @@
 
 #include <windows.h>
 
+#include <fcntl.h>
 #include <intrin.h>
+#include <io.h>
 
 #include <d3d11_4.h>
 #include <dxgi1_4.h>
@@ -53,6 +55,13 @@ constexpr int kFps = 30;
 constexpr int kFrames = 60;
 constexpr DWORD kTestTimeoutMs = 45000;
 constexpr UINT32 kH265Main420x8 = 1;  // eAVEncH265VProfile_Main_420_8
+
+// The codec under test. HEVC is the point of the probe; "--codec h264" runs the
+// very same pipeline on H.264 and is used by CI as a self-test of the encode and
+// decode machinery (the hosted runner has no HEVC MFT at all).
+GUID g_subtype = MFVideoFormat_HEVC;
+bool g_is_hevc = true;
+const char* g_codec_name = "hevc";
 
 // ---------------------------------------------------------------- helpers
 
@@ -764,10 +773,10 @@ EncodeOut DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
   ComPtr<IMFMediaType> ot;
   MFCreateMediaType(&ot);
   ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  ot->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_HEVC);
+  ot->SetGUID(MF_MT_SUBTYPE, g_subtype);
   ot->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
   SetVideoCommon(ot.Get(), w, h);
-  ot->SetUINT32(MF_MT_MPEG2_PROFILE, kH265Main420x8);
+  if (g_is_hevc) ot->SetUINT32(MF_MT_MPEG2_PROFILE, kH265Main420x8);
   HRESULT hr = mft->SetOutputType(0, ot.Get(), 0);
   if (FAILED(hr)) {
     r.stage = "set_output_type";
@@ -891,7 +900,7 @@ TestResult DoDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>
   ComPtr<IMFMediaType> it;
   MFCreateMediaType(&it);
   it->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-  it->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_HEVC);
+  it->SetGUID(MF_MT_SUBTYPE, g_subtype);
   SetVideoCommon(it.Get(), w, h);
   if (seq_header && !seq_header->empty()) {
     it->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, seq_header->data(),
@@ -1208,6 +1217,16 @@ int main(int argc, char** argv) {
     std::string a = argv[i];
     if (a == "--pause") {
       pause = true;
+    } else if (a == "--codec" && i + 1 < argc) {
+      std::string c = argv[++i];
+      if (c == "h264") {
+        g_subtype = MFVideoFormat_H264;
+        g_is_hevc = false;
+        g_codec_name = "h264";
+      } else if (c != "hevc") {
+        std::fprintf(stderr, "unknown codec %s (hevc or h264)\n", c.c_str());
+        return 2;
+      }
     } else if (a == "--out" && i + 1 < argc) {
       int n = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, nullptr, 0);
       if (n > 1) {
@@ -1218,14 +1237,15 @@ int main(int argc, char** argv) {
       ++i;
     } else if (a == "--help" || a == "-h") {
       std::fprintf(stderr,
-                   "hevc-probe [--out <file name>] [--pause]\n"
+                   "hevc-probe [--out <file name>] [--pause] [--codec hevc|h264]\n"
                    "Writes a JSON report to stdout and to a file next to the exe.\n");
       return 0;
     }
   }
 
+  _setmode(_fileno(stdout), _O_BINARY);  // the file and stdout carry identical bytes
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  std::fprintf(stderr, "[hevc-probe] start\n");
+  std::fprintf(stderr, "[hevc-probe] start (%s)\n", g_codec_name);
 
   SYSTEM_INFO si{};
   GetNativeSystemInfo(&si);
@@ -1239,8 +1259,8 @@ int main(int argc, char** argv) {
   std::vector<MftInfo> encoders, decoders;
   std::map<std::string, int> enc_counts, dec_counts;
   if (mf_ok) {
-    encoders = EnumMfts(MFT_CATEGORY_VIDEO_ENCODER, MFVideoFormat_HEVC, true, &enc_counts);
-    decoders = EnumMfts(MFT_CATEGORY_VIDEO_DECODER, MFVideoFormat_HEVC, false, &dec_counts);
+    encoders = EnumMfts(MFT_CATEGORY_VIDEO_ENCODER, g_subtype, true, &enc_counts);
+    decoders = EnumMfts(MFT_CATEGORY_VIDEO_DECODER, g_subtype, false, &dec_counts);
   }
   auto hw_first = [](std::vector<MftInfo>& v) {
     std::stable_partition(v.begin(), v.end(), [](const MftInfo& m) { return m.hardware; });
@@ -1330,6 +1350,7 @@ int main(int argc, char** argv) {
   j.BeginObject();
   j.KvS("name", "hevc-probe");
   j.KvI("report_version", 1);
+  j.KvS("codec", g_codec_name);
   j.KvS("git_sha", PROBE_GIT_SHA);
   j.KvS("test_content", "synthetic NV12, 60 frames, 30 fps, 1280x720 and 1920x1080");
   j.EndObject();
@@ -1399,14 +1420,16 @@ int main(int argc, char** argv) {
 
   j.Key("summary");
   j.BeginObject();
-  j.KvB("hevc_hardware_encoder_present", hw_enc_present);
-  j.KvB("hevc_software_encoder_present", sw_enc_present);
-  j.KvB("hevc_hardware_decoder_present", hw_dec_present);
-  j.KvB("hevc_software_decoder_present", sw_dec_present);
-  j.KvB("hevc_hardware_encode_720p_ok", hw_enc_720);
-  j.KvB("hevc_hardware_encode_1080p_ok", hw_enc_1080);
-  j.KvB("hevc_any_encode_720p_ok", enc_720);
-  j.KvB("hevc_any_encode_1080p_ok", enc_1080);
+  const std::string pre = std::string(g_codec_name) + "_";
+  auto kb = [&](const char* suffix, bool v) { j.KvB((pre + suffix).c_str(), v); };
+  kb("hardware_encoder_present", hw_enc_present);
+  kb("software_encoder_present", sw_enc_present);
+  kb("hardware_decoder_present", hw_dec_present);
+  kb("software_decoder_present", sw_dec_present);
+  kb("hardware_encode_720p_ok", hw_enc_720);
+  kb("hardware_encode_1080p_ok", hw_enc_1080);
+  kb("any_encode_720p_ok", enc_720);
+  kb("any_encode_1080p_ok", enc_1080);
   j.KvN("best_encode_fps_720p", fps_720);
   j.KvN("best_encode_fps_1080p", fps_1080);
   j.Key("best_encoder");
@@ -1415,9 +1438,9 @@ int main(int argc, char** argv) {
   } else {
     j.Null();
   }
-  j.KvB("hevc_decode_720p_ok", any_decode_720);
-  j.KvB("hevc_hardware_decode_720p_ok", any_hw_decode_720);
-  j.KvB("hevc_decode_1080p_ok", any_decode_1080);
+  kb("decode_720p_ok", any_decode_720);
+  kb("hardware_decode_720p_ok", any_hw_decode_720);
+  kb("decode_1080p_ok", any_decode_1080);
   j.KvB("decoder_configure_only_ok", !have_stream && any_decoder_configures);
   j.KvB("video_send_possible", hw_enc_720);
   j.KvB("video_receive_possible", any_decode_720 || (!have_stream && any_decoder_configures));
