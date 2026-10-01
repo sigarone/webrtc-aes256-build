@@ -145,8 +145,7 @@ bool AceSidMatchesCurrentUser(const std::wstring& dacl) {
 }
 
 void ExpectOnlyCurrentUser(const std::wstring& dacl) {
-  std::fprintf(stderr, "  dacl: %ls
-", dacl.c_str());
+  std::fprintf(stderr, "  dacl: %ls\n", dacl.c_str());
   CHECK(dacl.rfind(L"D:P", 0) == 0);        // protected: no inherited entries
   CHECK_EQ(CountOf(dacl, L'('), 1u);        // exactly one ACE
   CHECK(Contains(dacl, L"(A;"));            // an allow entry
@@ -183,11 +182,12 @@ QTEST(pipe_name_validation) {
 }
 
 QTEST(pipe_flags_are_the_hardened_ones) {
-  CHECK((kPipeOpenMode & FILE_FLAG_FIRST_PIPE_INSTANCE) != 0);
-  CHECK((kPipeOpenMode & FILE_FLAG_OVERLAPPED) != 0);
-  CHECK((kPipeMode & PIPE_REJECT_REMOTE_CLIENTS) != 0);
-  CHECK((kPipeMode & PIPE_TYPE_MESSAGE) == 0);  // byte stream, our own framing
-  CHECK_EQ(kPipeMaxInstances, 1u);
+  // Compile-time checks: a change to the flags must be a conscious edit of this test.
+  static_assert((kPipeOpenMode & FILE_FLAG_FIRST_PIPE_INSTANCE) != 0);
+  static_assert((kPipeOpenMode & FILE_FLAG_OVERLAPPED) != 0);
+  static_assert((kPipeMode & PIPE_REJECT_REMOTE_CLIENTS) != 0);
+  static_assert((kPipeMode & PIPE_TYPE_MESSAGE) == 0);  // byte stream, our own framing
+  static_assert(kPipeMaxInstances == 1);
 }
 
 QTEST(pipe_acl_is_current_user_only) {
