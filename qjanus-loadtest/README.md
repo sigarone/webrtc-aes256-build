@@ -63,6 +63,7 @@ the seed; every bot shard, on any machine, derives the same ids from the same se
 | --- | --- | --- |
 | `QJANUS_WS_URL` | Janus WebSocket URL (`wss://<node>/janus`, or `ws://127.0.0.1:8188/janus`) | bot shards |
 | `QJANUS_TOKEN_SECRET` | core `token_auth_secret` (HMAC key of the signed session tokens) | bot shards, admin |
+| `QJANUS_SESSION_TOKENS` | instead of the token secret: JSON array of pre-minted session tokens, one per bot (production nodes, see `aruba/README.md`) | bot shards |
 | `QJANUS_LOADTEST_SEED` | seed of the deterministic ids (any string, e.g. `openssl rand -hex 16`) | bot shards, admin |
 | `QJANUS_ADMIN_URL` | Janus HTTP base, `http://127.0.0.1:8088/janus` (node-local) | admin (and `--manage-rooms`) |
 | `QJANUS_ADMIN_KEY` | videoroom plugin `admin_key` | admin |
@@ -76,6 +77,8 @@ line by the workflow. Outputs contain only `targetId` = first 12 hex of `sha256(
 nothing in this repo creates a secret): `QJANUS_WS_URL`, `QJANUS_TOKEN_SECRET`, `QJANUS_LOADTEST_SEED`. The secret *names* are workflow
 inputs, so another target can use other names. The repo is public: **workflow inputs are visible in public run logs**, so keep
 the URL in the secret and leave the `target_ws_url` input empty (it is only a fallback and is masked after it has been read).
+
+A node whose token secret must not leave it (a production box) is tested in the pre-minted token mode: `aruba/README.md`.
 
 ## Running against a real node, step by step
 

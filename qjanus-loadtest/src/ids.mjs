@@ -6,7 +6,8 @@
 //   room      32 hex (128 bit)   "room|k"
 //   secret    64 hex (256 bit)   "secret|<room id>"
 //   pseudonym 32 hex             "pseudo|k|i"
-//   joinToken 32 hex             "join|k|i"
+//   joinToken "<pseudonym>:<32 hex>"  "join|k|i" (the qjanus form: patch 0007 binds a join token to the
+//                                     participant id, so the token must start with "<id>:")
 //   e2eeKey   64 hex             "e2ee|k"
 
 import { createHmac } from 'node:crypto';
@@ -47,7 +48,7 @@ export function pseudonym(seed, k, i) {
 export function joinToken(seed, k, i) {
   checkIndex('k', k);
   checkIndex('i', i);
-  return derive(seed, `join|${k}|${i}`).slice(0, 32);
+  return `${pseudonym(seed, k, i)}:${derive(seed, `join|${k}|${i}`).slice(0, 32)}`;
 }
 
 export function e2eeKey(seed, k) {

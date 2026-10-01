@@ -33,7 +33,7 @@ test('run defaults', () => {
   assert.equal(cfg.botsPerPage, 1);
   assert.equal(cfg.cpu.limit, 180);
   assert.deepEqual(cfg.limits, { lossPct: 1, freezeTolerance: 0, breachWindows: 2, joinFailPct: 5 });
-  assert.deepEqual(cfg.token, { ttlSec: 600, refreshSec: 300 });
+  assert.deepEqual(cfg.token, { ttlSec: 600, refreshSec: 300, preminted: false });
   assert.equal(cfg.e2ee, 'aesgcm');
   assert.equal(cfg.expectTransport, 'strict');
   assert.equal(cfg.fieldTrials, 'WebRTC-EnableDtlsPqc/Enabled/WebRTC-LegacySimulcastLayerLimit/Disabled/');
@@ -299,6 +299,74 @@ test('buildBotConfig: video bots, speaker is member 0, substreams clamp to the p
   const none = buildBotConfig({ cfg: cfgOf(['run', '--scenario', 'video4', '--simulcast', 'none']), plan, index: 2, sessionToken: 't' });
   assert.deepEqual([none.subscribe.substream, none.subscribe.speakerSubstream], [0, 0]);
   assert.equal(none.video.encodings.length, 1);
+});
+
+// ------------------------------------------------------------ pre-minted tokens
+
+const NOW_S = Math.floor(NOW().getTime() / 1000);
+const tokenAt = (expiry, tag = 'A') => `${expiry},janus,janus.plugin.videoroom:${tag.repeat(43)}=`;
+const tokenList = (n, expiry = NOW_S + 7200) => Array.from({ length: n }, (_, i) => tokenAt(expiry, String.fromCharCode(65 + (i % 26))));
+const PRE_ENV = (tokens) => ({ QJANUS_WS_URL: WS, QJANUS_LOADTEST_SEED: 'SEEDVALUE123', QJANUS_SESSION_TOKENS: JSON.stringify(tokens) });
+
+test('pre-minted mode: the token secret is not needed and not read', () => {
+  const tokens = tokenList(16);
+  const cfg = parseCli(['run', '--rooms', '2'], PRE_ENV(tokens), { now: NOW }).cfg;
+  assert.equal(cfg.secrets.tokenSecret, null);
+  assert.deepEqual(cfg.secrets.sessionTokens, tokens);
+  assert.equal(cfg.token.preminted, true);
+  assert.equal(cfg.token.count, 16);
+  assert.equal(cfg.token.minExpiresInSec, 7199); // 0.789 s of the current second are already gone
+  // with the secret set as well, the tokens still win and the secret is dropped
+  const both = parseCli(['run', '--rooms', '1'], { ...PRE_ENV(tokens), QJANUS_TOKEN_SECRET: 'TOKENSECRETVALUE' }, { now: NOW }).cfg;
+  assert.equal(both.secrets.tokenSecret, null);
+});
+
+test('pre-minted mode: needs one token per bot of every room the ramp can reach', () => {
+  assert.throws(() => parseCli(['run', '--rooms', '3'], PRE_ENV(tokenList(23)), { now: NOW }), /not enough pre-minted session tokens: 24 needed for 3 room\(s\) of 8, 23 given/);
+  parseCli(['run', '--rooms', '3'], PRE_ENV(tokenList(24)), { now: NOW });
+  const ramp = ['ramp', '--ramp-start', '2', '--ramp-step', '2', '--ramp-max', '6', '--scenario', 'video4'];
+  assert.throws(() => parseCli(ramp, PRE_ENV(tokenList(23)), { now: NOW }), /24 needed for 6 room/);
+  parseCli(ramp, PRE_ENV(tokenList(24)), { now: NOW });
+});
+
+test('pre-minted mode: tokens must outlive the planned run (start instant and schedule included)', () => {
+  // run of 1 room: join 4 s + settle 10 + hold 60 = 74 s, plus the 120 s margin
+  parseCli(['run', '--rooms', '1'], PRE_ENV(tokenList(8, NOW_S + 300)), { now: NOW });
+  assert.throws(() => parseCli(['run', '--rooms', '1', '--start-at', String(NOW_S + 200)], PRE_ENV(tokenList(8, NOW_S + 300)), { now: NOW }), /expire before the planned end/);
+  assert.throws(() => parseCli(['run', '--rooms', '1'], PRE_ENV(tokenList(8, NOW_S + 190)), { now: NOW }), /expire before the planned end/);
+  // an expired token anywhere among the needed ones is caught, one beyond the needed ones is not
+  const mixed = tokenList(9, NOW_S + 7200);
+  mixed[3] = tokenAt(NOW_S - 5);
+  assert.throws(() => parseCli(['run', '--rooms', '1'], PRE_ENV(mixed), { now: NOW }), /expire before/);
+  mixed[3] = tokenAt(NOW_S + 7200);
+  mixed[8] = tokenAt(NOW_S - 5);
+  parseCli(['run', '--rooms', '1'], PRE_ENV(mixed), { now: NOW });
+});
+
+test('pre-minted mode: malformed input is refused with a message that carries no value', () => {
+  const bad = ['not json', '[]', '{"a":1}', '["x"]', '[1,2]', JSON.stringify([`${NOW_S + 7200},janus,janus.plugin.videoroom`]), JSON.stringify(['abc,janus:AAAA'])];
+  for (const raw of bad) {
+    assert.throws(() => parseCli(['run'], { QJANUS_WS_URL: WS, QJANUS_LOADTEST_SEED: 'SEEDVALUE123', QJANUS_SESSION_TOKENS: raw }, { now: NOW }),
+      (e) => e instanceof ConfigError && /invalid session tokens/.test(e.message) && !e.message.includes('janus,'));
+  }
+  assert.throws(() => parseCli(['run', '--session-tokens-env', 'lower case'], PRE_ENV(tokenList(8)), { now: NOW }), /NAME of an environment variable/);
+  assert.throws(() => parseCli(['run', '--session-tokens-file', '/nonexistent/x.json'], PRE_ENV(tokenList(8)), { now: NOW }), /cannot read a value from --session-tokens-file/);
+  assert.throws(() => parseCli(['run', '--manage-rooms'], PRE_ENV(tokenList(8)), { now: NOW }), /--manage-rooms.*pre-minted/);
+});
+
+test('pre-minted mode: an empty variable means HMAC mode, which then asks for the secret', () => {
+  assert.throws(() => parseCli(['run'], { QJANUS_WS_URL: WS, QJANUS_LOADTEST_SEED: 'SEEDVALUE123', QJANUS_SESSION_TOKENS: '  ' }, { now: NOW }), /QJANUS_TOKEN_SECRET/);
+});
+
+test('pre-minted tokens never reach the redacted config or scrubbed text', () => {
+  const tokens = tokenList(8);
+  const cfg = parseCli(['run', '--rooms', '1'], PRE_ENV(tokens), { now: NOW }).cfg;
+  const json = JSON.stringify(redactedConfig(cfg));
+  for (const t of tokens) assert.ok(!json.includes(t.split(':')[1]), 'a token reached the redacted config');
+  assert.ok(!json.includes('SEEDVALUE123') && !json.includes('sfu-secret-host'));
+  assert.deepEqual(redactedConfig(cfg).token, { ttlSec: 600, refreshSec: 300, preminted: true, count: 8, minExpiresInSec: 7199 });
+  const text = scrubSecrets(`bot failed with ${tokens[2]} twice ${tokens[2]}`, cfg);
+  assert.ok(!text.includes(tokens[2].split(':')[1]));
 });
 
 // ----------------------------------------------------------------------- CLI

@@ -20,6 +20,10 @@ Target (secrets come from the environment or --*-file, are never printed or writ
   --ws-url URL                 Janus WebSocket URL              [QJANUS_WS_URL]
   --token-secret-env NAME      env var holding the token secret [default QJANUS_TOKEN_SECRET]
   --token-secret-file FILE     read the token secret from a file instead
+  --session-tokens-env NAME    env var holding pre-minted session tokens, a JSON array with one token per bot
+                               (bot of room k, member i uses entry k*roomSize+i)  [default QJANUS_SESSION_TOKENS]
+  --session-tokens-file FILE   read the pre-minted tokens from a file instead; with tokens the token secret is
+                               not read at all, tokens are never refreshed and must outlive the whole run
   --seed-env NAME              env var holding the seed         [default QJANUS_LOADTEST_SEED]
   --seed-file FILE             read the seed from a file instead
   --ice-servers-json JSON      RTCIceServer array               [QJANUS_ICE_SERVERS]

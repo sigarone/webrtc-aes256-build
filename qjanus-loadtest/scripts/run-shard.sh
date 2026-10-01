@@ -11,7 +11,9 @@
 #
 # Required environment
 #   QJANUS_WS_URL          Janus WebSocket URL          } read by qjanus-load, never printed
-#   QJANUS_TOKEN_SECRET    core token secret            }
+#   QJANUS_TOKEN_SECRET    core token secret            } ONE of these two: the secret (tokens are minted here)
+#   QJANUS_SESSION_TOKENS  JSON array, one pre-minted    } or pre-minted session tokens, one per bot (the secret
+#                          session token per bot         } then stays on the node; when both are set the tokens win)
 #   QJANUS_LOADTEST_SEED   id seed                      }
 #   SHARD, SHARDS          this shard (0-based) and the shard count, SHARD < SHARDS
 #   START_AT               epoch seconds at which all shards start their first step
@@ -59,7 +61,12 @@ is_enum() {                                                   # is_enum NAME all
 }
 
 need QJANUS_WS_URL
-need QJANUS_TOKEN_SECRET
+if [ -z "${QJANUS_SESSION_TOKENS:-}" ]; then
+  need QJANUS_TOKEN_SECRET
+  # a pre-minted token list wins: the core token secret must not be used by a runner that was given tokens
+else
+  unset QJANUS_TOKEN_SECRET
+fi
 need QJANUS_LOADTEST_SEED
 is_int SHARDS
 is_int SHARD
@@ -106,7 +113,8 @@ if [ -n "${EXTRA_ARGS:-}" ]; then
   args+=("${extra[@]}")
 fi
 
-# No --manage-rooms (see above). The Janus URL, token secret and seed reach qjanus-load
-# through the environment (QJANUS_WS_URL, QJANUS_TOKEN_SECRET, QJANUS_LOADTEST_SEED).
+# No --manage-rooms (see above). The Janus URL, token secret (or pre-minted tokens) and seed reach
+# qjanus-load through the environment (QJANUS_WS_URL, QJANUS_TOKEN_SECRET | QJANUS_SESSION_TOKENS,
+# QJANUS_LOADTEST_SEED).
 cd "$ROOT"
 exec node bin/qjanus-load.mjs "${args[@]}"
