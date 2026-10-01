@@ -25,7 +25,7 @@ index 55eee13..4be04cd 100644
  
  /*! \brief Helper method to get a string representation of an API error code
 diff --git a/src/janus.c b/src/janus.c
-index 8fc10b7..e0bab9d 100644
+index 8fc10b7..6c29ce6 100644
 --- a/src/janus.c
 +++ b/src/janus.c
 @@ -300,6 +300,45 @@ static uint reclaim_session_timeout = DEFAULT_RECLAIM_SESSION_TIMEOUT;
@@ -90,15 +90,26 @@ index 8fc10b7..e0bab9d 100644
  	janus_mutex_destroy(&session->mutex);
  	g_free(session);
  }
-@@ -789,6 +830,7 @@ janus_session *janus_session_create(guint64 session_id) {
+@@ -764,7 +805,7 @@ static gboolean janus_status_sessions(gpointer user_data) {
+ 	return TRUE;
+ }
+ 
+-janus_session *janus_session_create(guint64 session_id) {
++janus_session *janus_session_create(guint64 session_id, const char *token) {
+ 	janus_session *session = NULL;
+ 	if(session_id == 0) {
+ 		while(session_id == 0) {
+@@ -789,6 +830,9 @@ janus_session *janus_session_create(guint64 session_id) {
  	session->last_activity = janus_get_monotonic_time();
  	session->transport_gone_time = 0;
  	session->ice_handles = NULL;
-+	session->token = NULL;
++	/* qjanus: the slot of this token belongs to the session from the moment it is visible in the table,
++	 * so a destroy at any time (e.g. transport gone with reclaim_session_timeout 0) gives it back */
++	session->token = token ? g_strdup(token) : NULL;
  	janus_mutex_init(&session->mutex);
  	janus_mutex_lock(&sessions_mutex);
  	g_hash_table_insert(sessions, janus_uint64_dup(session->session_id), session);
-@@ -834,6 +876,10 @@ gint janus_session_destroy(janus_session *session) {
+@@ -834,6 +878,10 @@ gint janus_session_destroy(janus_session *session) {
  	JANUS_LOG(LOG_INFO, "Destroying session %"SCNu64"; %p\n", session_id, session);
  	if(!g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
  		return 0;
@@ -109,7 +120,7 @@ index 8fc10b7..e0bab9d 100644
  	janus_session_handles_clear(session);
  	/* The session will actually be destroyed when the counter gets to 0 */
  	janus_refcount_decrease(&session->ref);
-@@ -1134,12 +1180,34 @@ int janus_process_incoming_request(janus_request *request) {
+@@ -1134,9 +1182,29 @@ int janus_process_incoming_request(janus_request *request) {
  			}
  		}
  
@@ -131,19 +142,15 @@ index 8fc10b7..e0bab9d 100644
 +		}
 +
  		/* Handle it */
- 		session = janus_session_create(session_id);
+-		session = janus_session_create(session_id);
++		/* The session owns the slot from its creation on: janus_session_destroy gives it back */
++		session = janus_session_create(session_id, session_token);
  		if(session == NULL) {
 +			if(session_token != NULL)
 +				janus_token_sessions_release(session_token);
  			ret = janus_process_error(request, session_id, transaction_text, JANUS_ERROR_UNKNOWN, "Memory error");
  			goto jsondone;
  		}
-+		/* From here the session owns the slot: janus_session_destroy gives it back */
-+		if(session_token != NULL)
-+			session->token = g_strdup(session_token);
- 		session_id = session->session_id;
- 		/* We increase the counter as this request is using the session */
- 		janus_refcount_increase(&session->ref);
 @@ -5069,6 +5137,17 @@ gint main(int argc, char *argv[]) {
  		}
  	}
@@ -171,7 +178,7 @@ index 8fc10b7..e0bab9d 100644
  	sessions_watchdog_context = g_main_context_new();
  	GMainLoop *watchdog_loop = g_main_loop_new(sessions_watchdog_context, FALSE);
 diff --git a/src/janus.h b/src/janus.h
-index 46cc227..6ae2eb6 100644
+index 46cc227..cf3f389 100644
 --- a/src/janus.h
 +++ b/src/janus.h
 @@ -48,6 +48,8 @@ typedef struct janus_session {
@@ -183,3 +190,14 @@ index 46cc227..6ae2eb6 100644
  	/*! \brief Pointer to the request instance (and the transport that originated the session) */
  	janus_request *source;
  	/*! \brief Flag to notify there's been a session timeout */
+@@ -72,8 +74,9 @@ typedef struct janus_session {
+ ///@{
+ /*! \brief Method to create a new Janus Core-Client session
+  * @param[in] session_id The desired Janus Core-Client session ID, or 0 if it needs to be generated randomly
++ * @param[in] token The signed token the session is created with (qjanus counts sessions per token), or NULL
+  * @returns The created Janus Core-Client session if successful, NULL otherwise */
+-janus_session *janus_session_create(guint64 session_id);
++janus_session *janus_session_create(guint64 session_id, const char *token);
+ /*! \brief Method to find an existing Janus Core-Client session from its ID
+  * @param[in] session_id The Janus Core-Client session ID
+  * @returns The created Janus Core-Client session if successful, NULL otherwise */
