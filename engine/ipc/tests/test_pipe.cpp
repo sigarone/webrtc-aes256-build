@@ -629,6 +629,14 @@ QTEST(engine_process_exits_when_no_nonce_arrives) {
   CHECK_EQ(e.WaitExit(10000), 3);
 }
 
+QTEST(engine_process_exits_on_an_all_zero_nonce) {
+  const std::wstring name = UniqueName();
+  Engine e;
+  CHECK(e.Start(PipeArg(name)));
+  CHECK(e.SendNonce(Buf(32, 0)));  // a host that forgot to fill the buffer
+  CHECK_EQ(e.WaitExit(10000), 3);
+}
+
 QTEST(engine_process_exits_on_a_short_nonce) {
   const std::wstring name = UniqueName();
   Engine e;

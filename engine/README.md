@@ -67,7 +67,7 @@ qaudion-media.exe --pipe \\.\pipe\<name> [--expect-client-pid <pid>]
    exits when the connection ends: it serves exactly one client for exactly one lifetime.
 
 Exit codes are the only diagnostics the engine emits before the core is linked: 0 clean shutdown,
-2 bad command line, 3 nonce not received, 4 pipe creation failed, 5 no client in time, 6 client
+2 bad command line, 3 nonce missing, short or all zero, 4 pipe creation failed, 5 no client in time, 6 client
 process id mismatch, 7 hello failed (wrong nonce or not a hello), 8 protocol violation after the
 hello, 9 I/O error.
 

@@ -5,7 +5,7 @@
 // client connects to the pipe and sends "hello" with that nonce as its first message.
 //
 // Exit codes (the only diagnostics this process emits; it never logs):
-//   0 clean shutdown or peer closed   2 bad command line      3 nonce not received
+//   0 clean shutdown or peer closed   2 bad command line      3 nonce missing, short or all zero
 //   4 pipe creation failed            5 no client in time     6 client pid mismatch
 //   7 handshake failed (bad nonce)    8 protocol violation    9 I/O error
 //
@@ -39,6 +39,12 @@ bool ParseUint32(const char* s, uint32_t* out) {
   return true;
 }
 
+bool IsAllZero(const uint8_t* p, size_t n) {
+  uint8_t acc = 0;
+  for (size_t i = 0; i < n; ++i) acc = static_cast<uint8_t>(acc | p[i]);
+  return acc == 0;
+}
+
 // Process-wide hardening that does not depend on the command line.
 void HardenProcess() {
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
@@ -70,7 +76,9 @@ int main(int argc, char** argv) {
   if (!IsValidPipeName(pipe_name)) return 2;
 
   uint8_t nonce[kNonceBytes];
-  if (ReadNonceFromHandle(GetStdHandle(STD_INPUT_HANDLE), nonce, kNonceReadTimeoutMs) != Err::Ok) {
+  if (ReadNonceFromHandle(GetStdHandle(STD_INPUT_HANDLE), nonce, kNonceReadTimeoutMs) != Err::Ok ||
+      IsAllZero(nonce, sizeof nonce)) {
+    // Missing, short, or all zero (a host that sent an uninitialised buffer): no session.
     SecureZero(nonce, sizeof nonce);
     return 3;
   }
