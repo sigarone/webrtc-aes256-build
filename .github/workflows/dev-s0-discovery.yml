@@ -1,0 +1,109 @@
+name: dev-s0-discovery
+
+# TEMPORARY, branch-only (feat/m150-windows-s0): prints the real GN/compiler facts
+# of the Windows M150 build (compile command of a webrtc TU, libs, libc++ layout)
+# so build-flags.json can be generated from them. Deleted before the PR merges.
+
+on:
+  push:
+    branches: [feat/m150-windows-s0]
+    paths: [".github/workflows/dev-s0-discovery.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKDIR: C:/w
+      DEPOT_TOOLS_UPDATE: "0"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      GYP_MSVS_OVERRIDE_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      vs2022_install: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      WINDOWSSDKDIR: C:\Program Files (x86)\Windows Kits\10
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync
+        env:
+          WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "ba469aa2093b-qaudion-m150" win
+
+      - name: Apply series
+        run: |
+          bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
+          bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: gn gen + discovery
+        working-directory: C:/w/src
+        run: |
+          set -x
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          mkdir -p out/win-x64 /c/disc
+          GN_ARGS='target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true'
+          echo "$GN_ARGS" | tr ' ' '\n' > out/win-x64/args.gn
+          cmd //c "gn.bat gen out/win-x64"
+          D=/c/disc
+          cmd //c "gn.bat args out/win-x64 --list --short" > $D/gn-args-short.txt 2>&1 || true
+          cmd //c "gn.bat args out/win-x64 --list --json" > $D/gn-args-all.json 2>&1 || true
+          for k in defines cflags cflags_c cflags_cc include_dirs libs lib_dirs ldflags configs public_configs all_dependent_configs; do
+            cmd //c "gn.bat desc out/win-x64 //:webrtc $k" > $D/desc-webrtc-$k.txt 2>&1 || true
+          done
+          cmd //c "gn.bat desc out/win-x64 //:webrtc --all --blame libs" > $D/desc-webrtc-libs-blame.txt 2>&1 || true
+          cmd //c "gn.bat ls out/win-x64 //buildtools/third_party/libc++*" > $D/gn-ls-libcxx.txt 2>&1 || true
+          cmd //c "gn.bat ls out/win-x64 //third_party/libc++*" >> $D/gn-ls-libcxx.txt 2>&1 || true
+          cmd //c "gn.bat path out/win-x64 //:webrtc //buildtools/third_party/libc++:libc++" > $D/gn-path-libcxx.txt 2>&1 || true
+          cmd //c "gn.bat refs out/win-x64 //buildtools/third_party/libc++:libc++" > $D/gn-refs-libcxx.txt 2>&1 || true
+          cmd //c "gn.bat desc out/win-x64 //buildtools/third_party/libc++:libc++" > $D/gn-desc-libcxx.txt 2>&1 || true
+          cmd //c "gn.bat desc out/win-x64 //buildtools/third_party/libc++:libc++ --all --blame defines" > $D/gn-desc-libcxx-defines.txt 2>&1 || true
+          cmd //c "ninja.bat -C out/win-x64 -t compdb cxx" > $D/compdb-all.json 2> $D/compdb-err.txt || true
+          python - <<'PY'
+          import json
+          d = json.load(open('/c/disc/compdb-all.json'))
+          want = ('pc/peer_connection_factory.cc', 'rtc_base/qaudion_tuning.cc', 'rtc_base/openssl_stream_adapter.cc')
+          out = [e for e in d if any(e['file'].replace('\\','/').endswith(w) for w in want)]
+          out += [e for e in d if 'libc++' in e['file'].replace('\\','/')][:6]
+          json.dump(out, open('/c/disc/compdb-pick.json','w'), indent=1)
+          print('compdb entries', len(d), 'picked', len(out))
+          PY
+          ls buildtools/third_party/libc++ third_party/libc++ 2>&1 | head -60 > $D/ls-libcxx.txt || true
+          ls third_party/libc++/src 2>&1 | head -30 >> $D/ls-libcxx.txt || true
+          cat buildtools/third_party/libc++/__config_site > $D/config_site.txt 2>&1 || true
+          cat build/config/c++/BUILD.gn > $D/build-config-c++-BUILD.gn 2>&1 || true
+          cat build/config/c++/c++.gni > $D/c++.gni 2>&1 || true
+          cat buildtools/third_party/libc++/BUILD.gn > $D/libcxx-BUILD.gn 2>&1 || true
+          cat third_party/libc++/BUILD.gn > $D/libcxx2-BUILD.gn 2>&1 || true
+          third_party/llvm-build/Release+Asserts/bin/clang-cl.exe --version > $D/clang-version.txt 2>&1 || true
+          cat tools/clang/scripts/update.py | grep -E "^(CLANG_REVISION|CLANG_SUB_REVISION|PACKAGE_VERSION)" > $D/clang-rev.txt 2>&1 || true
+          ls third_party/llvm-build/Release+Asserts/bin > $D/clang-bin.txt 2>&1 || true
+          cat third_party/llvm-build/Release+Asserts/cr_build_revision > $D/clang-cr-rev.txt 2>&1 || true
+          ls "/c/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC" > $D/msvc-toolset.txt 2>&1 || true
+          ls "/c/Program Files (x86)/Windows Kits/10/Include" > $D/winsdk.txt 2>&1 || true
+          clang-cl --version > $D/runner-clang.txt 2>&1 || true
+          for f in $D/*.txt; do echo "=== $f"; head -c 4000 "$f"; done || true
+
+      - name: Try building the libc++ target (see what it yields)
+        working-directory: C:/w/src
+        run: |
+          set -x
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          cmd //c "autoninja.bat -C out/win-x64 buildtools/third_party/libc++:libc++" > /c/disc/build-libcxx.txt 2>&1 || true
+          tail -30 /c/disc/build-libcxx.txt
+          find out/win-x64/obj -iname '*libc++*' | head -40 > /c/disc/find-libcxx.txt || true
+          cat /c/disc/find-libcxx.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: discovery
+          path: C:/disc/*
