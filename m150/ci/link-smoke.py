@@ -100,7 +100,7 @@ def main():
     if os.path.isdir(bssl) and bssl not in incs:
         incs.append(bssl)
     print("link-smoke: include dirs used: %d, not shipped/not needed: %s" % (len(incs), skipped))
-    if not any(i.endswith(os.path.join("third_party", "libc++", "src", "include")) for i in incs) \
+    if not any(i.replace("\\", "/").endswith("third_party/libc++/src/include") for i in incs) \
             and "libc++" in flags["abi"]["stl"]:
         die("libc++ headers are not in the header zip")
 
