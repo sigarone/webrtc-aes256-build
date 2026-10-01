@@ -31,10 +31,10 @@ on:
     paths:
       - 'm150/**'
       - '.github/workflows/test-m150-patches.yml'
-  # A run on main is what fills the caches that PR runs (and the release
-  # builds, for the resources cache) restore from: a cache saved on a branch or
-  # on a PR merge ref is invisible to every other ref, one saved on main is
-  # visible to all.
+  # A run on main is what fills the caches that PR runs restore from: a cache
+  # saved on a branch or on a PR merge ref is invisible to every other ref, one
+  # saved on main is visible to all. The release builds (build-m150-*) never
+  # restore or save any of these caches.
   push:
     branches: [main]
     paths:
