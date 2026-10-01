@@ -70,7 +70,9 @@ T9_FILTER="FrameCryptor.KeyProvider:KeyProvider.*:DataPacketCryptor.*"
 # T10 (P9): the certificate stats cache must not keep a pair taken before
 # the remote certificate was known, plus the upstream cache test it must not
 # break. Both configs.
-T10_FILTER="RTCStatsCollectorTest*CertificateStatsCache*"
+# Both are TEST_P: the full gtest name is "<instantiation>/RTCStatsCollectorTest.<name>/<n>",
+# so the filter needs the leading wildcard (without it the filter matched nothing).
+T10_FILTER="*RTCStatsCollectorTest*CertificateStatsCache*"
 # T11 (strict transport, negative tests): a stock-like peer (DTLS 1.2 only,
 # AES-128 SRTP only, no DTLS-SRTP) must NOT connect to a strict peer, plus the
 # positive controls (strict peers negotiate DTLS 1.3 / TLS_AES_256_GCM_SHA384 /

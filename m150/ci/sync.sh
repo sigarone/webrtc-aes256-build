@@ -26,6 +26,13 @@
 #                     or "ios,mac"
 # env:
 #   WEBRTC_FORK_URL     default https://github.com/sigarone/webrtc.git
+#   SYNC_RESOURCES_CACHE  optional directory (outside <workdir>/src) holding a CI
+#                       cache of the sha1-addressed test blobs that the
+#                       `chromium-webrtc-resources` gclient hook downloads into
+#                       src/resources (4-5 minutes of every sync). Unix only.
+#                       Unset = no cache, behaviour identical to before. See
+#                       "resources cache" below for why it cannot change what
+#                       is built.
 #
 # depot_tools is pinned below (DEPOT_TOOLS_SHA), the same way WEBRTC_PIN/
 # BORINGSSL_PIN/OPUS_PIN are: a hardcoded 40-hex constant, not an
@@ -119,6 +126,83 @@ fi
 [ -f "$WORKDIR/depot_tools/python3_bin_reldir.txt" ] || { echo "::error::sync: depot_tools python3 bootstrap did not produce python3_bin_reldir.txt" >&2; exit 1; }
 echo "::endgroup::"
 
+# --- resources cache ---------------------------------------------------------
+# The `download_from_google_storage ... chromium-webrtc-resources src/resources`
+# hook fetches, for every `<file>.sha1` the pinned webrtc commit tracks under
+# src/resources, the blob `<file>` whose sha1 is the content of that .sha1 file.
+# The blobs are test data only (nothing under src/resources is compiled into an
+# AAR or xcframework), but the download costs 4-5 minutes per run.
+# With SYNC_RESOURCES_CACHE set, blobs saved by an earlier run are put back
+# between `gclient sync --nohooks` and `gclient runhooks`, so the hook finds
+# them and skips the download. Why this cannot change what is built:
+#   - only a blob that the freshly checked-out tree names through a sibling
+#     .sha1 file is restored; nothing else from the cache enters the tree;
+#   - after the hook, EVERY .sha1 under src/resources is re-checked here against
+#     the sha1 of its blob (fail closed on a missing or different one),
+#     independently of what the hook itself does. A stale or tampered cache
+#     entry can therefore at worst cost the time it was meant to save;
+#   - only blobs that passed that check are written back to the cache dir.
+RES_CACHE=${SYNC_RESOURCES_CACHE:-}
+sha1_of() {
+  if command -v sha1sum >/dev/null 2>&1; then sha1sum "$1" | awk '{print $1}'; else shasum -a 1 "$1" | awk '{print $1}'; fi
+}
+resources_restore() {
+  [ -n "$RES_CACHE" ] || return 0
+  rdir="$WORKDIR/src/resources"
+  if [ ! -d "$RES_CACHE/resources" ] || [ ! -d "$rdir" ]; then
+    echo "sync: resources cache: cold, nothing to restore"
+    return 0
+  fi
+  rlist=$(mktemp); rcount=0
+  find "$rdir" -type f -name '*.sha1' > "$rlist"
+  while IFS= read -r rf; do
+    rrel=${rf#"$rdir"/}; rblob=${rrel%.sha1}
+    rsrc="$RES_CACHE/resources/$rblob"
+    if [ -f "$rsrc" ] && [ ! -L "$rsrc" ] && [ ! -e "$rdir/$rblob" ]; then
+      mkdir -p "$(dirname "$rdir/$rblob")"
+      cp -p "$rsrc" "$rdir/$rblob"
+      rcount=$((rcount + 1))
+    fi
+  done < "$rlist"
+  rm -f "$rlist"
+  echo "sync: resources cache: restored $rcount blob(s) before the hook"
+}
+resources_verify_and_save() {
+  [ -n "$RES_CACHE" ] || return 0
+  rdir="$WORKDIR/src/resources"
+  [ -d "$rdir" ] || { echo "::error::sync: $rdir missing after runhooks" >&2; exit 1; }
+  rlist=$(mktemp); rkeep=$(mktemp); rtotal=0; rsaved=0; rpruned=0
+  find "$rdir" -type f -name '*.sha1' > "$rlist"
+  mkdir -p "$RES_CACHE/resources"
+  while IFS= read -r rf; do
+    rrel=${rf#"$rdir"/}; rblob=${rrel%.sha1}
+    rwant=$(awk 'NR==1{print $1}' "$rf")
+    if [ ! -f "$rdir/$rblob" ] || [ -L "$rdir/$rblob" ]; then
+      echo "::error::sync: src/resources/$rblob is missing after the resources hook" >&2; exit 1
+    fi
+    rgot=$(sha1_of "$rdir/$rblob")
+    if [ "$rgot" != "$rwant" ]; then
+      echo "::error::sync: src/resources/$rblob has sha1 $rgot, its .sha1 file says $rwant" >&2; exit 1
+    fi
+    rtotal=$((rtotal + 1))
+    echo "$rblob" >> "$rkeep"
+    if ! cmp -s "$rdir/$rblob" "$RES_CACHE/resources/$rblob" 2>/dev/null; then
+      mkdir -p "$(dirname "$RES_CACHE/resources/$rblob")"
+      cp -p "$rdir/$rblob" "$RES_CACHE/resources/$rblob"
+      rsaved=$((rsaved + 1))
+    fi
+  done < "$rlist"
+  # drop whatever the cache dir holds that the pinned tree does not name
+  find "$RES_CACHE/resources" -type f > "$rlist"
+  while IFS= read -r rf; do
+    rrel=${rf#"$RES_CACHE/resources"/}
+    if ! grep -qxF -- "$rrel" "$rkeep"; then rm -f "$rf"; rpruned=$((rpruned + 1)); fi
+  done < "$rlist"
+  rm -f "$rlist" "$rkeep"
+  echo "sync: resources: $rtotal blob(s) verified against their .sha1; cache dir: $rsaved written, $rpruned pruned"
+  du -sh "$RES_CACHE/resources" 2>/dev/null || true
+}
+
 echo "::group::sync: gclient config + sync ($WEBRTC_REF, target_os=$TARGET_OS_CSV)"
 TARGET_OS_PY=$(printf '%s' "$TARGET_OS_CSV" | awk -F',' '{for(i=1;i<=NF;i++){printf "\"%s\"%s", $i, (i<NF?", ":"")}}')
 cat > "$WORKDIR/.gclient" <<EOF
@@ -146,7 +230,9 @@ EOF
     cmd //c "gclient.bat runhooks"
   else
     gclient sync --no-history --shallow --nohooks
+    resources_restore
     gclient runhooks
+    resources_verify_and_save
   fi
 )
 echo "::endgroup::"
