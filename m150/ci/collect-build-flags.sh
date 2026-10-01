@@ -29,7 +29,16 @@ cd "$SRC"
 # The resolved target description (defines/libs/ldflags of //:webrtc, public
 # configs included) and the real compiler command lines of every C++ TU.
 cmd //c "gn.bat desc $OUT //:webrtc --format=json" > "$RAW/desc-webrtc.json"
-cmd //c "ninja.bat -C $OUT -t compdb cxx" > "$RAW/compdb.json"
+# depot_tools' ninja wrapper refuses an output dir that already holds Siso
+# state (i.e. after autoninja built it), so talk to the ninja binary of the
+# checkout directly; if it is not there, let GN export the compile commands.
+NINJA_EXE=third_party/ninja/ninja.exe
+if [ -f "$NINJA_EXE" ]; then
+  "$NINJA_EXE" -C "$OUT" -t compdb cxx > "$RAW/compdb.json"
+else
+  cmd //c "gn.bat gen $OUT --export-compile-commands=pc:peer_connection_factory"
+  cp "$OUT/compile_commands.json" "$RAW/compdb.json"
+fi
 CLANG_DIR=third_party/llvm-build/Release+Asserts
 "$CLANG_DIR/bin/clang-cl.exe" --version > "$RAW/clang-version.txt"
 cp "$CLANG_DIR/cr_build_revision" "$RAW/cr-build-revision"

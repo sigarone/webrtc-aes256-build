@@ -79,6 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          ls -la "$WORKDIR/src/third_party/ninja" | head || true
           bash ctrl/m150/ci/collect-build-flags.sh "$WORKDIR/src" out/win-x64 raw "$GN_ARGS" out/build-flags.json
           cp -r raw out/raw-dumps
 
