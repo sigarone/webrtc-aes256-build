@@ -64,4 +64,6 @@ jobs:
           tar -xJf clang.tar.xz -C C:/clang
 
       - name: Compile, link and run the out-of-tree consumer
+        env:
+          QAUDION_SMOKE_LOG: "1"
         run: python ctrl/m150/ci/link-smoke.py out C:/clang C:/smoke ctrl/m150/smoke/consumer.cc

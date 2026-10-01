@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +50,7 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtc_stats_report.h"
 #include "api/stats/rtcstats_objects.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/qaudion_tuning.h"
 #include "rtc_base/ssl_adapter.h"
 
@@ -68,6 +70,22 @@ void Check(bool ok, const char* what) {
   std::fflush(stdout);
   if (!ok) {
     ++g_failures;
+  }
+}
+
+// A step the rest of the run cannot do without: report and stop at once
+// instead of waiting for the next timeouts.
+void Require(bool ok, const char* what, const std::string& detail = "") {
+  Check(ok, what);
+  if (!ok) {
+    if (!detail.empty()) {
+      std::printf("[smoke]   reason: %s
+", detail.c_str());
+    }
+    std::printf("[smoke] FAILED (stopping at a required step)
+");
+    std::fflush(stdout);
+    std::exit(1);
   }
 }
 
@@ -95,11 +113,13 @@ class CreateSdpObserver : public webrtc::CreateSessionDescriptionObserver {
     desc_.reset(desc);  // ownership is transferred to the observer
     done_.Set();
   }
-  void OnFailure(webrtc::RTCError) override {
+  void OnFailure(webrtc::RTCError error) override {
     failed_ = true;
+    error_ = std::string(error.message());
     done_.Set();
   }
   bool Wait() { return done_.WaitFor(seconds(20)) && !failed_ && desc_; }
+  const std::string& error() const { return error_; }
   std::unique_ptr<webrtc::SessionDescriptionInterface> Take() {
     return std::move(desc_);
   }
@@ -107,6 +127,7 @@ class CreateSdpObserver : public webrtc::CreateSessionDescriptionObserver {
  private:
   Event done_;
   bool failed_ = false;
+  std::string error_;
   std::unique_ptr<webrtc::SessionDescriptionInterface> desc_;
 };
 
@@ -114,26 +135,32 @@ class SetLocalObserver : public webrtc::SetLocalDescriptionObserverInterface {
  public:
   void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
     ok_ = error.ok();
+    error_ = std::string(error.message());
     done_.Set();
   }
   bool Wait() { return done_.WaitFor(seconds(20)) && ok_; }
+  const std::string& error() const { return error_; }
 
  private:
   Event done_;
   bool ok_ = false;
+  std::string error_;
 };
 
 class SetRemoteObserver : public webrtc::SetRemoteDescriptionObserverInterface {
  public:
   void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
     ok_ = error.ok();
+    error_ = std::string(error.message());
     done_.Set();
   }
   bool Wait() { return done_.WaitFor(seconds(20)) && ok_; }
+  const std::string& error() const { return error_; }
 
  private:
   Event done_;
   bool ok_ = false;
+  std::string error_;
 };
 
 class StatsObserver : public webrtc::RTCStatsCollectorCallback {
@@ -304,6 +331,11 @@ int main() {
   Check(!webrtc::qaudion::MagicBytesBypassAllowed(),
         "frame-cryptor magic-bytes bypass not allowed");
 
+  if (std::getenv("QAUDION_SMOKE_LOG") != nullptr) {
+    // Opt-in (dev runs): warnings and errors of the library on stderr.
+    webrtc::LogMessage::LogToDebug(webrtc::LS_WARNING);
+    webrtc::LogMessage::SetLogToStderr(true);
+  }
   webrtc::InitializeSSL();
 
   webrtc::Environment env = webrtc::CreateEnvironment();
@@ -366,12 +398,12 @@ int main() {
   auto offer_obs = webrtc::make_ref_counted<CreateSdpObserver>();
   a.pc->CreateOffer(offer_obs.get(),
                     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
-  Check(offer_obs->Wait(), "offer created");
+  Require(offer_obs->Wait(), "offer created", offer_obs->error());
   auto offer = offer_obs->Take();
   auto set_local_a = webrtc::make_ref_counted<SetLocalObserver>();
   a.pc->SetLocalDescription(std::move(offer), set_local_a);
-  Check(set_local_a->Wait(), "offerer local description set");
-  Check(a.gathered_.WaitFor(seconds(20)), "offerer ICE gathering complete");
+  Require(set_local_a->Wait(), "offerer local description set", set_local_a->error());
+  Require(a.gathered_.WaitFor(seconds(20)), "offerer ICE gathering complete");
   std::optional<std::string> offer_sdp = ToSdp(a.pc->local_description());
   Check(offer_sdp.has_value(), "offerer local description readable");
   if (!offer_sdp) {
@@ -382,17 +414,17 @@ int main() {
   b.pc->SetRemoteDescription(
       webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, *offer_sdp),
       set_remote_b);
-  Check(set_remote_b->Wait(), "answerer remote description set");
+  Require(set_remote_b->Wait(), "answerer remote description set", set_remote_b->error());
 
   auto answer_obs = webrtc::make_ref_counted<CreateSdpObserver>();
   b.pc->CreateAnswer(answer_obs.get(),
                      webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
-  Check(answer_obs->Wait(), "answer created");
+  Require(answer_obs->Wait(), "answer created", answer_obs->error());
   auto answer = answer_obs->Take();
   auto set_local_b = webrtc::make_ref_counted<SetLocalObserver>();
   b.pc->SetLocalDescription(std::move(answer), set_local_b);
-  Check(set_local_b->Wait(), "answerer local description set");
-  Check(b.gathered_.WaitFor(seconds(20)), "answerer ICE gathering complete");
+  Require(set_local_b->Wait(), "answerer local description set", set_local_b->error());
+  Require(b.gathered_.WaitFor(seconds(20)), "answerer ICE gathering complete");
   std::optional<std::string> answer_sdp = ToSdp(b.pc->local_description());
   Check(answer_sdp.has_value(), "answerer local description readable");
   if (!answer_sdp) {
@@ -403,7 +435,7 @@ int main() {
   a.pc->SetRemoteDescription(
       webrtc::CreateSessionDescription(webrtc::SdpType::kAnswer, *answer_sdp),
       set_remote_a);
-  Check(set_remote_a->Wait(), "offerer remote description set");
+  Require(set_remote_a->Wait(), "offerer remote description set", set_remote_a->error());
 
   const bool connected = a.connected_.WaitFor(seconds(40)) &&
                          b.connected_.WaitFor(seconds(40));
