@@ -385,6 +385,9 @@ class Pump {
   std::function<HRESULT()> renegotiate_output;
   int fed = 0;
   int produced = 0;
+  int ev_need_input = 0;
+  int ev_have_output = 0;
+  int ev_other = 0;
   HRESULT hr = S_OK;
   std::string stage;
   double seconds = 0;
@@ -435,6 +438,7 @@ class Pump {
         }
         switch (type) {
           case METransformNeedInput: {
+            ++ev_need_input;
             if (fed < total) {
               start();
               HRESULT r = FeedOne();
@@ -456,6 +460,7 @@ class Pump {
             break;
           }
           case METransformHaveOutput: {
+            ++ev_have_output;
             bool more = false;
             HRESULT r = PullOne(&more);
             if (FAILED(r)) {
@@ -473,6 +478,7 @@ class Pump {
             hr = E_FAIL;
             return false;
           default:
+            ++ev_other;
             break;
         }
       }
@@ -730,6 +736,24 @@ bool PrepareMft(const MftInfo& mi, bool use_d3d, TestResult* r, Prepared* p) {
   return true;
 }
 
+// Diagnostics that make a first failure on real hardware debuggable from the
+// report alone (no user data: counters and flag words only).
+void AddPumpNotes(TestResult* r, const Pump& pump, IMFTransform* mft) {
+  char b[128];
+  MFT_INPUT_STREAM_INFO isi{};
+  MFT_OUTPUT_STREAM_INFO osi{};
+  if (SUCCEEDED(mft->GetInputStreamInfo(0, &isi)) && SUCCEEDED(mft->GetOutputStreamInfo(0, &osi))) {
+    std::snprintf(b, sizeof b, "stream flags in=0x%lX out=0x%lX out_size=%lu", isi.dwFlags,
+                  osi.dwFlags, osi.cbSize);
+    r->notes.push_back(b);
+  }
+  if (pump.gen) {
+    std::snprintf(b, sizeof b, "events need_input=%d have_output=%d other=%d",
+                  pump.ev_need_input, pump.ev_have_output, pump.ev_other);
+    r->notes.push_back(b);
+  }
+}
+
 // ---------------------------------------------------------------- encode
 
 EncodeOut DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
@@ -850,6 +874,7 @@ EncodeOut DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
     return mft->SetOutputType(0, ot.Get(), 0);
   };
   const bool ok = pump.Run();
+  AddPumpNotes(&r, pump, mft);
   r.frames_in = pump.fed;
   r.frames_out = pump.produced;
   r.seconds = pump.seconds;
@@ -960,6 +985,7 @@ TestResult DoDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>
   pump.on_output = [&](IMFSample*) {};
   pump.renegotiate_output = [&]() -> HRESULT { return PickOutputNv12(mft); };
   const bool ok = pump.Run();
+  AddPumpNotes(&r, pump, mft);
   r.frames_in = pump.fed;
   r.frames_out = pump.produced;
   r.seconds = pump.seconds;
