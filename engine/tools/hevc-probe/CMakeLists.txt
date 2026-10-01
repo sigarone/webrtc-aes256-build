@@ -24,7 +24,10 @@ if(MSVC)
   # "media_foundation_available": false on Windows Server images that do not
   # ship it, instead of failing to start.
   target_link_options(hevc-probe PRIVATE
-    /DELAYLOAD:mfplat.dll /Brepro /DYNAMICBASE /NXCOMPAT /guard:cf /CETCOMPAT)
+    /DELAYLOAD:mfplat.dll /Brepro /DYNAMICBASE /NXCOMPAT /guard:cf /CETCOMPAT
+    /DEPENDENTLOADFLAG:0x800)
+  # /DEPENDENTLOADFLAG:0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32 for the static imports,
+  # so that a DLL planted next to the downloaded exe is never picked up.
 endif()
 
 target_link_libraries(hevc-probe PRIVATE

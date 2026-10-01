@@ -30,6 +30,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -55,6 +56,11 @@ constexpr int kFps = 30;
 constexpr int kFrames = 60;
 constexpr DWORD kTestTimeoutMs = 45000;
 constexpr UINT32 kH265Main420x8 = 1;  // eAVEncH265VProfile_Main_420_8
+// Upper bound for the whole run. The per-test watchdog does not cover the
+// start-up enumeration (DXGI and MFTEnumEx load vendor user-mode drivers), so a
+// stuck driver there would otherwise leave the process hanging forever.
+constexpr DWORD kHardLimitMs = 30 * 60 * 1000;
+std::atomic<bool> g_run_finished{false};
 
 // The codec under test. HEVC is the point of the probe; "--codec h264" runs the
 // very same pipeline on H.264 and is used by CI as a self-test of the encode and
@@ -1025,13 +1031,15 @@ template <typename R, typename F>
 R WithWatchdog(F f, R timeout_value) {
   auto prom = std::make_shared<std::promise<R>>();
   std::future<R> fut = prom->get_future();
-  std::thread([prom, f]() mutable {
+  std::thread([prom, f, timeout_value]() mutable {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     R res{};
     SehInfo info;
     std::function<void()> body = [&] { res = f(); };
     if (!SafeInvoke(body, &info)) {
-      res = R{};
+      // Start from the timeout value so that the entry still names the MFT,
+      // the resolution and the D3D mode that crashed.
+      res = timeout_value;
       MarkCrash(Result(res), info.code);
     }
     prom->set_value(std::move(res));
@@ -1269,6 +1277,19 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Hard cap on the run time (disarmed once the report is out, so that --pause
+  // can wait for Enter).
+  std::thread([] {
+    for (DWORD waited = 0; waited < kHardLimitMs; waited += 500) {
+      if (g_run_finished.load()) return;
+      Sleep(500);
+    }
+    if (g_run_finished.load()) return;
+    std::fprintf(stderr, "[hevc-probe] hard time limit reached, giving up\n");
+    std::fflush(stderr);
+    ExitProcess(3);
+  }).detach();
+
   _setmode(_fileno(stdout), _O_BINARY);  // the file and stdout carry identical bytes
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   std::fprintf(stderr, "[hevc-probe] start (%s)\n", g_codec_name);
@@ -1277,7 +1298,9 @@ int main(int argc, char** argv) {
   GetNativeSystemInfo(&si);
   ListAdapters();
 
-  const bool mf_dll = LoadLibraryW(L"mfplat.dll") != nullptr;
+  // Load Media Foundation from System32 only (the exe is typically run from a
+  // download folder; the delay-loaded import then binds to this module).
+  const bool mf_dll = LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) != nullptr;
   HRESULT mf_hr = mf_dll ? S_FALSE : HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
   if (mf_dll) mf_hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
   const bool mf_ok = SUCCEEDED(mf_hr);
@@ -1492,6 +1515,7 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[hevc-probe] report file %s\n",
                written ? "written next to the executable" : "NOT written (read-only location)");
 
+  g_run_finished = true;
   if (pause) {
     std::fprintf(stderr, "Press Enter to close.\n");
     std::getchar();

@@ -23,6 +23,10 @@ protocol logic.
 - When no encoder worked there is no bitstream to decode: the decoders are then only
   created and configured for HEVC input (`kind: configure_only`).
 
+The whole run is capped at 30 minutes (the start-up enumeration loads vendor
+drivers and is not covered by the per-test watchdog). Media Foundation and the other
+system DLLs are loaded from System32 only.
+
 ## Running it
 
 Double-click `run-probe.cmd` (it keeps the window open), or from a terminal:

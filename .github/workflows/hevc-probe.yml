@@ -79,6 +79,7 @@ jobs:
             if ($txt.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw 'report contains machine or user specific text' }
           }
           if ($txt -match '\\Users\\|[A-Za-z]:\\|[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}') { throw 'report contains a path or a MAC-like string' }
+          if (@($rep.tests | Where-Object { $_.failed_stage -in @("crash", "timeout") }).Count -gt 0) { throw "a test crashed or timed out" }
           # The hosted runner has no GPU: a hardware encode must not be reported.
           if ($rep.summary.hevc_hardware_encode_720p_ok) { throw 'unexpected hardware encode on the hosted runner' }
 
@@ -96,12 +97,12 @@ jobs:
           $enc = @($rep.encoders.mfts).Count
           $dec = @($rep.decoders.mfts).Count
           Write-Host "h264 encoder MFTs: $enc, decoder MFTs: $dec"
-          if ($enc -gt 0 -and $dec -gt 0) {
-            if (-not $rep.summary.h264_any_encode_720p_ok) { throw 'self-test: encode failed' }
-            if (-not $rep.summary.h264_decode_720p_ok) { throw 'self-test: decode failed' }
-          } else {
-            Write-Host '::warning::no H.264 MFT on this runner image: the encode/decode path was not exercised'
-          }
+          if (@($rep.tests | Where-Object { $_.failed_stage -in @("crash", "timeout") }).Count -gt 0) { throw "self-test: a test crashed or timed out" }
+          # A self-test that can skip itself can never fail: a missing H.264 MFT is an error.
+          if ($enc -lt 1 -or $dec -lt 1) { throw 'self-test: no H.264 encoder or decoder MFT on this runner image' }
+          if (-not $rep.summary.h264_any_encode_720p_ok) { throw 'self-test: encode failed' }
+          if (-not $rep.summary.h264_decode_720p_ok) { throw 'self-test: decode failed' }
+          if ($rep.summary.best_encode_fps_720p -le 0) { throw 'self-test: no encode throughput measured' }
 
       - name: Collect the artifact files
         shell: pwsh
