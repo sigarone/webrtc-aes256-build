@@ -23,7 +23,20 @@ name: test-webrtc-m150-patches
 
 on:
   workflow_dispatch:
+    inputs:
+      no_ccache:
+        description: "true = compile without the compiler cache and save nothing (cold verification build)"
+        default: "false"
   pull_request:
+    paths:
+      - 'm150/**'
+      - '.github/workflows/test-m150-patches.yml'
+  # A run on main is what fills the caches that PR runs restore from: a cache
+  # saved on a branch or on a PR merge ref is invisible to every other ref, one
+  # saved on main is visible to all. The release builds (build-m150-*) never
+  # restore or save any of these caches.
+  push:
+    branches: [main]
     paths:
       - 'm150/**'
       - '.github/workflows/test-m150-patches.yml'
@@ -37,6 +50,7 @@ env:
   # depot_tools is pinned inside m150/ci/sync.sh itself (no override).
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
+  NO_CCACHE: ${{ github.event.inputs.no_ccache }}
   # T1-T10 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
   # workflow, build-m150-windows.yml).
 
@@ -55,10 +69,31 @@ jobs:
           path: ctrl
           persist-credentials: false
 
+      # Cache of the sha1-addressed test blobs (src/resources) that the
+      # webrtc-resources gclient hook downloads (~4 min). sync.sh re-verifies
+      # every blob against its .sha1 file, so the cache can only save time.
+      - name: Restore resources cache
+        id: rescache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/synccache
+          key: webrtc-resources-v1-${{ hashFiles('ctrl/m150/ci/sync.sh') }}
+          restore-keys: |
+            webrtc-resources-v1-
+
       - name: Sync M150 source (pinned, hard-verified)
+        env:
+          SYNC_RESOURCES_CACHE: ${{ runner.temp }}/synccache
         run: |
           set -euo pipefail
           bash ctrl/m150/ci/sync.sh "$WORKDIR" "$WEBRTC_REF" unix
+
+      - name: Save resources cache
+        if: ${{ success() && steps.rescache.outputs.cache-hit != 'true' && matrix.config == 'strict' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/synccache
+          key: webrtc-resources-v1-${{ hashFiles('ctrl/m150/ci/sync.sh') }}
 
       - name: Apply patch series (plain series only - variant-agnostic, no LK patch here)
         run: |
@@ -75,18 +110,63 @@ jobs:
           set -euo pipefail
           bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
+      # Compiler cache - THIS (non-shipping) workflow only. The release builds
+      # (build-m150-android/ios/windows) never use it: a shipped binary must be
+      # compiled from the reviewed sources on a clean runner, and an attested
+      # artifact must not contain objects restored from an earlier run.
+      # ccache keys every object on the preprocessed source, the full command
+      # line and the compiler binary's content, so a hit is byte-identical to
+      # what the compiler would have produced; the caches are branch-scoped by
+      # GitHub (a branch or PR run can never write one that main reads).
+      - name: Install ccache
+        if: ${{ env.NO_CCACHE != 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ccache
+          ccache --version | head -1
+
+      - name: Restore ccache (${{ matrix.config }})
+        id: ccache
+        if: ${{ env.NO_CCACHE != 'true' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-v1-${{ matrix.config }}-${{ hashFiles('ctrl/m150/patches/**', 'ctrl/m150/series', 'ctrl/m150/ci/sync.sh', 'ctrl/m150/kat/**') }}
+          restore-keys: |
+            ccache-v1-${{ matrix.config }}-
+
       - name: Build host x64 test binaries (${{ matrix.config }})
+        id: build
         working-directory: /home/runner/webrtc/src
         env:
           STRICT: ${{ matrix.config == 'strict' && 'true' || 'false' }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 3G
+          CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
         run: |
           set -euo pipefail
-          gn gen "out/test-${{ matrix.config }}" --args="is_debug=false rtc_include_tests=true symbol_level=1 treat_warnings_as_errors=false rtc_build_tools=false rtc_qaudion_transport_strict=$STRICT"
+          CCW=""
+          if [ "$NO_CCACHE" != "true" ]; then
+            CCW='cc_wrapper="ccache"'
+            ccache --zero-stats
+          fi
+          gn gen "out/test-${{ matrix.config }}" --args="is_debug=false rtc_include_tests=true symbol_level=1 treat_warnings_as_errors=false rtc_build_tools=false rtc_qaudion_transport_strict=$STRICT $CCW"
           # T1/T2 live in rtc_unittests (api/crypto, rtc_base); T3-T5 live in
           # modules_unittests (modules/audio_coding) - security review, stage 3:
           # only rtc_unittests used to be built, so T3-T5 matched zero tests
           # and "passed" without running anything.
           autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests peerconnection_unittests
+
+      - name: ccache statistics (${{ matrix.config }})
+        if: ${{ always() && env.NO_CCACHE != 'true' }}
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+        run: |
+          ccache --show-stats --verbose || true
+          { echo "### ccache (${{ matrix.config }})"; echo '```'; ccache --show-stats || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          du -sh "$CCACHE_DIR" || true
 
       - name: Run T1-T10 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
@@ -95,3 +175,13 @@ jobs:
         run: |
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/ctrl/m150/ci/run-tests.sh" "out/test-${CONFIG}" "$CONFIG"
+
+      - name: Save ccache (${{ matrix.config }})
+        # Save once the build step succeeded (also when a later test step fails,
+        # the objects are fine); a cancelled or half-finished build must not leave
+        # an incomplete cache under the exact key, which would never be rewritten.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.NO_CCACHE != 'true' && steps.ccache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-v1-${{ matrix.config }}-${{ hashFiles('ctrl/m150/patches/**', 'ctrl/m150/series', 'ctrl/m150/ci/sync.sh', 'ctrl/m150/kat/**') }}
