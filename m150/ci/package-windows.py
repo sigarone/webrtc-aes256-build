@@ -31,6 +31,7 @@ No absolute paths, timestamps or runner data are written into the archive.
 """
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -132,6 +133,57 @@ def collect(src):
     return sorted(files)
 
 
+INCLUDE_RE = re.compile(rb'^[ 	]*#[ 	]*include[ 	]+"([^"]+)"', re.M)
+
+
+def close_headers(src, files):
+    """Add every in-tree header the packaged headers (transitively) include
+    but the directory walk did not carry (for example sdk/objc/base/
+    RTCMacros.h, pulled in by api/audio/audio_device.h). Includes that resolve
+    only through a third_party include dir (absl/, libyuv/, openssl/, ...) are
+    covered by the directory walk; other third_party/ paths are reported, not
+    added."""
+    have = set(files)
+    work = list(files)
+    added = []
+    third = set()
+    while work:
+        rel = work.pop()
+        try:
+            with open(os.path.join(src, rel), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        here = os.path.dirname(rel)
+        for m in INCLUDE_RE.finditer(data):
+            inc = m.group(1).decode("utf-8", "replace")
+            if inc in have:
+                continue
+            cands = [inc]
+            if here:
+                cands.append(here + "/" + inc)
+            for c in cands:
+                c = os.path.normpath(c).replace(os.sep, "/")
+                if c in have:
+                    break
+                if not c.endswith(EXTS):
+                    continue
+                if c.startswith("third_party/"):
+                    if os.path.isfile(os.path.join(src, c)):
+                        third.add(c.split("/")[1])
+                    continue
+                if os.path.isfile(os.path.join(src, c)):
+                    have.add(c)
+                    work.append(c)
+                    added.append(c)
+                    break
+    print("package-windows: header closure added %d file(s); third_party dirs referenced but not shipped: %s"
+          % (len(added), sorted(third)))
+    for a in sorted(added)[:60]:
+        print("  + " + a)
+    return sorted(have)
+
+
 def main():
     want_libcxx = "--libcxx" in sys.argv
     argv = [a for a in sys.argv[1:] if a != "--libcxx"]
@@ -163,7 +215,7 @@ def main():
                 f.write('"%s"\n' % o)
         subprocess.run([msvc_lib_exe(), "/nologo", "/OUT:" + cxx_lib, "@" + rsp], check=True)
         print("package-windows: libcxx.lib %d bytes from %d objects" % (os.path.getsize(cxx_lib), len(objs)))
-    files = collect(src)
+    files = close_headers(src, collect(src))
     cxx_files = libcxx_headers(src) if want_libcxx else []
     if len(files) < 1000:
         print("::error::package-windows: only %d headers found - wrong checkout?" % len(files), file=sys.stderr)
