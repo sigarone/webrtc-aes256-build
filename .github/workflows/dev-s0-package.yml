@@ -100,4 +100,4 @@ jobs:
       - name: Consumer link smoke (in this job, clang from the checkout)
         run: |
           set -euo pipefail
-          cmd //c "ctrl\\m150\\ci\\run-in-vcvars.cmd python ctrl/m150/ci/link-smoke.py out C:/w/src/third_party/llvm-build/Release+Asserts C:/smoke ctrl/m150/smoke/consumer.cc
+          python ctrl/m150/ci/link-smoke.py out C:/w/src/third_party/llvm-build/Release+Asserts C:/smoke ctrl/m150/smoke/consumer.cc
