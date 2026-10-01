@@ -1,0 +1,102 @@
+name: dev-s0-package
+
+# TEMPORARY, branch-only (feat/m150-windows-s0): exercises the new S0 packaging
+# (libcxx.lib, libc++ headers, build-flags.json) and the consumer link smoke
+# WITHOUT rebuilding webrtc.lib: the already published dplc-1 library (same
+# GN args, same toolchain, so the same ABI) stands in for it. Deleted before
+# the PR merges.
+
+on:
+  push:
+    branches: [feat/m150-windows-s0]
+    paths: [".github/workflows/dev-s0-package.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      WORKDIR: C:/w
+      DEPOT_TOOLS_UPDATE: "0"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      GYP_MSVS_VERSION: "2022"
+      GYP_MSVS_OVERRIDE_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      vs2022_install: C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+      WINDOWSSDKDIR: C:\Program Files (x86)\Windows Kits\10
+      NINJA_STATUS: "[%f/%t %es] "
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ctrl
+          persist-credentials: false
+
+      - name: Sync
+        env:
+          WEBRTC_FORK_URL: https://github.com/sigarone/webrtc.git
+        run: bash ctrl/m150/ci/sync.sh "$WORKDIR" "ba469aa2093b-qaudion-m150" win
+
+      - name: Apply series
+        run: |
+          bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
+          bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: gn gen and build the libc++ runtime target
+        working-directory: C:/w/src
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          mkdir -p out/win-x64
+          GN_ARGS='target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true'
+          echo "$GN_ARGS" | tr ' ' '\n' > out/win-x64/args.gn
+          echo "GN_ARGS=$GN_ARGS" >> "$GITHUB_ENV"
+          cmd //c "gn.bat gen out/win-x64"
+          cmd //c "autoninja.bat -C out/win-x64 buildtools/third_party/libc++:libc++"
+          find out/win-x64/obj -name '*.obj' -path '*libc++*' | head -5
+          find out/win-x64/obj -name '*.obj' -path '*llvm-libc*' | head -5
+
+      - name: Stand-in webrtc.lib (published dplc-1, sha256-verified)
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKDIR/src/out/win-x64/obj"
+          curl -fsSL -o "$WORKDIR/src/out/win-x64/obj/webrtc.lib" "https://github.com/sigarone/webrtc-aes256-build/releases/download/webrtc-windows-m150-a256-dplc-1/webrtc.lib"
+          echo "9d00b0cdffd05ab61137c4ca65ea495d73e2cfc8a746e9dd96b31bb9dbd0aa58 *$WORKDIR/src/out/win-x64/obj/webrtc.lib" | sha256sum -c -
+
+      - name: Package (libcxx.lib, headers incl. libc++)
+        run: |
+          set -euo pipefail
+          py=python; command -v python3 >/dev/null 2>&1 && py=python3
+          "$py" ctrl/m150/ci/package-windows.py "$WORKDIR/src" "$WORKDIR/src/out/win-x64" stage out --libcxx
+          ls -l out
+
+      - name: build-flags.json
+        run: |
+          set -euo pipefail
+          export PATH="$(cygpath -u "$WORKDIR")/depot_tools:$PATH"
+          bash ctrl/m150/ci/collect-build-flags.sh "$WORKDIR/src" out/win-x64 raw "$GN_ARGS" out/build-flags.json
+          cp -r raw out/raw-dumps
+
+      - name: Upload (always)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: s0-pkg
+          path: |
+            out/libcxx.lib
+            out/webrtc-headers.zip
+            out/build-flags.json
+            out/raw-dumps/clang-version.txt
+            out/raw-dumps/cr-build-revision
+            out/raw-dumps/clang-sha256
+          if-no-files-found: warn
+
+      - name: Consumer link smoke (in this job: clang from the checkout)
+        run: |
+          set -euo pipefail
+          cmd //c "ctrl\\m150\\ci\\run-in-vcvars.cmd python ctrl/m150/ci/link-smoke.py out C:/w/src/third_party/llvm-build/Release+Asserts C:/smoke ctrl/m150/smoke/consumer.cc"
