@@ -48,7 +48,7 @@ ServeResult Serve(ByteStream& stream, FrameBuffer& buf, std::span<const uint8_t>
   // ---- Hello: any failure is silent. ----------------------------------------------------
   if (nonce.size() != kNonceBytes) return ServeResult::HandshakeFailed;
   {
-    Err e = ReadFrame(stream, buf, hello_timeout_ms);
+    Err e = ReadFrame(stream, buf, hello_timeout_ms, kMaxHelloFramePayload);
     if (e != Err::Ok) return ServeResult::HandshakeFailed;
     cbor::Value root;
     ValidatedMessage msg;

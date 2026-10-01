@@ -12,6 +12,9 @@ inline constexpr uint32_t kProtocolVersion = 1;
 // Framing: 4-byte big-endian length, then that many payload bytes.
 inline constexpr size_t kFrameHeaderBytes = 4;
 inline constexpr size_t kMaxFramePayload = 1u << 20;  // 1 MiB. Video never goes through IPC.
+// Before the nonce has been checked the peer is unauthenticated: its first frame may be this big at
+// most (a hello is about 70 bytes), so it cannot make the engine allocate or decode more.
+inline constexpr size_t kMaxHelloFramePayload = 256;
 
 // CBOR decoder bounds.
 inline constexpr int kMaxDepth = 6;          // nesting levels below the root map

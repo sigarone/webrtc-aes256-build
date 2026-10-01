@@ -28,8 +28,8 @@
 ; Handles (session, cert, pc) are opaque numbers chosen by the engine, valid for the session
 ; that created them. They are never reused within one engine process.
 ;
-; The first client message must be "hello" with the 32-byte session nonce. Nothing is sent to a
-; peer that fails this check.
+; The first client message must be "hello" with the 32-byte session nonce, in a frame of at most
+; 256 bytes. Nothing is sent to a peer that fails this check.
 ;
 ; Key material travels only in install_key. The engine zeroes the receive buffer as soon as the
 ; message has been handled and fills retired slots with random bytes (never zeros).

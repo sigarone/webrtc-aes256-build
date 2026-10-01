@@ -414,7 +414,7 @@ QTEST(schema_text_fields_reject_control_characters) {
   full.full = true;
   CHECK_EQ(CheckC2E(GenMessageWith(pc, full, "ice_servers", &urls)), Err::SchemaText);
   const MessageSpec& cand = Spec("add_ice_candidate");
-  const Buf line = Str("candidate:1 1 udp 1 1.2.3.4 5 typ host\r\n");
+  const Buf line = Str("candidate:1 1 udp 1 h 5 typ host\r\n");
   CHECK_EQ(CheckC2E(GenMessageWith(cand, o, "candidate", &line)), Err::SchemaText);
 
   // SDP may contain line breaks and tabs, but not NUL or other control characters.

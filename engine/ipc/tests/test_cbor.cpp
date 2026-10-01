@@ -171,6 +171,13 @@ QTEST(cbor_map_key_rules) {
   CHECK_EQ(Dec(Bytes({0xA1, 0xC0, 0x61, 'a', 0x01})), Err::CborKeyType);
 }
 
+// The bounds are part of the contract (schema.cddl, README). Changing one is a conscious edit.
+static_assert(kMaxDepth == 6);
+static_assert(kMaxNodes == 4096);
+static_assert(kMaxKeyBytes == 64);
+static_assert(kMaxFramePayload == 1048576);
+static_assert(kNonceBytes == 32 && kKeyBytes == 32 && kFingerprintBytes == 32);
+
 QTEST(cbor_depth_and_node_limits) {
   // kMaxDepth levels of nesting below the root are accepted, one more is not.
   Buf ok;

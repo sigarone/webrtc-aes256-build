@@ -16,6 +16,10 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 if(MSVC)
   add_compile_options(/W4 /permissive- /EHsc /utf-8 /GS)
+  # Control Flow Guard needs every object that makes an indirect call to be compiled with it, so
+  # it is set for the whole project (the IPC libraries included), not only for the executable.
+  add_compile_options($<$<CONFIG:Release>:/guard:cf>)
+  add_link_options($<$<CONFIG:Release>:/GUARD:CF>)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
   add_compile_options(-Wall -Wextra -Wpedantic -fstack-protector-strong)
@@ -40,9 +44,7 @@ if(QMEDIA_BUILD_ENGINE)
   endif()
   add_executable(qaudion-media src/main.cpp)
   target_link_libraries(qaudion-media PRIVATE qmedia_ipc qmedia_pipe)
-  target_compile_options(qaudion-media PRIVATE $<$<CONFIG:Release>:/guard:cf>)
-  target_link_options(qaudion-media PRIVATE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA
-                      $<$<CONFIG:Release>:/guard:cf>)
+  target_link_options(qaudion-media PRIVATE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA)
   include(webrtc)
   qmedia_link_webrtc(qaudion-media)
 endif()

@@ -166,6 +166,40 @@ QTEST(session_first_message_must_be_hello) {
   CHECK(rn.result == ServeResult::HandshakeFailed && rn.out.empty());
 }
 
+QTEST(session_hello_frame_is_small) {
+  // A valid hello is far below the pre-authentication cap...
+  CHECK(BuildHello(0xFFFFFFFFu, Nonce(5)).size() < kMaxHelloFramePayload / 2);
+  // ...and a peer that has not proven the nonce cannot make the engine read a bigger frame: a
+  // header above the cap ends the handshake after 4 bytes, silently.
+  const Buf nonce = Nonce(5);
+  Buf in{0x00, 0x00, 0x01, 0x01};  // 257 bytes announced
+  in.resize(in.size() + 257, 0x55);
+  MemoryStream s(in);
+  FrameBuffer buf;
+  StubHandler handler;
+  const ServeResult r = Serve(s, buf, nonce, 1000, handler);
+  CHECK(r == ServeResult::HandshakeFailed);
+  CHECK(s.written().empty());
+  CHECK_EQ(s.consumed(), 4u);
+  CHECK_EQ(buf.capacity(), 0u);  // nothing was allocated for the oversized hello
+
+  // After a good hello the full frame size is available again.
+  Buf in2;
+  Append(in2, BuildHello(1, nonce));
+  const MessageSpec& sd = *FindMessage("set_remote_description");
+  GenOptions o;
+  o.id = 2;
+  cbor::Buf sdp;
+  cbor::PutStr(sdp, std::string(2000, 'a'));
+  const Buf big = GenMessageWith(sd, o, "sdp", &sdp);
+  CHECK(big.size() > kMaxHelloFramePayload);
+  Append(in2, big);
+  Run r2;
+  RunServe(in2, nonce, &r2);
+  CHECK(r2.result == ServeResult::PeerClosed);
+  CHECK((Kinds(r2.out) == std::vector<std::string>{"hello_ok", "err"}));
+}
+
 QTEST(session_rejects_a_bad_server_nonce_size) {
   Buf in;
   Append(in, BuildHello(1, Nonce(5)));
@@ -299,6 +333,50 @@ QTEST(session_key_material_is_wiped_from_the_receive_buffer) {
   const std::string out(r.out.begin(), r.out.end());
   const std::string needle(key.begin(), key.end());
   CHECK(out.find(needle) == std::string::npos);
+}
+
+namespace {
+
+// A stream that looks at the receive buffer every time the engine writes something.
+class WriteProbe final : public ByteStream {
+ public:
+  WriteProbe(std::span<const uint8_t> in, const FrameBuffer* buf) : mem_(in), buf_(buf) {}
+  IoResult ReadExact(uint8_t* dst, size_t n, uint32_t t) override { return mem_.ReadExact(dst, n, t); }
+  IoResult WriteAll(const uint8_t* src, size_t n, uint32_t t) override {
+    ++writes;
+    if (!BufferIsClean(*buf_)) dirty_writes++;
+    return mem_.WriteAll(src, n, t);
+  }
+  int writes = 0;
+  int dirty_writes = 0;
+
+ private:
+  MemoryStream mem_;
+  const FrameBuffer* buf_;
+};
+
+}  // namespace
+
+QTEST(session_buffer_is_wiped_before_any_reply_is_written) {
+  // A slow reader on the other side must not keep a key readable in memory while the engine waits
+  // to write: the buffer is already clean when the hello_ok and every later reply go out.
+  const Buf nonce = Nonce(13);
+  Buf key(32, 0x77);
+  Buf key_value;
+  cbor::PutBin(key_value, key);
+  GenOptions o;
+  o.id = 2;
+  Buf in;
+  Append(in, BuildHello(1, nonce));
+  Append(in, GenMessageWith(*FindMessage("install_key"), o, "key", &key_value));
+  Append(in, SimpleRequest("shutdown", 3));
+  FrameBuffer buf;
+  WriteProbe probe(in, &buf);
+  StubHandler handler;
+  const ServeResult r = Serve(probe, buf, nonce, 1000, handler);
+  CHECK(r == ServeResult::Shutdown);
+  CHECK_EQ(probe.writes, 6);  // header + payload for hello_ok, the unsupported err and the ok
+  CHECK_EQ(probe.dirty_writes, 0);
 }
 
 QTEST(session_reply_is_valid_engine_message) {

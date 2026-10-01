@@ -56,7 +56,8 @@ uint8_t* FrameBuffer::Prepare(size_t n) {
   return data_.get();
 }
 
-Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms) {
+Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms, size_t max_payload) {
+  if (max_payload > kMaxFramePayload) max_payload = kMaxFramePayload;
   buf.Wipe();
 
   uint8_t hdr[kFrameHeaderBytes];
@@ -69,7 +70,7 @@ Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms) {
   const uint32_t len = (static_cast<uint32_t>(hdr[0]) << 24) | (static_cast<uint32_t>(hdr[1]) << 16) |
                        (static_cast<uint32_t>(hdr[2]) << 8) | static_cast<uint32_t>(hdr[3]);
   if (len == 0) return Err::FrameEmpty;
-  if (len > kMaxFramePayload) return Err::FrameTooLarge;  // decided before reading the payload
+  if (len > max_payload) return Err::FrameTooLarge;  // decided before reading the payload
 
   uint8_t* dst = buf.Prepare(len);
   r = s.ReadExact(dst, len, body.Remaining());

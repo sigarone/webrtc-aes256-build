@@ -67,6 +67,35 @@ QTEST(frame_rejects_empty_and_oversized_from_the_header_alone) {
   }
 }
 
+QTEST(frame_honours_a_smaller_caller_limit) {
+  // The limit is checked from the header alone and never exceeds the protocol maximum.
+  Buf wire = Header(kMaxHelloFramePayload + 1);
+  wire.resize(4 + kMaxHelloFramePayload + 1, 0x33);
+  {
+    MemoryStream in(wire);
+    FrameBuffer buf;
+    CHECK_EQ(ReadFrame(in, buf, 1000, kMaxHelloFramePayload), Err::FrameTooLarge);
+    CHECK_EQ(in.consumed(), 4u);
+    CHECK_EQ(buf.capacity(), 0u);
+  }
+  {
+    Buf ok = Header(kMaxHelloFramePayload);
+    ok.resize(4 + kMaxHelloFramePayload, 0x33);
+    MemoryStream in(ok);
+    FrameBuffer buf;
+    CHECK_EQ(ReadFrame(in, buf, 1000, kMaxHelloFramePayload), Err::Ok);
+    CHECK_EQ(buf.view().size(), kMaxHelloFramePayload);
+  }
+  {
+    // A caller cannot raise the limit above the protocol maximum.
+    Buf big = Header(static_cast<uint32_t>(kMaxFramePayload + 1));
+    big.resize(4 + 16, 0x44);
+    MemoryStream in(big);
+    FrameBuffer buf;
+    CHECK_EQ(ReadFrame(in, buf, 1000, kMaxFramePayload * 8), Err::FrameTooLarge);
+  }
+}
+
 QTEST(frame_accepts_exactly_the_maximum) {
   Buf wire = Header(static_cast<uint32_t>(kMaxFramePayload));
   wire.resize(4 + kMaxFramePayload, 0x22);

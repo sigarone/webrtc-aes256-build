@@ -113,6 +113,9 @@ IPC hardening.
   rejects huge length claims from the header alone, and validates UTF-8 strictly. The validator
   additionally refuses control characters (NUL, C0, DEL) in every text field, so an identifier
   can neither truncate a C string nor smuggle a line break; only SDP may contain CR, LF and HT.
+- Before the nonce has been checked the peer is unauthenticated, so its first frame may be 256
+  bytes at most (a hello is about 60). A larger header ends the handshake after 4 bytes, with
+  nothing allocated and nothing sent. The full 1 MiB frame size applies only after a good hello.
 - Timeouts: the first byte of the hello must arrive within 5 seconds, and once any frame has
   started its remaining bytes must follow within 10 seconds, so a stalled peer cannot hold the
   reader. Between messages the engine waits without limit for the host.

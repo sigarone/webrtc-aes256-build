@@ -46,7 +46,7 @@ class FrameBuffer {
   void Wipe();
 
  private:
-  friend Err ReadFrame(ByteStream&, FrameBuffer&, uint32_t);
+  friend Err ReadFrame(ByteStream&, FrameBuffer&, uint32_t, size_t);
   uint8_t* Prepare(size_t n);  // only valid right after Wipe()
 
   std::unique_ptr<uint8_t[]> data_;
@@ -58,8 +58,10 @@ class FrameBuffer {
 // Reads one frame into buf (wiping it first). idle_timeout_ms bounds the wait for the first byte
 // of the frame (kNoTimeout = wait forever). After that byte the rest of the frame must arrive
 // within kFrameBodyTimeoutMs, so a peer that stalls in the middle of a frame cannot hold the
-// reader forever.
-Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms);
+// reader forever. A length above max_payload (never above kMaxFramePayload) is FrameTooLarge,
+// decided from the header alone.
+Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms,
+              size_t max_payload = kMaxFramePayload);
 
 // Writes header and payload. Fails with FrameEmpty / FrameTooLarge for an invalid size.
 Err WriteFrame(ByteStream& s, std::span<const uint8_t> payload, uint32_t timeout_ms);
