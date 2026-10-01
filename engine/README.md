@@ -145,7 +145,7 @@ Command groups, all defined in the schema:
   `pc_create` takes a session and a certificate handle; several peer connections per session
   (1:1 uses one, group calls use a publisher and a subscriber).
 - Negotiation: `create_offer`, `create_answer`, `set_local_description`, `set_remote_description`,
-  `add_ice_candidate`, `restart_ice`, and the events `ice_candidate`, `ice_gathering_state`,
+  `add_ice_candidate`, `restart_ice`, `update_ice_servers` (refresh relay credentials in a long call), and the events `ice_candidate`, `ice_gathering_state`,
   `ice_connection_state`, `pc_state`, `negotiation_needed`.
 - Frame keys: `install_key` (participant, slot 0 to 15, 32-byte key, direction send or recv),
   `retire_slot`, `select_send_slot`, `bind_media` (ties a media section to a participant and a

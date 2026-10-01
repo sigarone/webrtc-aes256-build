@@ -80,6 +80,7 @@ constexpr FieldSpec kFCreateOffer[] = {Hnd("pc"), Flag("ice_restart", false)};
 constexpr FieldSpec kFSetDesc[] = {Hnd("pc"), En("type", kSdpType), Sdp("sdp", 0, 262144)};
 constexpr FieldSpec kFCandidate[] = {Hnd("pc"), Str("candidate", 0, 2048), Str("mid", 0, 16, false),
                                      Num("mline_index", 0, 255, false)};
+constexpr FieldSpec kFUpdateIce[] = {Hnd("pc"), ArrObj("ice_servers", 0, 8, kFIceServer)};
 constexpr FieldSpec kFInstallKey[] = {Hnd("session"), Str("participant", 1, 64), Num("slot", 0, 15),
                                       Bin("key", kKeyBytes, kKeyBytes, true, true),
                                       En("direction", kDirection)};
@@ -161,6 +162,7 @@ constexpr MessageSpec kMessages[] = {
     {"set_remote_description", C2E, IdRule::Request, kFSetDesc},
     {"add_ice_candidate", C2E, IdRule::Request, kFCandidate},
     {"restart_ice", C2E, IdRule::Request, kFPc},
+    {"update_ice_servers", C2E, IdRule::Request, kFUpdateIce},
     {"install_key", C2E, IdRule::Request, kFInstallKey},
     {"retire_slot", C2E, IdRule::Request, kFRetire},
     {"select_send_slot", C2E, IdRule::Request, kFSelectSlot},

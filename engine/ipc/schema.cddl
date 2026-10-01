@@ -51,7 +51,7 @@ scalar = uint / bool / tstr .size (0..128)
 client-message =
   hello / ping / shutdown / session-create / session-close / cert-create / pc-create /
   pc-close / create-offer / create-answer / set-local-description / set-remote-description /
-  add-ice-candidate / restart-ice / install-key / retire-slot / select-send-slot / bind-media /
+  add-ice-candidate / restart-ice / update-ice-servers / install-key / retire-slot / select-send-slot / bind-media /
   set-muted / list-devices / select-device / start-video / stop-video / request-keyframe /
   set-simulcast / pcm-tap / get-stats / set-audio-tuning
 
@@ -187,6 +187,17 @@ restart-ice = {
   t: "restart_ice",
   id: req-id,
   pc: handle,
+}
+
+; Replaces the ICE server list of a live peer connection (for example to refresh short-lived relay
+; credentials during a long call). An empty list removes all servers. Takes effect for the next
+; gathering, so the host follows it with restart_ice when it needs new candidates now.
+update-ice-servers = {
+  v: 1,
+  t: "update_ice_servers",
+  id: req-id,
+  pc: handle,
+  ice_servers: [0*8 ice-server],
 }
 
 ; Installs a 32-byte frame key into ring slot 0..15 of a participant. "send" keys are used by
