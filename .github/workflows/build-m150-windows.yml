@@ -240,9 +240,9 @@ jobs:
           mkdir -p out/test-strict
           echo 'target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=true rtc_build_examples=false rtc_build_tools=false use_rtti=true treat_warnings_as_errors=false rtc_use_h264=false rtc_use_h265=true rtc_qaudion_transport_strict=true' | tr ' ' '\n' > out/test-strict/args.gn
           cmd //c "gn.bat gen out/test-strict"
-          cmd //c "autoninja.bat -C out/test-strict rtc_unittests modules_unittests"
+          cmd //c "autoninja.bat -C out/test-strict rtc_unittests modules_unittests peerconnection_unittests"
 
-      - name: Run T1-T9 (strict)
+      - name: Run T1-T10 (strict)
         working-directory: C:/w/src
         run: |
           set -euo pipefail

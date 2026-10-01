@@ -37,7 +37,7 @@ env:
   # depot_tools is pinned inside m150/ci/sync.sh itself (no override).
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
-  # T1-T9 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
+  # T1-T10 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
   # workflow, build-m150-windows.yml).
 
 jobs:
@@ -86,9 +86,9 @@ jobs:
           # modules_unittests (modules/audio_coding) - security review, stage 3:
           # only rtc_unittests used to be built, so T3-T5 matched zero tests
           # and "passed" without running anything.
-          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests
+          autoninja -C "out/test-${{ matrix.config }}" rtc_unittests modules_unittests peerconnection_unittests
 
-      - name: Run T1-T9 (${{ matrix.config }})
+      - name: Run T1-T10 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
         env:
           CONFIG: ${{ matrix.config }}

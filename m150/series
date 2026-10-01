@@ -29,6 +29,10 @@ third_party P4a-opus-dnn-osce-build.patch
 # unittest and api/crypto/BUILD.gn; applies on top of P1/P2/P3/P6/P7.
 . P12-frame-replay-window.patch
 #
+# P9: certificate stats cache must not pin a result taken before the DTLS
+# handshake delivered the peer certificate (transcript-v5 check (b)).
+. P9-stats-remote-cert-cache.patch
+#
 # Build-tooling author: P10 touches the separate 'build' repo (DEPS
 # 'src/build'), not the webrtc src tree or third_party, so it has no hunk
 # overlap with P1-P8/P4a and its position in this file does not matter.

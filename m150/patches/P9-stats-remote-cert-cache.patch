@@ -1,0 +1,135 @@
+Certificate stats: do not cache a result that has no remote certificate yet.
+
+RTCStatsCollector::PrepareTransportCertificateStats_n() caches the per-
+transport certificate pair on the first getStats() and returns that cache
+until ClearCachedStatsReport() runs. ClearCachedStatsReport() is called on
+SDP, ICE candidate and data-channel changes only, never when a DTLS
+handshake completes. A getStats() issued between ICE connected and the end
+of the DTLS handshake therefore stored a pair whose `remote` was empty, and
+every later report kept omitting the remote certificate:
+transport.remoteCertificateId stayed absent for the rest of the call.
+
+The DTLS server (the answerer, a=setup:passive) is the side that hits it:
+it only learns the client's certificate from the client's last flight, so
+the window is wide. The transcript-v5 check (b) in the apps (DTLSFP 3.6)
+polls getStats() for the negotiated certificates and fails closed after
+5 s without a verdict. Observed 2026-10-01 on M150 a256-dplc-9: every
+incoming call on Android ended 5 s after answer
+("dtls_fp mismatch stage=stats", [dtls-diag] remoteCert=NONE
+dtlsRole=server for the whole call), and some iOS-to-iOS calls ended the
+same way (hsfatal r=1) depending on timing.
+
+Fix: cache the result only when every transport reports a remote
+certificate. Until then it is recomputed on each call (what the code did
+before the cache existed). Once complete, behaviour is byte-for-byte
+upstream: the existing CertificateStatsCache test still holds. New test
+RTCStatsCollectorTest.CertificateStatsCacheWaitsForRemoteCertificate
+(T10, peerconnection_unittests) reproduces the field failure.
+
+Applies identically to every variant; nothing here depends on
+rtc_qaudion_transport_strict.
+
+diff --git a/pc/rtc_stats_collector.cc b/pc/rtc_stats_collector.cc
+index 90cc23b..8b1afa1 100644
+--- a/pc/rtc_stats_collector.cc
++++ b/pc/rtc_stats_collector.cc
+@@ -2267,10 +2267,29 @@ RTCStatsCollector::PrepareTransportCertificateStats_n(
+       transport_cert_stats.insert(
+           std::make_pair(transport_name, std::move(certificate_stats_pair)));
+     }
+-    // Copy the result into the certificate cache for future reference.
++    // Q-Audion (P9): cache the result only once every transport reports the
++    // remote certificate. Nothing invalidates this cache when a DTLS
++    // handshake completes (ClearCachedStatsReport() runs on SDP, candidate
++    // and data-channel changes only), so a getStats() issued while DTLS was
++    // still in progress used to pin an entry without `remote` for the rest
++    // of the call: transport.remoteCertificateId stayed absent forever. The
++    // DTLS server side is the one that hits it, since it receives the
++    // client's certificate in the client's last flight. Until the result is
++    // complete it is recomputed on every call, which is what the code did
++    // before the cache existed.
++    bool qaudion_remote_complete = true;
+     for (const auto& pair : transport_cert_stats) {
+-      cached_certificates_by_transport_.insert(
+-          std::make_pair(pair.first, pair.second.Copy()));
++      if (!pair.second.remote) {
++        qaudion_remote_complete = false;
++        break;
++      }
++    }
++    // Copy the result into the certificate cache for future reference.
++    if (qaudion_remote_complete) {
++      for (const auto& pair : transport_cert_stats) {
++        cached_certificates_by_transport_.insert(
++            std::make_pair(pair.first, pair.second.Copy()));
++      }
+     }
+   }
+   return transport_cert_stats;
+diff --git a/pc/rtc_stats_collector_unittest.cc b/pc/rtc_stats_collector_unittest.cc
+index 75ec9c8..41f718a 100644
+--- a/pc/rtc_stats_collector_unittest.cc
++++ b/pc/rtc_stats_collector_unittest.cc
+@@ -1617,6 +1617,62 @@ TEST_P(RTCStatsCollectorTest, CertificateStatsCache) {
+       third_report, updated_remote_certinfo->fingerprints[1]));
+ }
+ 
++// Q-Audion (P9): a stats report taken while DTLS is still in progress (no
++// remote certificate yet) must not pin that incomplete result in the
++// certificate cache. Once the remote certificate is known it has to show up,
++// and from then on the cache behaves as upstream (see CertificateStatsCache).
++TEST_P(RTCStatsCollectorTest, CertificateStatsCacheWaitsForRemoteCertificate) {
++  const char kTransportName[] = "transport";
++
++  RTC_ALLOW_PLAN_B_DEPRECATION_BEGIN();
++  pc_->AddVoiceChannel("audio", kTransportName);
++  RTC_ALLOW_PLAN_B_DEPRECATION_END();
++
++  // Local certificate only: the DTLS handshake has not delivered the peer's
++  // certificate yet.
++  std::unique_ptr<CertificateInfo> local_certinfo =
++      CreateFakeCertificateAndInfoFromDers({"LocalCertA"});
++  pc_->SetLocalCertificate(kTransportName, local_certinfo->certificate);
++  ASSERT_EQ(local_certinfo->fingerprints.size(), 1u);
++
++  scoped_refptr<const RTCStatsReport> first_report =
++      stats_->GetStatsReport(main_thread_);
++  EXPECT_TRUE(GetCertificateStatsFromFingerprint(
++      first_report, local_certinfo->fingerprints[0]));
++
++  // The handshake completes. No ClearCachedStatsReport(): nothing calls it
++  // when DTLS finishes.
++  std::unique_ptr<CertificateInfo> remote_certinfo =
++      CreateFakeCertificateAndInfoFromDers({"RemoteCertA"});
++  pc_->SetRemoteCertChain(
++      kTransportName,
++      remote_certinfo->certificate->GetSSLCertificateChain().Clone());
++  ASSERT_EQ(remote_certinfo->fingerprints.size(), 1u);
++
++  time_controller_.AdvanceTime(TimeDelta::Seconds(1));
++  scoped_refptr<const RTCStatsReport> second_report =
++      stats_->GetStatsReport(main_thread_);
++  EXPECT_TRUE(GetCertificateStatsFromFingerprint(
++      second_report, local_certinfo->fingerprints[0]));
++  EXPECT_TRUE(GetCertificateStatsFromFingerprint(
++      second_report, remote_certinfo->fingerprints[0]));
++
++  // Complete now, so it is cached: a later remote chain is not picked up
++  // without ClearCachedStatsReport(), exactly as upstream.
++  std::unique_ptr<CertificateInfo> updated_remote_certinfo =
++      CreateFakeCertificateAndInfoFromDers({"UpdatedRemoteCertA"});
++  pc_->SetRemoteCertChain(
++      kTransportName,
++      updated_remote_certinfo->certificate->GetSSLCertificateChain().Clone());
++  time_controller_.AdvanceTime(TimeDelta::Seconds(1));
++  scoped_refptr<const RTCStatsReport> third_report =
++      stats_->GetStatsReport(main_thread_);
++  EXPECT_TRUE(GetCertificateStatsFromFingerprint(
++      third_report, remote_certinfo->fingerprints[0]));
++  EXPECT_FALSE(GetCertificateStatsFromFingerprint(
++      third_report, updated_remote_certinfo->fingerprints[0]));
++}
++
+ TEST_P(RTCStatsCollectorTest, CollectTwoRTCDataChannelStatsWithPendingId) {
+   // Note: The test assumes data channel IDs are predictable.
+   // This is not a safe assumption, but in order to make it work for

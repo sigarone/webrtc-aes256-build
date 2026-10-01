@@ -5,7 +5,8 @@
 # so the filters live in exactly one place.
 #
 # usage: run-tests.sh <out_dir> <strict|switchable> [exe_suffix]
-#   <out_dir>      GN output dir holding rtc_unittests and modules_unittests
+#   <out_dir>      GN output dir holding rtc_unittests, modules_unittests and
+#                  peerconnection_unittests
 #   <config>       strict | switchable (rtc_qaudion_transport_strict)
 #   [exe_suffix]   ".exe" on Windows, empty elsewhere
 # exit: 0 all selected filters passed | 1 a test failed or a filter matched
@@ -64,6 +65,10 @@ T8_FILTER="FrameReplayWindow.*:FrameCryptorReplay.*"
 # DataPacketCryptor tests (compiled but never run before P12), moved to the
 # 32-byte keys P1 requires, plus the P1/P12 key-provider checks.
 T9_FILTER="FrameCryptor.KeyProvider:KeyProvider.*:DataPacketCryptor.*"
+# T10 (P9): the certificate stats cache must not keep a pair taken before
+# the remote certificate was known, plus the upstream cache test it must not
+# break. Both configs.
+T10_FILTER="RTCStatsCollectorTest*CertificateStatsCache*"
 
 any=0
 # <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
@@ -75,7 +80,8 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
             "T3:modules_unittests:$T3_FILTER" "T4:modules_unittests:$T4_FILTER" \
             "T5:modules_unittests:$T5_FILTER" "T6:rtc_unittests:$T6_FILTER" \
             "T7:rtc_unittests:$T7_FILTER" "T8:rtc_unittests:$T8_FILTER" \
-            "T9:rtc_unittests:$T9_FILTER"; do
+            "T9:rtc_unittests:$T9_FILTER" \
+            "T10:peerconnection_unittests:$T10_FILTER"; do
   name=${spec%%:*}
   rest=${spec#*:}
   bin=${rest%%:*}
@@ -99,6 +105,6 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   any=$((any + 1))
 done
 if [ "$any" -eq 0 ]; then
-  echo "::warning::no T1-T9 filters ran - build-only smoke passed, no tests ran"
+  echo "::warning::no T1-T10 filters ran - build-only smoke passed, no tests ran"
 fi
 echo "run-tests: $any filter group(s) passed ($CONFIG)"
