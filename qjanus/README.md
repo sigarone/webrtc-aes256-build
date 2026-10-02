@@ -83,6 +83,7 @@ Target: Ubuntu 24.04 x86_64 (glibc 2.39), systemd. Everything below runs as root
    | `QJANUS_HTTP_BIND` | address of the server-facing HTTP API (port 8088): loopback, private (RFC 1918), VPN (100.64.0.0/10) or unique-local only |
    | `QJANUS_ALLOW_NONPRIVATE_BIND` | optional, `yes` lets `QJANUS_HTTP_BIND` be a public address (plain HTTP, no TLS: only if you know why) |
    | `QJANUS_NAT_1_1` | optional: public IPv4, only for a node behind a 1:1 NAT (nodes that carry their public address on an interface need nothing) |
+   | `QJANUS_MAX_SESSIONS_PER_TOKEN` | optional, 1-1024, default 4: live Janus sessions allowed per distinct signed token string (`max_sessions_per_token`, patch 0008) |
 
    Change a value by editing the file and running `systemctl restart qjanus`. Rotating the token secret or the
    admin key means updating the application server at the same time; running calls keep their PeerConnections but their
@@ -193,6 +194,16 @@ request/response shape it asserts (the `SHAPES` block of the CI log). Points tha
   sent as `token` in EVERY request (create, attach, message, keepalive, claim, destroy) and validated each time;
   missing/wrong/expired/wrong-realm -> `{"janus":"error","error":{"code":403}}`; a token without the VideoRoom
   descriptor can create a session but not attach (405). `info` and `ping` need no token.
+- Sessions per token (since 1.4.2-q3, patch 0008): at most `max_sessions_per_token` (default 4, `info` shows it as
+  `max-sessions-per-token`) sessions are live at the same time for the same token STRING; the next `create` ->
+  `{"janus":"error","error":{"code":473,"reason":"Too many sessions for this token"}}`. A session counts for the token it was
+  created with and gives its slot back when it is destroyed, times out (`session_timeout`) or has lost its transport for
+  `reclaim_session_timeout`; a `claim` takes no slot. Every later request validates its own token, so a refreshed token (a new
+  string) works on a session created with the previous one and never moves a slot. The counter is per string: two tokens
+  minted from the same second and ttl are the SAME string and share their slots, so the application server should make
+  every minted token its own string (an extra descriptor after the plugin, for example `n.<random hex>`, which Janus ignores).
+  The limit bounds what a removed member can do with a token that is still valid; it does not replace the server's own
+  throttling of token minting.
 - HTTP (server): `POST /janus` `{janus:"create",token}` -> `data.id`; `POST /janus/<sid>` `{janus:"attach",plugin,token}`
   -> `data.id`; `POST /janus/<sid>/<handle>` `{janus:"message",token,body}`. Room management requests are answered
   synchronously (`janus:"success"`, `plugindata.data`); plugin errors are `plugindata.data.error_code`

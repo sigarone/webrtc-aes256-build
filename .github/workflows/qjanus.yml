@@ -27,6 +27,11 @@ on:
     paths:
       - 'qjanus/**'
       - '.github/workflows/qjanus.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'qjanus/**'
+      - '.github/workflows/qjanus.yml'
   workflow_dispatch:
     inputs:
       release_tag:
@@ -43,7 +48,7 @@ permissions:
 concurrency:
   # per event type: an incidental push to the branch must never cancel a release run in progress
   group: qjanus-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   precheck:
@@ -154,6 +159,21 @@ jobs:
           cc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
             -I"$SRC/janus/src" qjanus/test/log-scrub/test_scrub.c -o "$RUNNER_TEMP/test_scrub"
           "$RUNNER_TEMP/test_scrub"
+
+      # patches/0008: the counter block of janus.c is cut out of the PATCHED source and compiled as it is
+      - name: Unit test - per-token session counter (ASan + LeakSanitizer + UBSan, and ThreadSanitizer)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/tokcount"; mkdir -p "$T"
+          sed -n '/qjanus:token-sessions begin/,/qjanus:token-sessions end/p' "$SRC/janus/src/janus.c" > "$T/block.inc"
+          test "$(wc -l < "$T/block.inc")" -gt 30
+          G="$(pkg-config --cflags --libs glib-2.0)"
+          cc -std=gnu11 -Wall -Wextra -Werror -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all             -I"$SRC/janus/src" -I"$T" -DTOKEN_SESSIONS_BLOCK='"block.inc"' qjanus/test/token-sessions/test_token_sessions.c $G -o "$T/t_asan"
+          ASAN_OPTIONS=detect_leaks=1 "$T/t_asan"
+          # glib's own GMutex is not instrumented: the pthread variant of janus_mutex lets TSan see the locking
+          cc -std=gnu11 -Wall -Wextra -Werror -g -O1 -fsanitize=thread -DUSE_PTHREAD_MUTEX             -I"$SRC/janus/src" -I"$T" -DTOKEN_SESSIONS_BLOCK='"block.inc"' qjanus/test/token-sessions/test_token_sessions.c $G -o "$T/t_tsan"
+          sudo sysctl -q vm.mmap_rnd_bits=28 || true
+          "$T/t_tsan"
 
       - name: Package the relocatable tarball
         run: qjanus/build/package.sh

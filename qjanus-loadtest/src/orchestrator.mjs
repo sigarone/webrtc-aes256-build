@@ -59,7 +59,7 @@ function raceTimeout(promise, ms) {
 // so the orchestrator can be tested without them.
 async function defaultMintToken(cfg) {
   const { mintSessionToken } = await import('./token.mjs');
-  return () => mintSessionToken({ secret: cfg.secrets.tokenSecret, ttlSec: cfg.token.ttlSec });
+  return () => mintSessionToken({ secret: cfg.secrets.tokenSecret, ttlSec: cfg.token.ttlSec, nonce: true });
 }
 
 async function defaultRoomPlan() {

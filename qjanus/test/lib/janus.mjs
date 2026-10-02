@@ -14,9 +14,14 @@ export const joinTokenFor = (id) => `${id}:${hex(16)}`;
 
 // Janus core signed token: "<expiry>,janus,<plugin>:<base64 HMAC>" with token_auth_hash = sha256; the
 // HMAC key is the secret string itself. `now` is in ms; a negative ttl mints an already expired token.
-export function mintToken(secret, { ttl = 600, plugins = [PLUGIN], realm = 'janus', now = Date.now() } = {}) {
+// qjanus allows at most N live sessions per distinct token STRING (patch 0008), and a token minted from
+// (now, ttl) alone is the same string for everyone who gets one within the same second. So by default a
+// test token carries one extra random descriptor ("n.<hex>", accepted by Janus: extra descriptors after
+// the plugin are ignored), which makes every minted token its own counter. `nonce: false` mints the bare
+// format the application server mints today (the tests that pin down the per-string counting use it).
+export function mintToken(secret, { ttl = 600, plugins = [PLUGIN], realm = 'janus', now = Date.now(), nonce = true } = {}) {
   const expiry = Math.floor(now / 1000) + ttl;
-  const data = [expiry, realm, ...plugins].join(',');
+  const data = [expiry, realm, ...plugins, ...(nonce ? [`n.${hex(6)}`] : [])].join(',');
   return `${data}:${crypto.createHmac('sha256', secret).update(data).digest('base64')}`;
 }
 

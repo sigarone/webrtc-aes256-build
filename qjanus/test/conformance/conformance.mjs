@@ -89,6 +89,7 @@ await check('info answers without a token: version, VideoRoom + HTTP + WebSocket
   assert.equal(json['dtls-mtu'], 1200);
   assert.equal(json['session-timeout'], 60);
   assert.equal(json['reclaim-session-timeout'], 20);
+  assert.equal(json['max-sessions-per-token'], 4, 'default: 4 live sessions per token (patches/0008)');
   assert.equal(json['min-nack-queue'], 500);
   assert.equal(json['twcc-period'], 200);
   assert.equal(json.auth_token, true);
@@ -621,6 +622,227 @@ await check('WebSocket: a fresh token can be presented mid-session; the old expi
   c.token = mintToken(TOKEN_SECRET);
   assert.equal((await c.keepalive()).janus, 'ack');
 });
+
+// ===================================================================== sessions per token (patch 0008)
+// A removed member keeps a valid signed token up to its expiry; qjanus allows at most N live sessions per
+// distinct token STRING (default 4, janus.jcfg max_sessions_per_token), refusing the next `create` with 473.
+// A session counts for the token it was CREATED with and frees its slot when it is destroyed, times out
+// or its transport is gone for reclaim_session_timeout; the token of every later request is validated on its
+// own, so a refreshed token (a new string) keeps working on a session created with the previous one.
+const MAXS = (await http.info()).json['max-sessions-per-token'];
+const createWith = (t) => http.post('', { janus: 'create', token: t });
+const openMany = async (t, n) => { const ids = []; for (let i = 0; i < n; i++) ids.push(await http.createSession(t)); return ids; };
+const destroyAll = (ids, t) => Promise.all(ids.map((id) => http.destroySession(id, t)));
+const keepalive = async (id, t) => (await http.post(`/${id}`, { janus: 'keepalive', token: t })).json;
+const uniq = (opts) => { const t = mintToken(TOKEN_SECRET, opts); remember(t); return t; };
+
+// the idle HTTP sessions that must time out (session_timeout 60 s): created now, checked at the very end
+const tIdle = uniq();
+const tIdleAt = Date.now();
+const idleSids = SLOW ? await openMany(tIdle, MAXS) : [];
+
+await check(`sessions per token: ${MAXS} concurrent sessions succeed, the next create is refused with 473 and is not counted`, async () => {
+  assert.equal(MAXS, 4);
+  const t = uniq();
+  const sids = await openMany(t, MAXS);
+  const over = await createWith(t);
+  shape('create_over_limit', { janus: 'create', token: '<token>' }, over.json);
+  assert.equal(over.json.janus, 'error', JSON.stringify(over.json));
+  assert.equal(over.json.error.code, 473);
+  assert.match(over.json.error.reason, /too many sessions/i);
+  assert.equal(over.json.session_id, undefined, 'a refused create has no session');
+  // refused again and again: the refusals themselves never take a slot, never free one
+  for (let i = 0; i < 3; i++) assert.equal((await createWith(t)).json.error.code, 473);
+  // the sessions that exist keep working (a refused create broke nothing)
+  for (const id of sids) assert.equal((await keepalive(id, t)).janus, 'ack');
+  // the limit is not the plugin handle count: a session with several handles is still ONE session
+  const hs = [await http.attach(sids[0], t), await http.attach(sids[0], t), await http.attach(sids[0], t)];
+  assert.equal(hs.length, 3);
+  assert.equal((await createWith(t)).json.error.code, 473);
+  await destroyAll(sids, t);
+  // everything freed: the full quota is available again
+  const again = await openMany(t, MAXS);
+  assert.equal((await createWith(t)).json.error.code, 473);
+  await destroyAll(again, t);
+});
+
+await check('sessions per token: a destroyed session frees exactly one slot (and a destroy that fails frees none)', async () => {
+  const t = uniq();
+  const sids = await openMany(t, MAXS);
+  assert.equal((await createWith(t)).json.error.code, 473);
+  const d = await http.destroySession(sids[0], t);
+  assert.equal(d.json.janus, 'success');
+  // destroying it a second time is an error and must not free a second slot
+  const twice = await http.destroySession(sids[0], t);
+  assert.equal(twice.json.error.code, 458);
+  const wrongSession = await http.destroySession(String(2 ** 40 + 7), t);
+  assert.equal(wrongSession.json.error.code, 458);
+  const reborn = await http.createSession(t);
+  assert.ok(reborn);
+  assert.equal((await createWith(t)).json.error.code, 473, 'only one slot was free');
+  // a destroy with a token that does not validate is refused and frees nothing
+  const unauthorized = await http.post(`/${sids[1]}`, { janus: 'destroy', token: mintToken('2'.repeat(64)) });
+  assert.equal(unauthorized.json.error.code, 403);
+  assert.equal((await createWith(t)).json.error.code, 473);
+  await destroyAll([...sids.slice(1), reborn], t);
+});
+
+await check('sessions per token: different token strings are independent counters', async () => {
+  const a = uniq(); const b = uniq(); const c = uniq({ ttl: 700 });
+  const sa = await openMany(a, MAXS);
+  assert.equal((await createWith(a)).json.error.code, 473);
+  const sb = await openMany(b, MAXS);          // a is full, b is not affected
+  const sc = await openMany(c, MAXS);
+  assert.equal((await createWith(b)).json.error.code, 473);
+  assert.equal((await createWith(c)).json.error.code, 473);
+  // destroying under b frees b only
+  await destroyAll(sb, b);
+  assert.equal((await createWith(a)).json.error.code, 473, 'a stays full');
+  assert.equal((await createWith(c)).json.error.code, 473, 'c stays full');
+  const sb2 = await openMany(b, MAXS);
+  await destroyAll([...sa, ...sb2, ...sc], a);   // any valid token may destroy: the slot belongs to the token that CREATED the session
+  const sa2 = await openMany(a, MAXS);
+  const sc2 = await openMany(c, MAXS);
+  await destroyAll([...sa2, ...sc2], a);
+});
+
+await check('sessions per token: the counter is per token STRING; the bare token format the application server mints is shared by a same-second mint, an extra descriptor makes it its own', async () => {
+  const now = Date.now();
+  const bare = () => { const t = mintToken(TOKEN_SECRET, { now, ttl: 650, nonce: false }); remember(t); return t; };
+  const t1 = bare(); const t2 = bare();
+  assert.equal(t1, t2, 'same second, same ttl: the very same string');
+  const sids = await openMany(t1, MAXS);
+  assert.equal((await createWith(t2)).json.error.code, 473, 'the second mint is the same string: its sessions count together');
+  // another second (so another string) is its own counter
+  const t3 = mintToken(TOKEN_SECRET, { now: now + 1000, ttl: 650, nonce: false }); remember(t3);
+  assert.notEqual(t3, t1);
+  const other = await openMany(t3, MAXS);
+  // a nonce descriptor in the same second: its own counter again
+  const t4 = mintToken(TOKEN_SECRET, { now, ttl: 650 }); remember(t4);
+  const withNonce = await openMany(t4, MAXS);
+  await destroyAll([...sids, ...other, ...withNonce], t1);
+});
+
+await check('sessions per token: keepalive, handles and a REFRESHED token keep working on a full token; the refreshed string has its own quota', async () => {
+  const t = uniq();
+  const sids = await openMany(t, MAXS);
+  assert.equal((await createWith(t)).json.error.code, 473);
+  // the refresh the clients do every 300 s: a newly minted token (a different string) for the same session
+  const t2 = uniq();
+  assert.notEqual(t, t2);
+  for (const id of sids) {
+    assert.equal((await keepalive(id, t2)).janus, 'ack', 'keepalive with the refreshed token');
+    assert.equal((await keepalive(id, t)).janus, 'ack', 'the previous token still works until it expires');
+  }
+  const h = await http.attach(sids[0], t2);
+  assert.equal(typeof h, 'number', 'attach with the refreshed token on a session created with the previous one');
+  const r = await http.message(sids[0], h, t2, { request: 'exists', room: hex(16) });
+  assert.equal(r.json.janus, 'success', JSON.stringify(r.json));
+  assert.equal(pluginData(r.json).exists, false);
+  // none of that moved a slot: t is still full, and the refreshed string has the whole quota for new sessions
+  assert.equal((await createWith(t)).json.error.code, 473);
+  const viaT2 = await openMany(t2, MAXS);
+  assert.equal((await createWith(t2)).json.error.code, 473);
+  // an expired token is refused on every request, whatever the counters say
+  const dead = mintToken(TOKEN_SECRET, { ttl: -2 });
+  assert.equal((await keepalive(sids[0], dead)).error.code, 403);
+  await destroyAll([...sids, ...viaT2], t2);
+  const reopened = await openMany(t, MAXS);        // destroying with the refreshed token freed the slots of t
+  assert.equal((await createWith(t)).json.error.code, 473);
+  await destroyAll(reopened, t);
+});
+
+await check('sessions per token over WebSockets: N sockets succeed, N+1 is refused, destroy frees a slot, the refreshed token keeps the session alive', async () => {
+  const t = uniq();
+  const cs = [];
+  for (let i = 0; i < MAXS; i++) { const c = await ws({ token: t }); await c.create(); cs.push(c); }
+  const extra = await ws({ token: t });
+  const refused = await extra.send({ janus: 'create' });
+  shape('create_over_limit_ws', { janus: 'create', token: '<token>' }, refused);
+  assert.equal(refused.janus, 'error');
+  assert.equal(refused.error.code, 473);
+  // a second session over the SAME connection counts too
+  const sameSocket = await cs[0].send({ janus: 'create' });
+  assert.equal(sameSocket.error.code, 473);
+  // the refused socket is still usable (it never had a session), a refreshed token does not move anything
+  const t2 = uniq();
+  cs[1].token = t2;
+  assert.equal((await cs[1].keepalive()).janus, 'ack');
+  assert.equal(typeof (await cs[1].attach()), 'number', 'attach with the refreshed token on a session created with the previous one');
+  assert.equal((await extra.send({ janus: 'create' })).error.code, 473);
+  // destroy on the session of cs[2] frees ONE slot of t
+  assert.equal((await cs[2].destroy()).janus, 'success');
+  const ok = await extra.send({ janus: 'create' });
+  assert.equal(ok.janus, 'success', JSON.stringify(ok));
+  const next = await ws({ token: t });
+  assert.equal((await next.send({ janus: 'create' })).error.code, 473, 'only one slot was free');
+  for (const c of [...cs, extra, next]) c.close();
+});
+
+await check('sessions per token: reconnect overlap - the old session (socket dropped, still in the reclaim window) and the new one of the same member coexist within N; claiming the old one takes no slot; destroying it frees exactly one', async () => {
+  // what a client does when its socket drops: it reclaims the old session, and if that fails it opens a new one
+  // (media_join mints a new token, but the bare token format can also repeat the very same string)
+  const t = uniq();
+  const old = await ws({ token: t }); await old.create(); const oldSid = old.sid;
+  old.close();
+  await sleep(300);
+  const fresh = await ws({ token: t });
+  assert.equal((await fresh.send({ janus: 'create' })).janus, 'success', 'the new session while the old one is still reclaimable: 2 of N');
+  // the old session is claimed on yet another socket: still no extra slot
+  const claimer = await ws({ token: t });
+  assert.equal((await claimer.claim(oldSid)).janus, 'success');
+  assert.equal((await claimer.keepalive()).janus, 'ack');
+  // two sessions of this token are live: N-2 more fit, then the limit
+  const more = [];
+  for (let i = 0; i < MAXS - 2; i++) { const c = await ws({ token: t }); await c.create(); more.push(c); }
+  const over = await ws({ token: t });
+  assert.equal((await over.send({ janus: 'create' })).error.code, 473, 'the claim added nothing: exactly N sessions are live');
+  // the old session ends (the member left): one slot comes back, once
+  assert.equal((await claimer.destroy()).janus, 'success');
+  assert.equal((await over.send({ janus: 'create' })).janus, 'success');
+  assert.equal((await over.send({ janus: 'create' })).error.code, 473, 'exactly one slot was freed');
+  for (const c of [fresh, claimer, over, ...more]) c.close();
+});
+
+if (SLOW) {
+  await check('sessions per token: a dropped socket keeps its slots for reclaim_session_timeout (the session can be claimed), then frees them', async () => {
+    const t = uniq();
+    const cs = [];
+    for (let i = 0; i < MAXS; i++) { const c = await ws({ token: t }); await c.create(); cs.push(c); }
+    const sids = cs.map((c) => c.sid);
+    for (const c of cs) c.close();
+    await sleep(1500);
+    const probe = await ws({ token: t });
+    assert.equal((await probe.send({ janus: 'create' })).error.code, 473, 'the sessions are still reclaimable: the slots are still taken');
+    // claiming one on a new connection does not take (or free) a slot
+    const claimer = await ws({ token: t });
+    assert.equal((await claimer.claim(sids[0])).janus, 'success');
+    assert.equal((await claimer.keepalive()).janus, 'ack');
+    assert.equal((await probe.send({ janus: 'create' })).error.code, 473);
+    await sleep(24000);                       // > reclaim_session_timeout (20 s) + the 2 s watchdog tick
+    // the three that were not claimed are gone, the claimed one is alive and keeps its slot
+    const free = [];
+    for (let i = 0; i < MAXS - 1; i++) {
+      const m = await probe.send({ janus: 'create' });
+      assert.equal(m.janus, 'success', `slot ${i}: ${JSON.stringify(m)}`);
+      free.push(m.data.id);
+    }
+    assert.equal((await probe.send({ janus: 'create' })).error.code, 473, 'exactly the three unclaimed slots were freed');
+    assert.equal((await claimer.keepalive()).janus, 'ack', 'the claimed session lives on');
+    for (const c of [probe, claimer]) c.close();
+  });
+
+  await check('sessions per token: idle sessions time out (session_timeout) and free their slots', async () => {
+    // tIdle was filled at the start of this section and nothing touched it since
+    if (Date.now() - tIdleAt < 55000) assert.equal((await createWith(tIdle)).json.error.code, 473, 'idle but not yet timed out: the slots are taken');
+    const wait = 66000 - (Date.now() - tIdleAt);
+    if (wait > 0) await sleep(wait);
+    const fresh = await openMany(tIdle, MAXS);       // all four slots are back
+    assert.equal((await createWith(tIdle)).json.error.code, 473);
+    await destroyAll(fresh, tIdle);
+    for (const id of idleSids) assert.equal((await keepalive(id, tIdle)).error.code, 458, 'the idle session is gone');
+  });
+}
 
 // ======================================================================= results and shapes
 for (const c of clients) c.close();

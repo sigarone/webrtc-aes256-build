@@ -167,3 +167,16 @@ test('a freshly minted token is valid now and expires after its ttl', () => {
   assert.equal(verifySessionToken(token, { secret: SECRET, nowMs: NOW + 2000 }), true);
   assert.equal(verifySessionToken(token, { secret: SECRET, nowMs: NOW + 3000 }), false);
 });
+
+test('mintSessionToken nonce: every token is its own string (qjanus counts live sessions per token string) and Janus still accepts it', () => {
+  const a = mintSessionToken({ secret: SECRET, nowMs: NOW, nonce: true });
+  const b = mintSessionToken({ secret: SECRET, nowMs: NOW, nonce: true });
+  assert.notEqual(a, b);
+  assert.equal(mintSessionToken({ secret: SECRET, nowMs: NOW }), mintSessionToken({ secret: SECRET, nowMs: NOW }), 'without it the same second gives the same string');
+  for (const t of [a, b]) {
+    assert.match(t, /^1700000600,janus,janus\.plugin\.videoroom,n\.[0-9a-f]{12}:/);
+    assert.equal(janusCheck(t, { secret: SECRET, hash: 'sha256', nowSec: 1_700_000_000 }), true);
+    assert.equal(janusCheck(t, { secret: SECRET, hash: 'sha256', nowSec: 1_700_000_000, desc: 'janus.plugin.videoroom' }), true);
+    assert.equal(verifySessionToken(t, { secret: SECRET, nowMs: NOW, plugin: 'janus.plugin.videoroom' }), true);
+  }
+});
