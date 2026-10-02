@@ -214,7 +214,6 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
-      QM_DIR: ${{ runner.temp }}\qm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -223,13 +222,13 @@ jobs:
       - name: Download and verify the pinned release and the compiler package
         shell: pwsh
         run: |
-          cmake "-DQMEDIA_FETCH_DIR=$env:QM_DIR" -P engine/cmake/fetch_webrtc.cmake
+          cmake "-DQMEDIA_FETCH_DIR=$env:RUNNER_TEMP/qm" -P engine/cmake/fetch_webrtc.cmake
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify the build provenance attestation of webrtc.lib
         shell: pwsh
         run: |
-          $lib = Join-Path $env:QM_DIR "release\webrtc.lib"
+          $lib = Join-Path $env:RUNNER_TEMP "qm/release/webrtc.lib"
           gh attestation verify $lib --repo sigarone/webrtc-aes256-build
           if ($LASTEXITCODE -eq 0) { Write-Host "attestation: verified with gh attestation verify"; exit 0 }
           Write-Host "gh attestation verify failed (exit $LASTEXITCODE); checking the attestations API"
@@ -242,7 +241,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cmake -S engine -B build-rtc -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%QM_DIR%\toolchain.cmake" -DQMEDIA_WITH_WEBRTC=ON -DQMEDIA_BUILD_TESTS=ON "-DCMAKE_CXX_FLAGS=" || exit /b 1
+          cmake -S engine -B build-rtc -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%RUNNER_TEMP%/qm/toolchain.cmake" -DQMEDIA_WITH_WEBRTC=ON -DQMEDIA_BUILD_TESTS=ON "-DCMAKE_CXX_FLAGS=" || exit /b 1
 
       - name: Build the engine, the CI engine and the call test driver
         shell: cmd
