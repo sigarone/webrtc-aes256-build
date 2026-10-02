@@ -348,7 +348,7 @@ set-audio-tuning = {
   ? ptime_ms: 10..120,
   ? bitrate_bps: 6000..510000,
   ? cbr: bool,
-  ? fec_floor_pct: 0..100,
+  ? fec_floor_pct: 0..20,
 }
 
 ; ---- Engine to client: replies ----------------------------------------------------------

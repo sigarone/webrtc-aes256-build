@@ -1,7 +1,8 @@
 name: engine-ipc
 
 # CI for engine/ (the generic media engine process): the IPC codec, schema validator, session
-# layer and the Windows named-pipe transport. Does not build libwebrtc (see build-m150-windows.yml).
+# layer, the Windows named-pipe transport and the engine core on libwebrtc. libwebrtc itself is not
+# built here: the pinned Windows release is downloaded (see build-m150-windows.yml for how it is made).
 #
 #   ipc-linux    (ubuntu-24.04)  unit tests with clang + ASan/UBSan and with gcc -O2, both -Werror
 #   fuzz         (ubuntu-24.04)  libFuzzer (ASan + UBSan) on the CBOR/schema decoder and on the
@@ -9,6 +10,11 @@ name: engine-ipc
 #   ipc-windows  (windows-2022)  IPC library, pipe transport and qaudion-media.exe with MSVC/CMake;
 #                                runs the unit tests and the pipe tests (ACL, single client, nonce
 #                                reject, oversized frame reject, real process)
+#   engine-webrtc (windows-2022) the real engine against the pinned libwebrtc release: every download
+#                                is sha256-verified against values pinned in the repo, webrtc.lib's
+#                                provenance attestation is verified, the engine is compiled and
+#                                linked with the flags of build-flags.json (Chromium clang-cl), and
+#                                a test driver runs two engine processes through a full audio call
 #
 # The path filter keeps this workflow out of the way of the library builds. The hevc-probe tool
 # under engine/tools/hevc-probe has its own workflow and is not part of this CMake project.
@@ -200,3 +206,71 @@ jobs:
           $guardCf = ($dll -band 0x4000) -ne 0
           Write-Host ("DllCharacteristics=0x{0:X4} dynamicBase={1} highEntropyVA={2} nxCompat={3} guardCF={4}" -f $dll, $dynamicBase, $highEntropy, $nxCompat, $guardCf)
           if (-not ($dynamicBase -and $highEntropy -and $nxCompat -and $guardCf)) { throw "missing hardening flag" }
+
+  engine-webrtc:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      QM_DIR: ${{ runner.temp }}\qm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download and verify the pinned release and the compiler package
+        shell: pwsh
+        run: |
+          cmake "-DQMEDIA_FETCH_DIR=$env:QM_DIR" -P engine/cmake/fetch_webrtc.cmake
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify the build provenance attestation of webrtc.lib
+        shell: pwsh
+        run: |
+          $lib = Join-Path $env:QM_DIR "release\webrtc.lib"
+          gh attestation verify $lib --repo sigarone/webrtc-aes256-build
+          if ($LASTEXITCODE -eq 0) { Write-Host "attestation: verified with gh attestation verify"; exit 0 }
+          Write-Host "gh attestation verify failed (exit $LASTEXITCODE); checking the attestations API"
+          $sha = (Get-FileHash -Algorithm SHA256 $lib).Hash.ToLower()
+          $resp = gh api "repos/sigarone/webrtc-aes256-build/attestations/sha256:$sha" | ConvertFrom-Json
+          if ($resp.attestations.Count -lt 1) { throw "no attestation found for webrtc.lib" }
+          Write-Host "attestation: $($resp.attestations.Count) record(s) exist for webrtc.lib (signature NOT verified here)"
+
+      - name: Configure (Chromium clang-cl, Ninja, flags from build-flags.json)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S engine -B build-rtc -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%QM_DIR%\toolchain.cmake" -DQMEDIA_WITH_WEBRTC=ON -DQMEDIA_BUILD_TESTS=ON "-DCMAKE_CXX_FLAGS=" || exit /b 1
+
+      - name: Build the engine, the CI engine and the call test driver
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake --build build-rtc --target qaudion-media qaudion-media-ci qmedia_call_test || exit /b 1
+
+      - name: Engine executable hardening flags and CI-only code
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path build-rtc\qaudion-media.exe).Path
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $dll = [BitConverter]::ToUInt16($bytes, $pe + 24 + 70)
+          $dynamicBase = ($dll -band 0x0040) -ne 0
+          $highEntropy = ($dll -band 0x0020) -ne 0
+          $nxCompat = ($dll -band 0x0100) -ne 0
+          Write-Host ("DllCharacteristics=0x{0:X4} dynamicBase={1} highEntropyVA={2} nxCompat={3}" -f $dll, $dynamicBase, $highEntropy, $nxCompat)
+          if (-not ($dynamicBase -and $highEntropy -and $nxCompat)) { throw "missing hardening flag" }
+          # The production engine has no way to read or write audio files.
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text.Contains("ci-audio-in") -or $text.Contains("FileAudioDevice")) { throw "CI-only code found in the production engine" }
+          $ci = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path build-rtc\qaudion-media-ci.exe).Path))
+          if (-not $ci.Contains("ci-audio-in")) { throw "the CI engine lacks its CI flags" }
+          Write-Host ("size: " + $bytes.Length + " bytes")
+
+      - name: Two engines, one call (DTLS 1.3, PQC group, AES-256 everywhere, frame keys, negative cases)
+        shell: pwsh
+        run: |
+          build-rtc\qmedia_call_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -112,7 +112,7 @@ constexpr FieldSpec kFPcmTap[] = {Hnd("session"), En("point", kPcmPoint), Flag("
 constexpr FieldSpec kFGetStats[] = {Hnd("pc"), En("scope", kStatsScope, false)};
 constexpr FieldSpec kFTuning[] = {Hnd("pc"), Num("ptime_ms", 10, 120, false),
                                   Num("bitrate_bps", 6000, 510000, false), Flag("cbr", false),
-                                  Num("fec_floor_pct", 0, 100, false)};
+                                  Num("fec_floor_pct", 0, 20, false)};
 
 constexpr FieldSpec kFErr[] = {En("code", kErrCode), Str("detail", 0, 128, false)};
 constexpr FieldSpec kFCertCreated[] = {Hnd("cert"), Bin("fingerprint", kFingerprintBytes,
