@@ -1,0 +1,202 @@
+name: engine-ipc
+
+# CI for engine/ (the generic media engine process): the IPC codec, schema validator, session
+# layer and the Windows named-pipe transport. Does not build libwebrtc (see build-m150-windows.yml).
+#
+#   ipc-linux    (ubuntu-24.04)  unit tests with clang + ASan/UBSan and with gcc -O2, both -Werror
+#   fuzz         (ubuntu-24.04)  libFuzzer (ASan + UBSan) on the CBOR/schema decoder and on the
+#                                framing + hello + message loop, seeded from engine/ipc/fuzz/corpus
+#   ipc-windows  (windows-2022)  IPC library, pipe transport and qaudion-media.exe with MSVC/CMake;
+#                                runs the unit tests and the pipe tests (ACL, single client, nonce
+#                                reject, oversized frame reject, real process)
+#
+# The path filter keeps this workflow out of the way of the library builds. The hevc-probe tool
+# under engine/tools/hevc-probe has its own workflow and is not part of this CMake project.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - '!engine/tools/hevc-probe/**'
+      - '.github/workflows/engine.yml'
+  pull_request:
+    paths:
+      - 'engine/**'
+      - '!engine/tools/hevc-probe/**'
+      - '.github/workflows/engine.yml'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "seconds per fuzz target (two targets run one after the other)"
+        default: "150"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-ipc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipc-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clang-asan-ubsan
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Debug
+            sanitize: address,undefined
+          - name: gcc-release
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitize: ""
+    name: ipc-linux (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 ninja-build
+          # ASan on the 24.04 runner kernel needs a smaller address-space randomization range.
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          ${{ matrix.cxx }} --version | head -1
+          cmake --version | head -1
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S engine -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_CXX_FLAGS=-Werror \
+            -DQMEDIA_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Unit tests (codec, validator, session, CDDL sync, seed corpus)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Seed corpus is up to date with the schema
+        run: |
+          set -euo pipefail
+          rm -rf corpus-regen
+          ./build/ipc/qmedia_corpus_gen corpus-regen
+          diff -r corpus-regen engine/ipc/fuzz/corpus
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: ipc-linux
+    permissions:
+      contents: read
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '150' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev ninja-build
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Build the fuzz targets (libFuzzer, ASan + UBSan)
+        run: |
+          set -euo pipefail
+          cmake -S engine -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DQMEDIA_BUILD_FUZZERS=ON -DQMEDIA_BUILD_TESTS=OFF \
+            -DQMEDIA_SANITIZE=address,undefined
+          cmake --build build-fuzz --target fuzz_message fuzz_session
+
+      - name: Run fuzz_message (CBOR decoder and schema validator)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-work/message fuzz-out
+          cp engine/ipc/fuzz/corpus/message/* fuzz-work/message/
+          ./build-fuzz/ipc/fuzz_message fuzz-work/message \
+            -max_total_time="$FUZZ_SECONDS" -max_len=70000 -timeout=10 -rss_limit_mb=2048 \
+            -artifact_prefix=fuzz-out/message- -print_final_stats=1
+
+      - name: Run fuzz_session (framing, hello with nonce, message loop)
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz-work/session
+          cp engine/ipc/fuzz/corpus/session/* fuzz-work/session/
+          ./build-fuzz/ipc/fuzz_session fuzz-work/session \
+            -max_total_time="$FUZZ_SECONDS" -max_len=70000 -timeout=10 -rss_limit_mb=2048 \
+            -artifact_prefix=fuzz-out/session- -print_final_stats=1
+
+      - name: Upload crashes and the grown corpus
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine-fuzz-output
+          path: |
+            fuzz-out/
+            fuzz-work/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ipc-windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Configure (Visual Studio 2022, x64)
+        shell: pwsh
+        run: |
+          cmake -S engine -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build IPC library, pipe transport, tests and qaudion-media.exe
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Unit tests and pipe tests (ACL, single client, nonce reject, oversize reject, real process)
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Engine executable hardening flags are present
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter qaudion-media.exe build | Select-Object -First 1
+          if (-not $exe) { throw "qaudion-media.exe not built" }
+          # Read the PE header directly (no dependency on the VS command prompt).
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $dll = [BitConverter]::ToUInt16($bytes, $pe + 24 + 70)   # OptionalHeader.DllCharacteristics (PE32+)
+          $dynamicBase = ($dll -band 0x0040) -ne 0
+          $highEntropy = ($dll -band 0x0020) -ne 0
+          $nxCompat = ($dll -band 0x0100) -ne 0
+          $guardCf = ($dll -band 0x4000) -ne 0
+          Write-Host ("DllCharacteristics=0x{0:X4} dynamicBase={1} highEntropyVA={2} nxCompat={3} guardCF={4}" -f $dll, $dynamicBase, $highEntropy, $nxCompat, $guardCf)
+          if (-not ($dynamicBase -and $highEntropy -and $nxCompat -and $guardCf)) { throw "missing hardening flag" }

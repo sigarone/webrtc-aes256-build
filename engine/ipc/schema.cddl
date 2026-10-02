@@ -1,0 +1,539 @@
+; Media engine IPC contract, protocol version 1 (CDDL, RFC 8610).
+;
+; Transport: named pipe, byte stream. Framing: 4-byte big-endian payload length, then one CBOR
+; data item. 1 <= length <= 1048576. Video never travels over this channel.
+;
+; Encoding: the deterministic CBOR subset of RFC 8949 section 4.2.1, restricted further:
+;   allowed   unsigned integers, byte strings, UTF-8 text strings, arrays, maps with text keys,
+;             false, true, null; every length definite; integers and lengths in shortest form;
+;             map keys sorted by their encoded bytes, no duplicates; at most 64 bytes per key
+;   rejected  negative integers, tags, floats, undefined, other simple values, indefinite
+;             lengths, trailing bytes, nesting deeper than 6 levels, more than 4096 data items
+; A decoder accepts only canonical input, so re-encoding a decoded message gives the same bytes.
+;
+; Every message is a map with the envelope fields
+;   v   protocol version, always 1
+;   t   message kind (a text string, the "t" value of the rules below)
+;   id  request id
+; plus the fields of its rule. Unknown kinds, unknown fields, missing required fields, wrong
+; types, out-of-range values and messages travelling in the wrong direction are all rejected,
+; and a rejected message ends the connection (fail closed).
+;
+; Text fields (tstr) must not contain control characters (no NUL, no C0, no DEL). The fields marked
+; "; sdp" may additionally contain CR, LF and HT. Sizes are in bytes.
+;
+; Ids: a request carries an id >= 1 chosen by the client. The reply echoes it. Events carry id 0.
+; The "err" message may carry any id (0 when the failed message had no usable id).
+;
+; Handles (session, cert, pc) are opaque numbers chosen by the engine, valid for the session
+; that created them. They are never reused within one engine process.
+;
+; The first client message must be "hello" with the 32-byte session nonce, in a frame of at most
+; 256 bytes. Nothing is sent to a peer that fails this check.
+;
+; Key material travels only in install_key. The engine zeroes the receive buffer as soon as the
+; message has been handled and fills retired slots with random bytes (never zeros).
+;
+; Grammar subset used below (a test parses this file and compares it with the C++ validator):
+;   one field per line, "name: type," ; "? name: type," for optional fields
+;   types: handle | A..B | bool | tstr .size (A..B) | bstr .size (A..B) | bstr .size N
+;          | "x" / "y" | [A*B tstr .size (A..B)] | [A*B rule-name] | { A*B tstr .size (A..B) => scalar }
+;   a trailing "; nonzero" on a byte string rejects the all-zero value
+;   a trailing "; sdp" on a text string allows CR, LF and HT in it
+
+handle = 1..4294967295
+req-id = 1..4294967295
+resp-id = 1..4294967295
+event-id = 0
+any-id = 0..4294967295
+scalar = uint / bool / tstr .size (0..128)
+
+client-message =
+  hello / ping / shutdown / session-create / session-close / cert-create / pc-create /
+  pc-close / create-offer / create-answer / set-local-description / set-remote-description /
+  add-ice-candidate / restart-ice / update-ice-servers / install-key / retire-slot / select-send-slot / bind-media /
+  set-muted / list-devices / select-device / start-video / stop-video / request-keyframe /
+  set-simulcast / pcm-tap / get-stats / set-audio-tuning
+
+engine-message =
+  hello-ok / pong / ok / err / session-created / cert-created / pc-created / sdp-ready /
+  devices / stats / ice-candidate / ice-gathering-state / ice-connection-state / pc-state /
+  negotiation-needed / transport-info / transport-violation / cryptor-state / devices-changed /
+  pcm-frame
+
+; ---- Client to engine -------------------------------------------------------------------
+
+; Authenticates the connection. Must be the first message and must be sent exactly once.
+hello = {
+  v: 1,
+  t: "hello",
+  id: req-id,
+  nonce: bstr .size 32,
+}
+
+ping = {
+  v: 1,
+  t: "ping",
+  id: req-id,
+}
+
+; Asks the engine to close everything and exit. The reply is "ok".
+shutdown = {
+  v: 1,
+  t: "shutdown",
+  id: req-id,
+}
+
+; A session owns certificates, peer connections and the frame-key provider with its replay state.
+; Key provider and replay windows live as long as the session, not as long as one peer connection,
+; so a peer connection can be rebuilt without losing them. Reply: session_created.
+session-create = {
+  v: 1,
+  t: "session_create",
+  id: req-id,
+}
+
+session-close = {
+  v: 1,
+  t: "session_close",
+  id: req-id,
+  session: handle,
+}
+
+; Generates a fresh ECDSA P-256 certificate for DTLS. Reply: cert_created.
+cert-create = {
+  v: 1,
+  t: "cert_create",
+  id: req-id,
+  session: handle,
+}
+
+; Creates a peer connection that uses the given certificate. A session can hold several peer
+; connections (one for a 1:1 call, a publisher and a subscriber for a group call). The transport
+; policy (DTLS 1.3 only, AES-256-GCM only, X25519MLKEM768 only, SRTP AEAD_AES_256_GCM only) is
+; compiled in and cannot be changed here. Reply: pc_created.
+pc-create = {
+  v: 1,
+  t: "pc_create",
+  id: req-id,
+  session: handle,
+  cert: handle,
+  ? ice_policy: "all" / "relay",
+  ? ice_servers: [0*8 ice-server],
+}
+
+ice-server = {
+  urls: [1*8 tstr .size (1..256)],
+  ? username: tstr .size (0..256),
+  ? credential: tstr .size (0..256),
+}
+
+pc-close = {
+  v: 1,
+  t: "pc_close",
+  id: req-id,
+  pc: handle,
+}
+
+; Reply: sdp_ready (type "offer").
+create-offer = {
+  v: 1,
+  t: "create_offer",
+  id: req-id,
+  pc: handle,
+  ? ice_restart: bool,
+}
+
+; Reply: sdp_ready (type "answer").
+create-answer = {
+  v: 1,
+  t: "create_answer",
+  id: req-id,
+  pc: handle,
+}
+
+; Reply: ok. The "rollback" type has an empty sdp.
+set-local-description = {
+  v: 1,
+  t: "set_local_description",
+  id: req-id,
+  pc: handle,
+  type: "offer" / "answer" / "pranswer" / "rollback",
+  sdp: tstr .size (0..262144), ; sdp
+}
+
+set-remote-description = {
+  v: 1,
+  t: "set_remote_description",
+  id: req-id,
+  pc: handle,
+  type: "offer" / "answer" / "pranswer" / "rollback",
+  sdp: tstr .size (0..262144), ; sdp
+}
+
+; An empty candidate string marks the end of candidates.
+add-ice-candidate = {
+  v: 1,
+  t: "add_ice_candidate",
+  id: req-id,
+  pc: handle,
+  candidate: tstr .size (0..2048),
+  ? mid: tstr .size (0..16),
+  ? mline_index: 0..255,
+}
+
+restart-ice = {
+  v: 1,
+  t: "restart_ice",
+  id: req-id,
+  pc: handle,
+}
+
+; Replaces the ICE server list of a live peer connection (for example to refresh short-lived relay
+; credentials during a long call). An empty list removes all servers. Takes effect for the next
+; gathering, so the host follows it with restart_ice when it needs new candidates now.
+update-ice-servers = {
+  v: 1,
+  t: "update_ice_servers",
+  id: req-id,
+  pc: handle,
+  ice_servers: [0*8 ice-server],
+}
+
+; Installs a 32-byte frame key into ring slot 0..15 of a participant. "send" keys are used by
+; the sender cryptors bound to that participant, "recv" keys by the receiver cryptors. An
+; all-zero key is rejected. The key never appears in a reply or an event.
+install-key = {
+  v: 1,
+  t: "install_key",
+  id: req-id,
+  session: handle,
+  participant: tstr .size (1..64),
+  slot: 0..15,
+  key: bstr .size 32, ; nonzero
+  direction: "send" / "recv",
+}
+
+; Overwrites the slot with random bytes (never zeros) and marks it empty.
+retire-slot = {
+  v: 1,
+  t: "retire_slot",
+  id: req-id,
+  session: handle,
+  participant: tstr .size (1..64),
+  direction: "send" / "recv",
+  slot: 0..15,
+}
+
+; Selects the slot used for encryption by the sender cryptors of that participant.
+select-send-slot = {
+  v: 1,
+  t: "select_send_slot",
+  id: req-id,
+  session: handle,
+  participant: tstr .size (1..64),
+  slot: 0..15,
+}
+
+; Binds the cryptor of a media section (mid) to a participant id and a direction.
+bind-media = {
+  v: 1,
+  t: "bind_media",
+  id: req-id,
+  pc: handle,
+  mid: tstr .size (1..16),
+  participant: tstr .size (1..64),
+  direction: "send" / "recv",
+}
+
+set-muted = {
+  v: 1,
+  t: "set_muted",
+  id: req-id,
+  pc: handle,
+  track: "mic" / "camera" / "screen" / "remote_audio" / "remote_video",
+  muted: bool,
+}
+
+; Reply: devices.
+list-devices = {
+  v: 1,
+  t: "list_devices",
+  id: req-id,
+}
+
+; An empty device id selects the system default for that kind.
+select-device = {
+  v: 1,
+  t: "select_device",
+  id: req-id,
+  kind: "audio_in" / "audio_out" / "video_in",
+  device: tstr .size (0..256),
+}
+
+start-video = {
+  v: 1,
+  t: "start_video",
+  id: req-id,
+  pc: handle,
+  source: "camera" / "screen",
+  ? device: tstr .size (0..256),
+  ? mid: tstr .size (1..16),
+  ? width: 16..8192,
+  ? height: 16..8192,
+  ? fps: 1..120,
+  ? max_bitrate_bps: 10000..100000000,
+}
+
+stop-video = {
+  v: 1,
+  t: "stop_video",
+  id: req-id,
+  pc: handle,
+  source: "camera" / "screen",
+}
+
+request-keyframe = {
+  v: 1,
+  t: "request_keyframe",
+  id: req-id,
+  pc: handle,
+  mid: tstr .size (1..16),
+}
+
+; Activates, deactivates and sizes the simulcast layers of a video media section.
+set-simulcast = {
+  v: 1,
+  t: "set_simulcast",
+  id: req-id,
+  pc: handle,
+  mid: tstr .size (1..16),
+  layers: [1*4 layer],
+}
+
+layer = {
+  rid: tstr .size (1..16),
+  active: bool,
+  ? max_bitrate_bps: 10000..100000000,
+  ? scale_down: 1..16,
+}
+
+; Starts or stops a raw PCM tap (for the local speech guardian). Frames arrive as pcm_frame events.
+pcm-tap = {
+  v: 1,
+  t: "pcm_tap",
+  id: req-id,
+  session: handle,
+  point: "capture" / "playout",
+  enabled: bool,
+  ? sample_rate_hz: 8000..48000,
+  ? frame_ms: 10..100,
+}
+
+; Reply: stats.
+get-stats = {
+  v: 1,
+  t: "get_stats",
+  id: req-id,
+  pc: handle,
+  ? scope: "all" / "transport" / "audio" / "video",
+}
+
+; Audio encoder tuning knobs. Only the fields present are changed.
+set-audio-tuning = {
+  v: 1,
+  t: "set_audio_tuning",
+  id: req-id,
+  pc: handle,
+  ? ptime_ms: 10..120,
+  ? bitrate_bps: 6000..510000,
+  ? cbr: bool,
+  ? fec_floor_pct: 0..100,
+}
+
+; ---- Engine to client: replies ----------------------------------------------------------
+
+hello-ok = {
+  v: 1,
+  t: "hello_ok",
+  id: resp-id,
+  engine: tstr .size (1..64),
+  max_frame: 1..1048576,
+}
+
+pong = {
+  v: 1,
+  t: "pong",
+  id: resp-id,
+}
+
+ok = {
+  v: 1,
+  t: "ok",
+  id: resp-id,
+}
+
+; "detail" is a short static identifier, never a copy of client input.
+err = {
+  v: 1,
+  t: "err",
+  id: any-id,
+  code: "bad_request" / "unsupported" / "not_found" / "invalid_state" / "invalid_key" / "limit" / "internal",
+  ? detail: tstr .size (0..128),
+}
+
+session-created = {
+  v: 1,
+  t: "session_created",
+  id: resp-id,
+  session: handle,
+}
+
+; fingerprint is the raw SHA-256 of the DER certificate (32 bytes).
+cert-created = {
+  v: 1,
+  t: "cert_created",
+  id: resp-id,
+  cert: handle,
+  fingerprint: bstr .size 32,
+}
+
+pc-created = {
+  v: 1,
+  t: "pc_created",
+  id: resp-id,
+  pc: handle,
+}
+
+sdp-ready = {
+  v: 1,
+  t: "sdp_ready",
+  id: resp-id,
+  pc: handle,
+  type: "offer" / "answer",
+  sdp: tstr .size (1..262144), ; sdp
+}
+
+devices = {
+  v: 1,
+  t: "devices",
+  id: resp-id,
+  devices: [0*64 device],
+}
+
+device = {
+  id: tstr .size (0..256),
+  name: tstr .size (0..128),
+  kind: "audio_in" / "audio_out" / "video_in",
+  is_default: bool,
+  ? is_communications: bool,
+}
+
+stats = {
+  v: 1,
+  t: "stats",
+  id: resp-id,
+  pc: handle,
+  entries: [0*64 stat-entry],
+}
+
+stat-entry = {
+  type: tstr .size (1..32),
+  id: tstr .size (0..64),
+  values: { 0*64 tstr .size (1..48) => scalar },
+}
+
+; ---- Engine to client: events (id 0) ----------------------------------------------------
+
+ice-candidate = {
+  v: 1,
+  t: "ice_candidate",
+  id: event-id,
+  pc: handle,
+  candidate: tstr .size (0..2048),
+  ? mid: tstr .size (0..16),
+  ? mline_index: 0..255,
+}
+
+ice-gathering-state = {
+  v: 1,
+  t: "ice_gathering_state",
+  id: event-id,
+  pc: handle,
+  state: "new" / "gathering" / "complete",
+}
+
+ice-connection-state = {
+  v: 1,
+  t: "ice_connection_state",
+  id: event-id,
+  pc: handle,
+  state: "new" / "checking" / "connected" / "completed" / "failed" / "disconnected" / "closed",
+}
+
+pc-state = {
+  v: 1,
+  t: "pc_state",
+  id: event-id,
+  pc: handle,
+  state: "new" / "connecting" / "connected" / "disconnected" / "failed" / "closed",
+}
+
+negotiation-needed = {
+  v: 1,
+  t: "negotiation_needed",
+  id: event-id,
+  pc: handle,
+}
+
+; Reported once the DTLS handshake has completed. The client checks the values and the
+; remote certificate fingerprint against what the signed handshake promised.
+transport-info = {
+  v: 1,
+  t: "transport_info",
+  id: event-id,
+  pc: handle,
+  tls_version: tstr .size (1..16),
+  dtls_cipher: tstr .size (1..64),
+  group: tstr .size (0..64),
+  srtp_cipher: tstr .size (1..64),
+  remote_cert_fingerprint: bstr .size 32,
+}
+
+; The engine saw a transport that breaks the compiled-in policy and closed the peer connection.
+transport-violation = {
+  v: 1,
+  t: "transport_violation",
+  id: event-id,
+  pc: handle,
+  reason: "no_dtls" / "tls_version" / "dtls_cipher" / "group" / "srtp_cipher",
+}
+
+cryptor-state = {
+  v: 1,
+  t: "cryptor_state",
+  id: event-id,
+  pc: handle,
+  mid: tstr .size (1..16),
+  participant: tstr .size (1..64),
+  kind: "audio" / "video",
+  state: "ok" / "missing_key" / "decryption_failed" / "encryption_failed" / "internal_error",
+}
+
+devices-changed = {
+  v: 1,
+  t: "devices_changed",
+  id: event-id,
+}
+
+pcm-frame = {
+  v: 1,
+  t: "pcm_frame",
+  id: event-id,
+  session: handle,
+  point: "capture" / "playout",
+  seq: 0..4294967295,
+  sample_rate_hz: 8000..48000,
+  channels: 1..2,
+  samples: bstr .size (0..32768),
+}
