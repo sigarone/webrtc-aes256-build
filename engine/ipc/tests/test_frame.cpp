@@ -161,13 +161,29 @@ QTEST(frame_buffer_wipe_zeroes_everything_that_was_received) {
   CHECK(AllZero(buf.raw(), buf.capacity()));
 }
 
+QTEST(memory_stream_delivers_the_bytes_that_arrived_before_failing) {
+  // A pipe read that ends early has already written what it received into the destination. The
+  // in-memory stream must do the same, or the wipe-on-failure paths are never exercised by the
+  // unit tests and the session fuzzer.
+  const Buf wire{0x11, 0x22, 0x33};
+  MemoryStream in(wire);
+  uint8_t dst[8] = {0};
+  CHECK(in.ReadExact(dst, sizeof dst, 1000) == IoResult::Error);
+  CHECK(dst[0] == 0x11 && dst[1] == 0x22 && dst[2] == 0x33);
+  CHECK(AllZero(dst + 3, sizeof dst - 3));
+  CHECK_EQ(in.consumed(), wire.size());
+  CHECK(in.ReadExact(dst, 1, 1000) == IoResult::Eof);
+}
+
 QTEST(frame_failed_read_wipes_the_partial_payload) {
   FrameBuffer buf;
   Buf wire = Header(32);
   wire.resize(4 + 16, 0xD7);  // half of the payload, then the stream ends
   MemoryStream in(wire);
   CHECK_EQ(ReadFrame(in, buf, 1000), Err::IoError);
-  CHECK(buf.capacity() == 0 || AllZero(buf.raw(), buf.capacity()));
+  CHECK_EQ(buf.capacity(), 32u);  // the payload buffer existed and received 16 bytes
+  CHECK(AllZero(buf.raw(), buf.capacity()));
+  CHECK_EQ(buf.view().size(), 0u);
 }
 
 QTEST(secure_primitives) {

@@ -112,6 +112,9 @@ IoResult MemoryStream::ReadExact(uint8_t* dst, size_t n, uint32_t) {
   const size_t left = in_.size() - pos_;
   if (left == 0) return IoResult::Eof;
   if (left < n) {
+    // Like a real pipe, the bytes that did arrive are delivered before the stream fails, so tests
+    // and fuzzers see the same partially filled buffer the engine sees in production.
+    std::memcpy(dst, in_.data() + pos_, left);
     pos_ = in_.size();
     return IoResult::Error;
   }
