@@ -270,6 +270,7 @@ jobs:
           Set-Content -NoNewline -Path (Join-Path $bad "hdr/.qmedia-archive-sha256") -Value "00"
           Expect-Fail $bad "headers that do not come from the pinned archive"
           Remove-Item -Recurse -Force $bad
+          exit 0  # the last cmake run above failed on purpose; its exit code must not become the step result
 
       - name: Configure (Chromium clang-cl, Ninja, flags from build-flags.json)
         shell: cmd
