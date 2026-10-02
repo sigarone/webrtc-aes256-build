@@ -17,7 +17,8 @@ name: build-webrtc-windows-m150-hardened
 #
 # Job graph (same privilege split as build-m150-android.yml - the job that
 # compiles untrusted patched C++ never holds release/attestation rights):
-#   precheck (contents: read)          - validate inputs, refuse an existing tag
+#   precheck (contents: read)          - validate inputs, refuse an existing tag,
+#                                        refuse publish=true from any ref but main
 #   build    (contents: read)  <- precheck   compile webrtc.lib, gates, upload
 #   test     (contents: read)  <- precheck   rtc_unittests + modules_unittests +
 #                                            peerconnection_unittests (strict),
@@ -59,6 +60,8 @@ env:
   IN_WEBRTC_REF: ${{ github.event.inputs.webrtc_ref || 'ba469aa2093b-qaudion-m150' }}
   IN_FORK_URL: ${{ github.event.inputs.webrtc_fork_url || 'https://github.com/sigarone/webrtc.git' }}
   IN_SUFFIX: ${{ github.event.inputs.release_suffix || 'a256-dplc-1' }}
+  IN_PUBLISH: ${{ github.event.inputs.publish }}
+  RUN_REF: ${{ github.ref }}
   # depot_tools is pinned inside m150/ci/sync.sh itself (reviewed constant).
 
 permissions:
@@ -73,6 +76,15 @@ jobs:
     outputs:
       tag: ${{ steps.tags.outputs.tag }}
     steps:
+      - name: Refuse publish=true from any ref but main (else the whole build runs and publish is silently skipped)
+        run: |
+          set -euo pipefail
+          case "${IN_PUBLISH:-}" in true|false|'') ;; *) echo "::error::publish must be true or false"; exit 1 ;; esac
+          if [ "${IN_PUBLISH:-}" = true ] && [ "${RUN_REF:-}" != refs/heads/main ]; then
+            echo "::error::publish=true is only honoured on a dispatch from refs/heads/main; this run is on another ref, so it would build for ~75 min and then skip the release. Dispatch from main, or set publish=false for a branch run."
+            exit 1
+          fi
+
       - name: Validate dispatch inputs (charset allow-list, fail closed)
         run: |
           set -euo pipefail
@@ -359,15 +371,33 @@ jobs:
         working-directory: out
         run: sha256sum -c SHA256SUMS
 
-      - name: Every released file is checksummed (no extra file rides along)
+      - name: The release is exactly the 6 expected files plus SHA256SUMS
         working-directory: out
         run: |
           set -euo pipefail
-          listed=$(awk '{print $2}' SHA256SUMS | sed 's/^\*//' | sort)
-          present=$(ls -1 | grep -v '^SHA256SUMS$' | sort)
-          if [ "$listed" != "$present" ]; then
-            echo "::error::files in out/ differ from the files SHA256SUMS covers"
-            echo "listed:"; echo "$listed"; echo "present:"; echo "$present"
+          # The fixed set, not whatever the artifact happens to hold: a file that
+          # is missing, extra, a directory or a link, or a SHA256SUMS that lists
+          # more, fewer or the same file twice, fails the publish.
+          expected=$(printf '%s\n' BUILDINFO.json PINS.txt build-flags.json libcxx.lib webrtc-headers.zip webrtc.lib | LC_ALL=C sort)
+          present=$(ls -1A | grep -vx 'SHA256SUMS' | LC_ALL=C sort || true)
+          listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | LC_ALL=C sort)
+          bad=0
+          if [ "$present" != "$expected" ]; then
+            echo "::error::the files present in out/ are not exactly the 6 expected release files plus SHA256SUMS"
+            bad=1
+          fi
+          if [ "$listed" != "$expected" ]; then
+            echo "::error::SHA256SUMS does not list exactly the 6 expected release files (once each)"
+            bad=1
+          fi
+          for f in SHA256SUMS $expected; do
+            if [ ! -f "$f" ] || [ -L "$f" ]; then
+              echo "::error::$f is not a regular file"
+              bad=1
+            fi
+          done
+          if [ "$bad" != 0 ]; then
+            echo "expected:"; echo "$expected"; echo "present:"; echo "$present"; echo "listed in SHA256SUMS:"; echo "$listed"
             exit 1
           fi
 

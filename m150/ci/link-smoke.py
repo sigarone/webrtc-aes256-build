@@ -68,21 +68,53 @@ ALLOWED_FLAG_PREFIXES = ("/std:", "-std=", "-fmsc-version=", "-m64", "-m32", "-m
                          "/arch:", "/MT", "/MD", "/utf-8", "/Zc:", "/Zp", "/GR", "/EH",
                          "-fcomplete-member-pointers", "-fno-exceptions", "-fexceptions",
                          "-fno-rtti", "-frtti", "-fms-compatibility")
-LIB_RE = re.compile(r"[A-Za-z0-9_.+-]+\.lib")
-INC_RE = re.compile(r"(\.\./\.\.|\.\./\.\./[A-Za-z0-9_.+/-]+|gen(/[A-Za-z0-9_.+-]+)*)")
+
+# Every path that build-flags.json hands to a command line or to os.path.join is
+# validated SEGMENT by SEGMENT (split on "/"), never with one regex over the whole
+# string: a regex over the string let "../..//Windows/System32" through (the "//"
+# made os.path.join restart at an absolute path on Windows) and accepted a lib
+# name starting with "-" or "+" (an option for the linker).
+#
+# A plain segment: starts with a letter, a digit or "_" (so it is never ".", "..",
+# an option such as "-x" / "+x", or "@file"), then only [A-Za-z0-9_.+-] (so no
+# ":" = no drive letter or NTFS stream, no backslash, no space, no quote).
+SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+LIB_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*\.lib")   # one segment: a file name, never a path
+
+
+def plain_segments(segments):
+    """True when every segment is plain; an empty segment ("//"), "." and ".."
+    are not."""
+    return all(SEGMENT_RE.fullmatch(s) for s in segments)
+
+
+def is_plain_rel_path(value):
+    """A relative path of plain segments, no leading "/", no empty, "." or ".."
+    segment, no drive, no backslash."""
+    return isinstance(value, str) and plain_segments(value.split("/"))
+
+
+def is_include_dir(value):
+    """An include dir as GN writes it relative to the build dir: "../.." (the
+    source root), "../../<plain path>", or "gen"/"gen/<plain path>". The ONLY ".."
+    segments allowed are the two leading ones."""
+    if not isinstance(value, str):
+        return False
+    segs = value.split("/")
+    if segs[:2] == ["..", ".."]:
+        return plain_segments(segs[2:])
+    return segs[0] == "gen" and plain_segments(segs)
 
 
 CLANG_URL_RE = re.compile(
     r"https://commondatastorage\.googleapis\.com/chromium-browser-clang/Win/clang-[A-Za-z0-9._-]+\.tar\.xz")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
-# a relative path made of plain segments: no "..", no drive, no backslash, no leading slash
-REL_PATH_RE = re.compile(r"[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*")
 
 
 def safe_rel(value, what):
     """build-flags.json paths that are joined to a directory of ours must stay
     inside it."""
-    if not isinstance(value, str) or not REL_PATH_RE.fullmatch(value) or ".." in value.split("/"):
+    if not is_plain_rel_path(value):
         die("build-flags.json %s is not a plain relative path: %r" % (what, value))
     return value
 
@@ -111,10 +143,10 @@ def validate_flags(flags):
         if not FLAG_RE.fullmatch(f) or not f.startswith(ALLOWED_FLAG_PREFIXES):
             bad.append(("flag", f))
     for l in flags["link"]["system_libs"] + flags["link"]["static_libs"] + flags["link"]["default_libs"]:
-        if not LIB_RE.fullmatch(l):
+        if not isinstance(l, str) or not LIB_RE.fullmatch(l):
             bad.append(("lib", l))
     for i in flags["compile"]["include_dirs"]:
-        if not INC_RE.fullmatch(i) or ".." in i.replace("../..", "", 1).split("/"):
+        if not is_include_dir(i):
             bad.append(("include dir", i))
     if bad:
         die("build-flags.json carries tokens that are not plain compile/link options: %r" % (bad[:8],))
