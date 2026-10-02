@@ -35,6 +35,8 @@ inline constexpr DWORD kPipeOpenMode =
 inline constexpr DWORD kPipeMode =
     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
 inline constexpr DWORD kPipeMaxInstances = 1;
+// Access mask of the single ACE (SDDL "FRFW"). VerifyPipeDacl requires exactly this mask.
+inline constexpr DWORD kPipeUserAccess = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 
 // Accepts "\\.\pipe\" followed by 1..128 characters of [A-Za-z0-9._-].
 bool IsValidPipeName(std::wstring_view name);
@@ -87,7 +89,8 @@ class PipeServer {
 Err ConnectPipe(std::wstring_view name, uint32_t timeout_ms, uint32_t expected_server_pid,
                 std::unique_ptr<HandleStream>* out);
 
-// True iff the DACL of the pipe handle is exactly one ACCESS_ALLOWED ACE for the current user.
+// True iff the DACL of the pipe handle is exactly one ACCESS_ALLOWED ACE for the current user,
+// without ACE flags and with the access mask kPipeUserAccess.
 bool VerifyPipeDacl(HANDLE pipe);
 
 // Reads exactly kNonceBytes from a handle (typically stdin) within the timeout.

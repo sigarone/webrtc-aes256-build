@@ -110,7 +110,10 @@ bool UsersDaclMatches(HANDLE pipe, PSID expected) {
   if (!GetAce(dacl, 0, &ace) || ace == nullptr) return false;
   const ACE_HEADER* hdr = static_cast<const ACE_HEADER*>(ace);
   if (hdr->AceType != ACCESS_ALLOWED_ACE_TYPE) return false;
+  if (hdr->AceFlags != 0) return false;  // no inherit-only or other flag that changes its meaning
   const ACCESS_ALLOWED_ACE* allowed = static_cast<const ACCESS_ALLOWED_ACE*>(ace);
+  // Exactly the rights the server asks for, nothing wider (WRITE_DAC, WRITE_OWNER, DELETE, ...).
+  if (allowed->Mask != kPipeUserAccess) return false;
   return EqualSid(reinterpret_cast<PSID>(const_cast<DWORD*>(&allowed->SidStart)), expected) != FALSE;
 }
 
@@ -245,11 +248,15 @@ Err PipeServer::WaitForClient(uint32_t timeout_ms, uint32_t expected_client_pid,
       // The client connected between creation and this call: success.
     } else if (err == ERROR_IO_PENDING) {
       const DWORD w = WaitForSingleObject(ev, timeout_ms == kNoTimeout ? INFINITE : timeout_ms);
+      DWORD dummy = 0;
       if (w != WAIT_OBJECT_0) {
         CancelIoEx(handle_, &ov);
-        DWORD dummy = 0;
         GetOverlappedResult(handle_, &ov, &dummy, TRUE);
         result = w == WAIT_TIMEOUT ? Err::IoTimeout : Err::IoError;
+      } else if (!GetOverlappedResult(handle_, &ov, &dummy, FALSE)) {
+        // The event also fires when the connect completes with an error (for example
+        // ERROR_OPERATION_ABORTED after a cancel): that is not a connected client.
+        result = Err::IoError;
       }
     } else {
       result = Err::IoError;
