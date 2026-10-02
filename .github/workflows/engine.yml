@@ -310,6 +310,7 @@ jobs:
           $ci = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path build-rtc\qaudion-media-ci.exe).Path))
           if (-not $ci.Contains("ci-audio-in")) { throw "the CI engine lacks its CI flags" }
           Write-Host ("size: " + $bytes.Length + " bytes")
+          exit 0  # the flag checks above end with a native exit code of 2 on purpose
 
       - name: Two engines, one call (DTLS 1.3, PQC group, AES-256 everywhere, frame keys, negative cases)
         shell: pwsh
