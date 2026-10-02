@@ -356,6 +356,25 @@ std::string MidOf(const std::string& sdp) {
   return sdp.substr(p + 6, e - p - 6);
 }
 
+// The DTLS fingerprint an SDP announces: "a=fingerprint:sha-256 AA:BB:..." as 32 raw bytes.
+Buf FingerprintOfSdp(const std::string& sdp) {
+  Buf out;
+  const std::string key = "a=fingerprint:sha-256 ";
+  const size_t p = sdp.find(key);
+  if (p == std::string::npos) return out;
+  size_t i = p + key.size();
+  while (i + 1 < sdp.size() && sdp[i] != '\r' && sdp[i] != '\n') {
+    const auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    const int hi = hex(sdp[i]);
+    const int lo = hex(sdp[i + 1]);
+    if (hi < 0 || lo < 0) break;
+    out.push_back(static_cast<uint8_t>(hi * 16 + lo));
+    i += 2;
+    if (i < sdp.size() && sdp[i] == ':') ++i;
+  }
+  return out;
+}
+
 // ---- The microphone file -----------------------------------------------------------------------
 
 bool WriteMicFile(const std::string& path, double seed) {
@@ -576,6 +595,7 @@ void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_re
   Msg offer = a.proc.Call("create_offer", [&](uint32_t id) { return BeginMessage("create_offer", id).Uint("pc", a.pc).Finish(); });
   if (offer->kind() != "sdp_ready") Abort("create_offer failed " + offer->Text("code") + " " + offer->Text("detail"));
   const std::string offer_sdp = MungeOpus(offer->Text("sdp"));
+  Check(FingerprintOfSdp(offer_sdp) == a.fingerprint, "the offer announces the certificate cert_create returned (check a)");
   SetDesc(a, true, "offer", offer_sdp);
   const std::string mid = MidOf(offer_sdp);
   if (mid.empty()) Abort("the offer has no mid");
@@ -586,6 +606,7 @@ void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_re
   Msg answer = b.proc.Call("create_answer", [&](uint32_t id) { return BeginMessage("create_answer", id).Uint("pc", b.pc).Finish(); });
   if (answer->kind() != "sdp_ready") Abort("create_answer failed " + answer->Text("code") + " " + answer->Text("detail"));
   const std::string answer_sdp = MungeOpus(answer->Text("sdp"));
+  Check(FingerprintOfSdp(answer_sdp) == b.fingerprint, "the answer announces the certificate cert_create returned (check a)");
   SetDesc(b, true, "answer", answer_sdp);
   SetDesc(a, false, "answer", answer_sdp);
 
@@ -649,6 +670,7 @@ void Call1(const std::string& dir) {
   std::this_thread::sleep_for(std::chrono::seconds(2));
   const AudioIn mid = ReadInbound(b.proc, b.pc);
   const double rate = (mid.energy - before.energy) / 2.0;
+  std::printf("[call]   note: energy rate while keyed %.6g per second\n", rate);
   Check(rate > 1e-5, "call 1 callee: decoded audio energy grows while the key is installed");
   b.proc.CallOk("retire_slot", [&](uint32_t id) {
     return BeginMessage("retire_slot", id).Uint("session", b.session).Str("participant", "remote").Str("direction", "recv").Uint("slot", 0).Finish();
@@ -659,6 +681,7 @@ void Call1(const std::string& dir) {
   const AudioIn settled = ReadInbound(b.proc, b.pc);
   std::this_thread::sleep_for(std::chrono::seconds(3));
   const AudioIn after = ReadInbound(b.proc, b.pc);
+  std::printf("[call]   note: energy delta after retirement %.6g over 3 s\n", after.energy - settled.energy);
   Check(after.packets > settled.packets, "call 1 callee: packets keep arriving after the retirement");
   Check((after.energy - settled.energy) < rate * 3.0 * 0.02, "call 1 callee: no decoded audio after the retirement");
 
@@ -693,8 +716,50 @@ void Call2(const std::string& dir) {
   Check(WaitAudio(a.proc, a.pc, 40, &ia), "call 2 caller: audio from the callee still decrypts (control)");
   std::this_thread::sleep_for(std::chrono::seconds(3));
   const AudioIn ib = ReadInbound(b.proc, b.pc);
+  std::printf("[call]   note: wrong key: packets %llu energy %.6g; control energy %.6g\n",
+              static_cast<unsigned long long>(ib.packets), ib.energy, ia.energy);
   Check(ib.packets >= 20, "call 2 callee: packets arrive");
   Check(ib.energy < 1e-4, "call 2 callee: no decoded audio with the wrong key");
+
+  // The remaining commands, on a live call.
+  Msg devs = a.proc.Call("list_devices", [](uint32_t id) { return Req("list_devices", id); });
+  Check(devs->kind() == "devices", "list_devices answers with a device list");
+  a.proc.CallOk("set_muted mic", [&](uint32_t id) {
+    return BeginMessage("set_muted", id).Uint("pc", a.pc).Str("track", "mic").Flag("muted", true).Finish();
+  });
+  a.proc.CallOk("set_muted mic off", [&](uint32_t id) {
+    return BeginMessage("set_muted", id).Uint("pc", a.pc).Str("track", "mic").Flag("muted", false).Finish();
+  });
+  Msg video = a.proc.Call("set_muted camera", [&](uint32_t id) {
+    return BeginMessage("set_muted", id).Uint("pc", a.pc).Str("track", "camera").Flag("muted", true).Finish();
+  });
+  Check(video->kind() == "err" && video->Text("code") == "unsupported", "video commands are refused in this build");
+  Msg tune = a.proc.Call("set_audio_tuning ptime", [&](uint32_t id) {
+    return BeginMessage("set_audio_tuning", id).Uint("pc", a.pc).Uint("ptime_ms", 60).Finish();
+  });
+  Check(tune->kind() == "err" && tune->Text("code") == "unsupported", "ptime is an SDP parameter and is refused at run time");
+  Msg ts = a.proc.Call("get_stats transport", [&](uint32_t id) {
+    return BeginMessage("get_stats", id).Uint("pc", a.pc).Str("scope", "transport").Finish();
+  });
+  Check(ts->kind() == "stats", "get_stats answers for the transport scope");
+  a.proc.CallOk("update_ice_servers", [&](uint32_t id) {
+    cbor::ArrayBuilder none;
+    return BeginMessage("update_ice_servers", id).Uint("pc", a.pc).Raw("ice_servers", none.Finish()).Finish();
+  });
+  a.proc.CallOk("restart_ice", [&](uint32_t id) { return BeginMessage("restart_ice", id).Uint("pc", a.pc).Finish(); });
+
+  // A peer connection rebuilt in the same session presents the same certificate (R-CERT).
+  a.proc.CallOk("pc_close", [&](uint32_t id) { return BeginMessage("pc_close", id).Uint("pc", a.pc).Finish(); });
+  Msg again = a.proc.Call("pc_create again", [&](uint32_t id) {
+    return BeginMessage("pc_create", id).Uint("session", a.session).Uint("cert", a.cert).Finish();
+  });
+  Check(again->kind() == "pc_created", "a second peer connection is created with the same certificate handle");
+  if (again->kind() == "pc_created") {
+    const uint32_t pc2 = static_cast<uint32_t>(again->Uint("pc"));
+    Msg offer2 = a.proc.Call("create_offer again", [&](uint32_t id) { return BeginMessage("create_offer", id).Uint("pc", pc2).Finish(); });
+    Check(offer2->kind() == "sdp_ready" && FingerprintOfSdp(offer2->Text("sdp")) == a.fingerprint,
+          "the rebuilt peer connection announces the same certificate fingerprint");
+  }
   Finish(a, b);
   Check(!a.proc.invalid_message() && !b.proc.invalid_message(), "call 2: every engine message validated against the schema");
 }
