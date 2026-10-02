@@ -449,12 +449,12 @@ void SetupSide(Side& s, const std::string& dir, const std::string& name, double 
   if (!WriteMicFile(mic, seed)) Abort("cannot write the microphone file");
   if (!s.proc.Start(name, mic, spk, dir + "\\" + name + "-engine.err")) Abort(name + ": engine did not start");
   Msg r = s.proc.Call("session_create", [](uint32_t id) { return Req("session_create", id); });
-  if (r->kind() != "session_created") Abort(name + ": session_create failed");
+  if (r->kind() != "session_created") Abort(name + ": session_create failed " + r->Text("code") + " " + r->Text("detail"));
   s.session = static_cast<uint32_t>(r->Uint("session"));
   r = s.proc.Call("cert_create", [&](uint32_t id) {
     return BeginMessage("cert_create", id).Uint("session", s.session).Finish();
   });
-  if (r->kind() != "cert_created") Abort(name + ": cert_create failed");
+  if (r->kind() != "cert_created") Abort(name + ": cert_create answered " + r->kind() + " " + r->Text("code") + " " + r->Text("detail"));
   s.cert = static_cast<uint32_t>(r->Uint("cert"));
   s.fingerprint = r->Bytes("fingerprint");
   r = s.proc.Call("pc_create", [&](uint32_t id) {

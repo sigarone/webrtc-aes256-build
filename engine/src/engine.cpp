@@ -170,8 +170,10 @@ ipc::HandlerAction Engine::Handle(const ipc::ValidatedMessage& m, ipc::Outbox& o
       auto cert = webrtc::RTCCertificateGenerator::GenerateCertificate(webrtc::KeyParams::ECDSA(),
                                                                        std::nullopt);
       std::array<uint8_t, 32> fp{};
-      if (!cert || !Fingerprint(cert, &fp)) {
+      if (!cert) {
         Fail(out, id, ec::kInternal.data(), "cert_generation_failed");
+      } else if (!Fingerprint(cert, &fp)) {
+        Fail(out, id, ec::kInternal.data(), "cert_digest_failed");
       } else {
         CertEntry e;
         e.id = next_handle_++;
