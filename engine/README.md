@@ -52,8 +52,10 @@ qaudion-media.exe --pipe \\.\pipe\<name> [--expect-client-pid <pid>]
    engine's standard input, which must be an anonymous pipe or a file. A console, the NUL device
    or any other handle is refused. The engine reads the nonce within 5 seconds.
 2. The engine creates the named pipe (one instance only, see below) and waits 15 seconds for one
-   client. The host should pick a fresh random pipe name for every start (128 random bits). With `--expect-client-pid` it also checks the client process id with
-   `GetNamedPipeClientProcessId`.
+   client. The host should pick a fresh random pipe name for every start (128 random bits). With
+   `--expect-client-pid` it also checks the client process id with `GetNamedPipeClientProcessId`.
+   Each option may be given once; a repeated option or a client process id of 0 is a bad command
+   line (exit code 2), so the check cannot be switched off by accident.
 3. Before sending the hello, the host must check that the process at the other end of the pipe is
    the child it started (`GetNamedPipeServerProcessId` equals the child's process id; the helper
    `ConnectPipe` does this when given the id). Another process of the same user could have
@@ -85,7 +87,10 @@ Keys.
   detail or a log.
 - The receive buffer is zeroed after every message and when the session ends, on every exit path
   (`FrameBuffer::Wipe`, also run by its destructor). Decoded byte strings are views into that
-  buffer, so the decoder never makes a second copy of a key.
+  buffer, so the decoder never makes a second copy of a key. That buffer is ordinary heap memory
+  (it holds up to 1 MiB): a key is in pageable memory only for the time one message is handled.
+  The in-memory test stream delivers partial reads the way a pipe does, so the wipe of a partially
+  received frame is exercised by the unit tests and the session fuzzer.
 - Code that keeps a key (the frame key provider) copies it once into locked, non-pageable memory,
   zeroes it with `SecureZero` when the slot is retired or the session ends, and never copies it
   into logs, exceptions, crash reports or telemetry. `retire_slot` fills the slot with random
@@ -122,10 +127,18 @@ IPC hardening.
 - The pipe has a protected DACL with one allow entry for the current user SID (no Everyone,
   Network, Anonymous, Users, Administrators or System), `PIPE_REJECT_REMOTE_CLIENTS`,
   `FILE_FLAG_FIRST_PIPE_INSTANCE` and a maximum of one instance. The DACL is read back after
-  creation and the pipe is refused if it is not exactly that. The access mask is the generic read
+  creation and the pipe is refused if it is not exactly that (one allow entry, that SID, that
+  access mask, no ACE flags). The access mask is the generic read
   and write set, which includes the right to create a pipe instance; the instance limit of one is
   what prevents a second instance, so do not raise it.
-- The client side opens the pipe with identification-level impersonation only.
+- The client side opens the pipe with identification-level impersonation only
+  (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, as `ConnectPipe` does). The host must do the
+  same: a plain file open of the pipe from the JVM grants the server full impersonation, which a
+  compromised engine could use against the host.
+- The pipe carries no explicit integrity label, so the default policy applies (no write up). A
+  process of the same user at lower integrity can still open it for reading and so occupy the
+  single instance; it cannot send a hello and the engine sends nothing before one, so this is a
+  denial of service of one start, not a disclosure.
 - At start the process restricts DLL loading to its own directory and System32, turns on heap
   termination on corruption and suppresses the fault dialog.
 
@@ -169,7 +182,10 @@ whose purpose is a clean supply chain, and the strictness we need would still ha
 on top. The decoder here is about 250 lines, has no dependency, is zero-copy (needed for the key
 wipe), and is covered three ways: exhaustive unit tests of every rejected form, a canonical
 round-trip property (an accepted input must re-encode to the same bytes, which catches any
-leniency), and libFuzzer with ASan and UBSan.
+leniency), and libFuzzer with ASan and UBSan. The message fuzzer compares every verdict of the
+validator with an independent second implementation of the rules (`ipc/fuzz/oracle.h`) that
+descends into every nested object, array element and scalar map, so a validator that fails open
+anywhere in a message is caught without needing a crash.
 
 ## Layout
 
