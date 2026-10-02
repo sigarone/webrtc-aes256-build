@@ -1,5 +1,6 @@
 #include "peer.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -565,13 +566,10 @@ void Peer::CheckTransport() {
     else if (info.ssl_group_id().value_or(-1) != kX25519Mlkem768) violation = "group";
     else if (info.srtp_cipher_suite().value_or(-1) != kSrtpAeadAes256Gcm) violation = "srtp_cipher";
 
-    webrtc::Buffer digest;
+    std::array<uint8_t, 32> digest{};
     bool have_fp = false;
     const webrtc::SSLCertChain* chain = info.remote_ssl_certificates();
-    if (chain != nullptr && chain->GetSize() > 0 &&
-        chain->Get(0).ComputeDigest("sha-256", digest) && digest.size() == ipc::kFingerprintBytes) {
-      have_fp = true;
-    }
+    if (chain != nullptr && chain->GetSize() > 0) have_fp = CertSha256(chain->Get(0), &digest);
     if (violation == nullptr && !have_fp) violation = "no_dtls";
 
     if (violation != nullptr) {

@@ -38,11 +38,7 @@ std::string Text(const ipc::ValidatedMessage& m, const char* name) {
 }
 
 bool Fingerprint(const webrtc::scoped_refptr<webrtc::RTCCertificate>& cert, std::array<uint8_t, 32>* out) {
-  webrtc::Buffer digest;
-  if (!cert->GetSSLCertificate().ComputeDigest("sha-256", digest)) return false;
-  if (digest.size() != out->size()) return false;
-  std::memcpy(out->data(), digest.data(), out->size());
-  return true;
+  return CertSha256(cert->GetSSLCertificate(), out);
 }
 
 std::vector<IceServerSpec> ParseIceServers(const Value* arr) {

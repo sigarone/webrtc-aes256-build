@@ -3,6 +3,7 @@
 // compiled into libwebrtc (rtc_qaudion_transport_strict) and nothing in this file can relax it.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -13,6 +14,7 @@
 #include "api/environment/environment.h"
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
+#include "rtc_base/ssl_certificate.h"
 #include "rtc_base/thread.h"
 
 namespace qmedia::engine {
@@ -72,6 +74,11 @@ class Runtime {
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
   bool wsa_started_ = false;
 };
+
+// SHA-256 of the DER encoding of a certificate: the DTLS fingerprint the signalling binds. Computed
+// here from the DER bytes with the operating system's hash, so it does not depend on how the
+// library names or sizes its own digest.
+bool CertSha256(const webrtc::SSLCertificate& cert, std::array<uint8_t, 32>* out);
 
 // Replaces every control character by a space and cuts the text to at most max_bytes at a UTF-8
 // boundary, so it satisfies the schema's text rules. Used for device names and ids.

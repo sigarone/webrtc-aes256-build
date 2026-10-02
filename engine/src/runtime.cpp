@@ -1,6 +1,8 @@
 #include "runtime.h"
 
 #include <winsock2.h>
+#include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,7 @@
 #include "api/create_peerconnection_factory.h"
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
+#include "rtc_base/buffer.h"
 #include "rtc_base/qaudion_tuning.h"
 #include "rtc_base/ssl_adapter.h"
 
@@ -84,6 +87,15 @@ std::string SanitizeText(const std::string& in, size_t max_bytes) {
     i += n;
   }
   return out;
+}
+
+bool CertSha256(const webrtc::SSLCertificate& cert, std::array<uint8_t, 32>* out) {
+  webrtc::Buffer der;
+  cert.ToDER(&der);
+  if (der.size() == 0) return false;
+  const NTSTATUS st = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<PUCHAR>(der.data()),
+                                 static_cast<ULONG>(der.size()), out->data(), static_cast<ULONG>(out->size()));
+  return st >= 0;
 }
 
 std::unique_ptr<Runtime> Runtime::Create(const Options& opts) {
