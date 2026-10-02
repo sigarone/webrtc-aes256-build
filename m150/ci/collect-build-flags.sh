@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # collect-build-flags.sh - dump the real build facts and turn them into
 # build-flags.json (S0.1). Windows only (Git Bash on windows-2022, depot_tools
 # on PATH). Runs AFTER `gn gen <out>` and after the library was built in the
@@ -11,7 +11,7 @@
 #   <gn_args>      the exact GN args string of the build
 #   <result.json>  where build-flags.json is written
 # exit: 0 ok | 1 a required fact is missing | 2 usage
-set -eu
+set -euo pipefail
 
 [ $# -eq 5 ] || { echo "usage: $0 <webrtc_src> <out_dir_rel> <raw_dir> <gn_args> <result.json>" >&2; exit 2; }
 SRC=$1
@@ -45,8 +45,10 @@ cp "$CLANG_DIR/cr_build_revision" "$RAW/cr-build-revision"
 REV=$(tr -d '\r\n' < "$RAW/cr-build-revision")
 # Pin the exact compiler package a consumer must use (same URL gclient's
 # tools/clang/scripts/update.py fetched it from).
-if curl -fsSL "https://commondatastorage.googleapis.com/chromium-browser-clang/Win/clang-$REV.tar.xz" -o "$RAW/clang.tar.xz"; then
-  sha256sum "$RAW/clang.tar.xz" | cut -d' ' -f1 > "$RAW/clang-sha256"
+case "$REV" in ''|*[!A-Za-z0-9._-]*) echo "::error::collect-build-flags: odd compiler revision" >&2; exit 1 ;; esac
+if curl --proto '=https' --tlsv1.2 -fsSL "https://commondatastorage.googleapis.com/chromium-browser-clang/Win/clang-$REV.tar.xz" -o "$RAW/clang.tar.xz"; then
+  sum=$(sha256sum "$RAW/clang.tar.xz")
+  printf '%s\n' "${sum%% *}" > "$RAW/clang-sha256"
   rm -f "$RAW/clang.tar.xz"
 else
   echo "::error::collect-build-flags: cannot download the clang package $REV to pin its sha256" >&2

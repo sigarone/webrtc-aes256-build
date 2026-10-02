@@ -12,8 +12,7 @@ GN output directory the library was compiled in, no hand-written values):
                      source of defines, include dirs and ABI-relevant flags)
   clang-version.txt  <clang-cl> --version
   cr-build-revision  third_party/llvm-build/Release+Asserts/cr_build_revision
-  clang-sha256       sha256 of the clang package tarball (single line, may be
-                     absent when the download was not possible)
+  clang-sha256       sha256 of the clang package tarball (single line, required)
 
 The file tells a consumer exactly how to compile and link against webrtc.lib:
 defines, include directories (as GN wrote them, relative to the build dir; the
@@ -88,7 +87,9 @@ def main():
         return 2
     raw, gn_args = sys.argv[1], sys.argv[2]
     desc = json.loads(read(os.path.join(raw, "desc-webrtc.json")))
-    target = desc.get("//:webrtc") or next(iter(desc.values()))
+    if "//:webrtc" not in desc:
+        die("gn desc has no //:webrtc entry")
+    target = desc["//:webrtc"]
     compdb = json.loads(read(os.path.join(raw, "compdb.json")))
     tokens = tokenize(probe_command(compdb))
 
@@ -143,6 +144,13 @@ def main():
         die("no C++ standard flag in the compile command")
 
     # STL: Chromium's libc++ shows up as an include dir under third_party/libc++
+    # The public headers include <openssl/...> (BoringSSL ids) and the zip
+    # carries that tree; the library's own command line does not list it
+    # because the library finds it through a dependency's config, so the
+    # contract states it explicitly.
+    bssl_inc = "../../third_party/boringssl/src/include"
+    if bssl_inc not in includes:
+        includes.append(bssl_inc)
     libcxx_inc = [i for i in includes if "third_party/libc++/src/include" in i]
     libcxx_cfg = [i for i in includes if i.endswith("buildtools/third_party/libc++")]
     uses_libcxx = bool(libcxx_inc)
@@ -169,7 +177,13 @@ def main():
         die("clang cr_build_revision missing or odd: %r" % cr_rev)
     clang_ver = (read(os.path.join(raw, "clang-version.txt")) or "").strip().splitlines()
     clang_ver_line = clang_ver[0] if clang_ver else ""
-    clang_sha = (read(os.path.join(raw, "clang-sha256"), required=False) or "").strip() or None
+    if not clang_ver_line.startswith("clang version"):
+        die("clang --version output not recognised: %r" % clang_ver_line)
+    clang_sha = (read(os.path.join(raw, "clang-sha256")) or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", clang_sha):
+        die("clang package sha256 missing or malformed")
+    if not msvc_toolset or not win_sdk:
+        die("MSVC toolset / Windows SDK version not found in the compile command")
 
     libs = []
     builtins = None

@@ -168,6 +168,8 @@ def close_headers(src, files):
                     break
                 if not c.endswith(EXTS):
                     continue
+                if any(part in ("test", "testing", "fuzzers") for part in c.split("/")[:-1]):
+                    continue
                 if c.startswith("third_party/"):
                     if os.path.isfile(os.path.join(src, c)):
                         third.add(c.split("/")[1])

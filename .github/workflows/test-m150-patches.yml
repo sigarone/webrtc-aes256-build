@@ -51,7 +51,7 @@ env:
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
   NO_CCACHE: ${{ github.event.inputs.no_ccache }}
-  # T1-T10 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
+  # T1-T11 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
   # workflow, build-m150-windows.yml).
 
 jobs:
@@ -173,7 +173,7 @@ jobs:
           { echo "### ccache (${{ matrix.config }})"; echo '```'; ccache --show-stats || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           du -sh "$CCACHE_DIR" || true
 
-      - name: Run T1-T10 (${{ matrix.config }})
+      - name: Run T1-T11 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
         env:
           CONFIG: ${{ matrix.config }}

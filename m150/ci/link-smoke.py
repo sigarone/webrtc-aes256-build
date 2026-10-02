@@ -18,6 +18,7 @@ exit: 0 the program printed SMOKE-OK and returned 0 | 1 any failure
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -56,6 +57,37 @@ def import_msvc_environment():
         die("INCLUDE/LIB still empty after vcvars64")
 
 
+DEFINE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.:+-]*)?")
+FLAG_RE = re.compile(r"(/[A-Za-z][A-Za-z0-9:_+.=-]*|-[A-Za-z][A-Za-z0-9_+.=-]*)")
+ALLOWED_FLAG_PREFIXES = ("/std:", "-std=", "-fmsc-version=", "-m64", "-m32", "-msse", "-mavx",
+                         "/arch:", "/MT", "/MD", "/utf-8", "/Zc:", "/Zp", "/GR", "/EH",
+                         "-fcomplete-member-pointers", "-fno-exceptions", "-fexceptions",
+                         "-fno-rtti", "-frtti", "-fms-compatibility")
+LIB_RE = re.compile(r"[A-Za-z0-9_.+-]+\.lib")
+INC_RE = re.compile(r"(\.\./\.\.|\.\./\.\./[A-Za-z0-9_.+/-]+|gen(/[A-Za-z0-9_.+-]+)*)")
+
+
+def validate_flags(flags):
+    """build-flags.json is data produced by an earlier job: only plain tokens
+    may reach the compiler and linker command lines (no paths outside the
+    unpacked headers, no /FORCE or /LIBPATH style options, no response files)."""
+    bad = []
+    for d in flags["compile"]["defines"]:
+        if not DEFINE_RE.fullmatch(d):
+            bad.append(("define", d))
+    for f in flags["compile"]["flags"]:
+        if not FLAG_RE.fullmatch(f) or not f.startswith(ALLOWED_FLAG_PREFIXES):
+            bad.append(("flag", f))
+    for l in flags["link"]["system_libs"] + flags["link"]["static_libs"] + flags["link"]["default_libs"]:
+        if not LIB_RE.fullmatch(l):
+            bad.append(("lib", l))
+    for i in flags["compile"]["include_dirs"]:
+        if not INC_RE.fullmatch(i) or ".." in i.replace("../..", "", 1).split("/"):
+            bad.append(("include dir", i))
+    if bad:
+        die("build-flags.json carries tokens that are not plain compile/link options: %r" % (bad[:8],))
+
+
 def main():
     if len(sys.argv) != 5:
         print("link-smoke: expected 4 arguments, got %d: %r" % (len(sys.argv) - 1, sys.argv[1:]),
@@ -70,6 +102,7 @@ def main():
     flags = json.load(open(os.path.join(art, "build-flags.json"), encoding="utf-8"))
     if flags.get("schema") != "qaudion-webrtc-buildflags/1":
         die("unexpected build-flags schema")
+    validate_flags(flags)
 
     hdr = os.path.join(work, "hdr")
     os.makedirs(work, exist_ok=True)
@@ -94,11 +127,6 @@ def main():
             incs.append(p)
         else:
             skipped.append(d)
-    # BoringSSL headers are public API surface of the library (SSL_* ids) and
-    # ship in the zip next to everything else.
-    bssl = os.path.join(root, "third_party", "boringssl", "src", "include")
-    if os.path.isdir(bssl) and bssl not in incs:
-        incs.append(bssl)
     print("link-smoke: include dirs used: %d, not shipped/not needed: %s" % (len(incs), skipped))
     if not any(i.replace("\\", "/").endswith("third_party/libc++/src/include") for i in incs) \
             and "libc++" in flags["abi"]["stl"]:

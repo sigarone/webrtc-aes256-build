@@ -1,5 +1,5 @@
 #!/bin/sh
-# run-tests.sh - run the T1-T6 unit-test filters (webrtc-plan.md v2 §6.1)
+# run-tests.sh - run the T1-T11 unit-test filters (webrtc-plan.md v2 §6.1)
 # against already-built rtc_unittests / modules_unittests. Shared by
 # test-m150-patches.yml (Linux x64) and build-m150-windows.yml (Windows x64)
 # so the filters live in exactly one place.
@@ -111,8 +111,12 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
     continue
   fi
   n=$("$OUT/$bin$EXE" "--gtest_filter=$filt" --gtest_list_tests | grep -c '^  ' || true)
-  if [ "${n:-0}" -eq 0 ]; then
-    echo "::error::$name: filter '$filt' matches no test in $bin - the check would silently pass"
+  # Minimum number of tests a filter must select. T6/T11 are ours: if a guard
+  # (#if) ever drops most of them the remaining few must not keep the job green.
+  min=1
+  case "$name" in T6) min=7 ;; T11) min=11 ;; esac
+  if [ "${n:-0}" -lt "$min" ]; then
+    echo "::error::$name: filter '$filt' selects ${n:-0} test(s) in $bin, expected at least $min - the check would silently pass"
     exit 1
   fi
   echo "::group::$name ($bin, $n tests, $filt)"

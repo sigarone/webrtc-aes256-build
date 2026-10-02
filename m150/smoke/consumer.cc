@@ -48,6 +48,7 @@
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/rtp_sender_interface.h"
+#include "api/sctp_transport_interface.h"
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
@@ -171,30 +172,31 @@ class StatsObserver : public webrtc::RTCStatsCollectorCallback {
   void OnStatsDelivered(
       const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report)
       override {
+    // EVERY transport of the peer connection must carry the hardened
+    // ciphers: a weak one among several must not be masked by a later good one.
     for (const webrtc::RTCTransportStats* t :
          report->GetStatsOfType<webrtc::RTCTransportStats>()) {
-      if (t->dtls_cipher.has_value()) {
-        dtls_cipher_ = *t->dtls_cipher;
-      }
-      if (t->srtp_cipher.has_value()) {
-        srtp_cipher_ = *t->srtp_cipher;
-      }
-      if (t->dtls_state.has_value()) {
-        dtls_state_ = *t->dtls_state;
+      ++transports_;
+      const bool ok = t->dtls_cipher.has_value() &&
+                      *t->dtls_cipher == "TLS_AES_256_GCM_SHA384" &&
+                      t->srtp_cipher.has_value() &&
+                      *t->srtp_cipher == "AEAD_AES_256_GCM" &&
+                      t->dtls_state.has_value() &&
+                      *t->dtls_state == "connected";
+      if (!ok) {
+        ++weak_transports_;
       }
     }
     done_.Set();
   }
   bool Wait() { return done_.WaitFor(seconds(20)); }
-  const std::string& dtls_cipher() const { return dtls_cipher_; }
-  const std::string& srtp_cipher() const { return srtp_cipher_; }
-  const std::string& dtls_state() const { return dtls_state_; }
+  int transports() const { return transports_; }
+  int weak_transports() const { return weak_transports_; }
 
  private:
   Event done_;
-  std::string dtls_cipher_;
-  std::string srtp_cipher_;
-  std::string dtls_state_;
+  int transports_ = 0;
+  int weak_transports_ = 0;
 };
 
 class Peer : public webrtc::PeerConnectionObserver,
@@ -276,13 +278,9 @@ struct TransportInfo {
   int group = -1;
 };
 
-TransportInfo ReadTransport(Peer& p) {
+TransportInfo ReadDtls(
+    const webrtc::scoped_refptr<webrtc::DtlsTransportInterface>& dtls) {
   TransportInfo out;
-  auto senders = p.pc->GetSenders();
-  if (senders.empty()) {
-    return out;
-  }
-  auto dtls = senders[0]->dtls_transport();
   if (!dtls) {
     return out;
   }
@@ -296,6 +294,24 @@ TransportInfo ReadTransport(Peer& p) {
   out.srtp = info.srtp_cipher_suite().value_or(-1);
   out.group = info.ssl_group_id().value_or(-1);
   return out;
+}
+
+// The DTLS transport behind the first RTP sender (the audio track).
+TransportInfo ReadTransport(Peer& p) {
+  auto senders = p.pc->GetSenders();
+  if (senders.empty()) {
+    return TransportInfo();
+  }
+  return ReadDtls(senders[0]->dtls_transport());
+}
+
+// The DTLS transport behind the SCTP association (the data channel).
+TransportInfo ReadSctpTransport(Peer& p) {
+  auto sctp = p.pc->GetSctpTransport();
+  if (!sctp) {
+    return TransportInfo();
+  }
+  return ReadDtls(sctp->Information().dtls_transport());
 }
 
 void CheckTransport(const char* side, const TransportInfo& t) {
@@ -316,10 +332,12 @@ void CheckStats(const char* side, Peer& p) {
   p.pc->GetStats(cb.get());
   std::string label = std::string(side) + ": getStats delivered";
   Check(cb->Wait(), label.c_str());
-  label = std::string(side) + ": stats dtlsCipher TLS_AES_256_GCM_SHA384";
-  Check(cb->dtls_cipher() == "TLS_AES_256_GCM_SHA384", label.c_str());
-  label = std::string(side) + ": stats srtpCipher AEAD_AES_256_GCM";
-  Check(cb->srtp_cipher() == "AEAD_AES_256_GCM", label.c_str());
+  label = std::string(side) + ": stats report at least one transport";
+  Check(cb->transports() >= 1, label.c_str());
+  label = std::string(side) +
+          ": every stats transport connected, TLS_AES_256_GCM_SHA384, "
+          "AEAD_AES_256_GCM";
+  Check(cb->weak_transports() == 0, label.c_str());
 }
 
 }  // namespace
@@ -466,6 +484,8 @@ int main() {
   if (connected) {
     CheckTransport("offerer ", ReadTransport(a));
     CheckTransport("answerer", ReadTransport(b));
+    CheckTransport("offerer  sctp", ReadSctpTransport(a));
+    CheckTransport("answerer sctp", ReadSctpTransport(b));
     CheckStats("offerer ", a);
     CheckStats("answerer", b);
 
