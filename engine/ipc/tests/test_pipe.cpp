@@ -279,6 +279,12 @@ QTEST(pipe_dacl_verifier_accepts_only_exactly_one_allow_entry_for_the_user) {
       {"user plus Network", TestDacl::Sddl, L"D:P(A;;FRFW;;;" + me + L")(A;;FRFW;;;NU)"},
       {"deny entry for the user", TestDacl::Sddl, L"D:P(D;;FRFW;;;" + me + L")"},
       {"empty DACL", TestDacl::Sddl, L"D:P"},
+      // One allow entry for the user, but not with exactly the rights the server asks for.
+      {"full file access for the user", TestDacl::Sddl, L"D:P(A;;FA;;;" + me + L")"},
+      {"generic all for the user", TestDacl::Sddl, L"D:P(A;;GA;;;" + me + L")"},
+      {"read, write and change permissions", TestDacl::Sddl, L"D:P(A;;FRFWWD;;;" + me + L")"},
+      {"read, write and take ownership", TestDacl::Sddl, L"D:P(A;;FRFWWO;;;" + me + L")"},
+      {"read only", TestDacl::Sddl, L"D:P(A;;FR;;;" + me + L")"},
   };
   for (const Bad& b : bad) {
     HANDLE h = CreatePipeWithDacl(b.kind, b.sddl);
@@ -300,6 +306,33 @@ QTEST(pipe_second_server_with_the_same_name_is_refused) {
   const Err e = PipeServer::Create(name, &b);
   CHECK(e == Err::PipeAccessDenied || e == Err::PipeCreate);
   CHECK(!b);
+}
+
+QTEST(pipe_wait_for_client_fails_when_the_connect_does_not_succeed) {
+  // A pending ConnectNamedPipe that completes with an error (here: cancelled, no client at all)
+  // signals its event just like a real connection. WaitForClient must look at the result and not
+  // hand out a stream for a pipe that has no client.
+  const std::wstring name = UniqueName();
+  std::unique_ptr<PipeServer> server;
+  CHECK_EQ(PipeServer::Create(name, &server), Err::Ok);
+  if (!server) return;
+  const HANDLE h = server->handle();
+  std::atomic<bool> done{false};
+  Err result = Err::Ok;
+  std::unique_ptr<HandleStream> stream;
+  std::thread waiter([&] {
+    result = server->WaitForClient(8000, 0, &stream);
+    done = true;
+  });
+  // Cancel until the pending connect has been hit (a cancel issued before it started finds nothing).
+  while (!done) {
+    CancelIoEx(h, nullptr);
+    Sleep(2);
+  }
+  waiter.join();
+  if (result != Err::IoError) std::fprintf(stderr, "  WaitForClient returned %s\n", ErrName(result));
+  CHECK_EQ(result, Err::IoError);  // not Ok, and not the 8 s timeout
+  CHECK(!stream);
 }
 
 QTEST(pipe_serves_exactly_one_client) {
@@ -661,6 +694,22 @@ QTEST(engine_process_rejects_a_bad_command_line) {
     Engine e;
     CHECK(e.Start(PipeArg(UniqueName()) + L" --unknown"));
     CHECK_EQ(e.WaitExit(10000), 2);
+  }
+  // The client process check cannot be switched off by a 0 or by repeating the option, and the
+  // pipe name cannot be given twice. All of these stop before the nonce is read (no nonce is sent
+  // here, so a process that went on would exit with 3 after the nonce timeout instead).
+  const std::wstring pid = std::to_wstring(GetCurrentProcessId());
+  for (const std::wstring& args : {
+           PipeArg(UniqueName()) + L" --expect-client-pid 0",
+           PipeArg(UniqueName()) + L" --expect-client-pid " + pid + L" --expect-client-pid 0",
+           PipeArg(UniqueName()) + L" --expect-client-pid " + pid + L" --expect-client-pid " + pid,
+           PipeArg(UniqueName()) + L" " + PipeArg(UniqueName()),
+       }) {
+    Engine e;
+    CHECK(e.Start(args));
+    const int code = e.WaitExit(10000);
+    if (code != 2) std::fprintf(stderr, "  exit %d for: %ls\n", code, args.c_str());
+    CHECK_EQ(code, 2);
   }
 }
 

@@ -21,6 +21,7 @@ enum class IoResult : uint8_t { Ok, Eof, Timeout, Error };
 //   Eof     the stream ended before the first byte of this call,
 //   Error   the stream ended or failed after some bytes were consumed,
 //   Timeout the deadline passed (the stream must then be considered unusable).
+// On any result other than Ok, dst may already hold some of the bytes (ReadFrame wipes them).
 class ByteStream {
  public:
   virtual ~ByteStream() = default;
@@ -69,7 +70,8 @@ Err WriteFrame(ByteStream& s, std::span<const uint8_t> payload, uint32_t timeout
 // Header plus payload as one buffer (tests, fixtures).
 cbor::Buf EncodeFrame(std::span<const uint8_t> payload);
 
-// In-memory stream for tests and fuzzing: reads from `in`, appends writes to `out`.
+// In-memory stream for tests and fuzzing: reads from `in`, appends writes to `out`. A read that
+// asks for more than is left copies what is left and then fails, as a pipe does.
 class MemoryStream final : public ByteStream {
  public:
   explicit MemoryStream(std::span<const uint8_t> in) : in_(in) {}

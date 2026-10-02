@@ -31,7 +31,8 @@ if(QMEDIA_BUILD_TESTS)
     tests/test_validator.cpp
     tests/test_session.cpp
     tests/test_cddl.cpp
-    tests/test_corpus.cpp)
+    tests/test_corpus.cpp
+    tests/test_oracle.cpp)
   target_link_libraries(qmedia_ipc_tests PRIVATE qmedia_testsupport)
   target_compile_definitions(qmedia_ipc_tests PRIVATE
     QMEDIA_CORPUS_DIR="${QMEDIA_CORPUS_DIR}"

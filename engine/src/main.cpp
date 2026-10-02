@@ -1,6 +1,7 @@
 // qaudion-media: generic media engine process (Windows).
 //
 // Usage: qaudion-media.exe --pipe \\.\pipe\<name> [--expect-client-pid <pid>]
+// Each option at most once; the client process id must not be 0.
 // The parent writes exactly 32 random bytes (the session nonce) to this process' stdin, then the
 // client connects to the pipe and sends "hello" with that nonce as its first message.
 //
@@ -60,15 +61,22 @@ int main(int argc, char** argv) {
   HardenProcess();
   std::wstring pipe_name;
   uint32_t expect_pid = 0;
+  bool have_pipe = false;
+  bool have_pid = false;
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--pipe") == 0 && i + 1 < argc) {
+    // Each option at most once: a repeated option must not silently replace (or, for the client
+    // process id, switch off) the value the host meant.
+    if (std::strcmp(argv[i], "--pipe") == 0 && i + 1 < argc && !have_pipe) {
+      have_pipe = true;
       const char* a = argv[++i];
       for (; *a != '\0'; ++a) {
         if (static_cast<unsigned char>(*a) >= 0x80) return 2;  // names are plain ASCII
         pipe_name.push_back(static_cast<wchar_t>(*a));
       }
-    } else if (std::strcmp(argv[i], "--expect-client-pid") == 0 && i + 1 < argc) {
-      if (!ParseUint32(argv[++i], &expect_pid)) return 2;
+    } else if (std::strcmp(argv[i], "--expect-client-pid") == 0 && i + 1 < argc && !have_pid) {
+      have_pid = true;
+      // 0 is not a process id; accepting it would turn the check off while the host asked for it.
+      if (!ParseUint32(argv[++i], &expect_pid) || expect_pid == 0) return 2;
     } else {
       return 2;
     }
