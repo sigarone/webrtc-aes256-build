@@ -21,6 +21,12 @@ function(qmedia_webrtc_setup)
     message(FATAL_ERROR "the engine must be compiled with the clang-cl of the Chromium package")
   endif()
 
+  # libwebrtc is a Release build with the static release CRT (/MT, NDEBUG): a debug configuration
+  # would pull in the debug CRT (/MTd) and an incompatible STL mode.
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    message(FATAL_ERROR "QMEDIA_WITH_WEBRTC needs -DCMAKE_BUILD_TYPE=Release")
+  endif()
+
   file(READ "${QMEDIA_WEBRTC_DIR}/build-flags.json" json)
   string(JSON schema GET "${json}" schema)
   if(NOT schema STREQUAL "qaudion-webrtc-buildflags/1")
@@ -77,7 +83,7 @@ function(qmedia_webrtc_setup)
   endforeach()
 
   add_compile_definitions(${defs})
-  add_compile_options(${flags} -Wno-everything)
+  add_compile_options(${flags} -fno-exceptions -Wno-everything)
   include_directories(${incs})
 
   # No exception handling, as in the library (CMake's default for MSVC-like compilers adds /EHsc).

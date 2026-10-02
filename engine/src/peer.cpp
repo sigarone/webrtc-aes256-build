@@ -238,18 +238,20 @@ Status Peer::Init(const PeerParams& params, webrtc::scoped_refptr<webrtc::RTCCer
 void Peer::Close() {
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
   std::vector<Bound> bound;
+  SessionKeys* keys;
   {
     std::lock_guard<std::mutex> l(mu_);
     if (closed_) return;
     closed_ = true;
     pc = std::move(pc_);
     bound = std::move(bound_);
+    keys = keys_;
   }
   for (Bound& b : bound) {
     auto* obs = static_cast<CryptorObs*>(b.observer.get());
     if (obs != nullptr) obs->Detach();
     if (b.transformer) b.transformer->UnRegisterFrameCryptorTransformerObserver();
-    if (keys_ != nullptr && b.send) keys_->UnregisterSender(b.transformer.get());
+    if (keys != nullptr && b.send) keys->UnregisterSender(b.transformer.get());
   }
   if (pc) pc->Close();
 }

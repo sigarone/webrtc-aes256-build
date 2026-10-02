@@ -129,7 +129,7 @@ ipc::HandlerAction Engine::Handle(const ipc::ValidatedMessage& m, ipc::Outbox& o
 
   // ---- Sessions and certificates -------------------------------------------------------------
   if (k == "session_create") {
-    if (sessions_.size() >= kMaxSessions) {
+    if (sessions_.size() >= kMaxSessions || next_handle_ >= 0xFFFFFF00u) {
       Fail(out, id, ec::kLimit.data(), "sessions");
     } else if (!EnsureRuntime()) {
       Fail(out, id, ec::kInternal.data(), "runtime_init_failed");
@@ -197,7 +197,7 @@ ipc::HandlerAction Engine::Handle(const ipc::ValidatedMessage& m, ipc::Outbox& o
       Fail(out, id, ec::kNotFound.data(), "cert");
       return ipc::HandlerAction::Continue;
     }
-    if (s->pcs.size() >= kMaxPcsPerSession) {
+    if (s->pcs.size() >= kMaxPcsPerSession || peers_.size() >= kMaxPeersTotal) {
       Fail(out, id, ec::kLimit.data(), "pcs");
       return ipc::HandlerAction::Continue;
     }

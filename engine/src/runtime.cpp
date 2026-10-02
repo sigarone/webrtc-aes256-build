@@ -116,7 +116,7 @@ bool Runtime::Init(const Options& opts) {
   WSADATA wsa;
   wsa_started_ = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
   if (!wsa_started_) return false;
-  webrtc::InitializeSSL();
+  if (!webrtc::InitializeSSL()) return false;
 
   const webrtc::Environment env = webrtc::CreateEnvironment();
 

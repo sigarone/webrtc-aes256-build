@@ -26,6 +26,9 @@ namespace qmedia::engine {
 inline constexpr size_t kMaxSessions = 4;
 inline constexpr size_t kMaxCertsPerSession = 8;
 inline constexpr size_t kMaxPcsPerSession = 8;
+// Closed peers stay in the table until shutdown (libwebrtc observers must outlive their connection),
+// so the number of peers one engine process creates is bounded.
+inline constexpr size_t kMaxPeersTotal = 256;
 
 class Engine final : public ipc::MessageHandler, public Emitter {
  public:
