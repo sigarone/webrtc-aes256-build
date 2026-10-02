@@ -320,12 +320,13 @@ jobs:
         run: |
           set -euo pipefail
           py=python; command -v python3 >/dev/null 2>&1 && py=python3
-          url=$("$py" -c "import json; print(json.load(open('out/build-flags.json'))['toolchain']['clang_package_url'])")
-          sha=$("$py" -c "import json; print(json.load(open('out/build-flags.json'))['toolchain']['clang_package_sha256'])")
-          # Both values come from a file the build job produced: validate them
-          # strictly (no path traversal, no extra lines) before they reach curl.
-          printf '%s' "$url" | grep -Eq '^https://commondatastorage\.googleapis\.com/chromium-browser-clang/Win/clang-[A-Za-z0-9._-]+\.tar\.xz$' || { echo "::error::unexpected clang package url"; exit 1; }
-          printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::build-flags.json carries no valid clang package sha256"; exit 1; }
+          # Both values come from a file the build job produced: link-smoke.py
+          # validates them with a full-string match (one line, fixed host and
+          # file-name shape, 64 hex digits) before they reach curl. A failure
+          # there fails this step (command substitution, set -e).
+          pkg=$("$py" ctrl/m150/ci/link-smoke.py --clang-package out/build-flags.json)
+          url=${pkg%% *}
+          sha=${pkg##* }
           curl --proto '=https' --tlsv1.2 -fsSL -o clang.tar.xz "$url"
           echo "$sha *clang.tar.xz" | sha256sum -c -
           mkdir -p C:/clang

@@ -99,8 +99,8 @@ T1/T2 tests can run.)
 
 `build-webrtc-windows-m150-hardened` publishes `webrtc.lib`, `libcxx.lib`,
 `webrtc-headers.zip`, `build-flags.json`, `BUILDINFO.json`, `PINS.txt` and
-`SHA256SUMS` (lib, libcxx.lib, headers, build-flags.json and SHA256SUMS carry a
-build-provenance attestation). The library is built by Chromium's clang-cl
+`SHA256SUMS` (every one of these files carries a build-provenance
+attestation). The library is built by Chromium's clang-cl
 against Chromium's libc++ (`std::__Cr`) with the static CRT (`/MT`); webrtc.lib
 does not carry the libc++ runtime objects, which is why `libcxx.lib` ships
 next to it, and the zip carries Chromium's libc++ headers. `build-flags.json`
