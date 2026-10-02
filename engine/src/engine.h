@@ -13,7 +13,7 @@
 #include <mutex>
 #include <vector>
 
-#include "api/rtc_certificate.h"
+#include "rtc_base/rtc_certificate.h"
 #include "devices.h"
 #include "keys.h"
 #include "peer.h"

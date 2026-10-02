@@ -17,6 +17,7 @@
 #include "api/scoped_refptr.h"
 #include "keys.h"
 #include "qmedia/ipc/cbor.h"
+#include "qmedia/ipc/limits.h"
 #include "qmedia/ipc/message.h"
 #include "runtime.h"
 #include "stats.h"

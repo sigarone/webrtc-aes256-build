@@ -398,11 +398,13 @@ Status Peer::BindMedia(SessionKeys& keys, const std::string& mid, const std::str
       return;
     }
     const bool audio = found->media_type() == webrtc::MediaType::AUDIO;
-    auto transformer = webrtc::make_ref_counted<webrtc::FrameCryptorTransformer>(
-        rt_.signaling(), SessionKeys::ProviderId(participant, send),
-        audio ? webrtc::FrameCryptorTransformer::MediaType::kAudioFrame
-              : webrtc::FrameCryptorTransformer::MediaType::kVideoFrame,
-        webrtc::FrameCryptorTransformer::Algorithm::kAesGcm, keys.provider());
+    // The class is already a ref-counted object; it is created with new and held by a scoped_refptr.
+    webrtc::scoped_refptr<webrtc::FrameCryptorTransformer> transformer(
+        new webrtc::FrameCryptorTransformer(
+            rt_.signaling(), SessionKeys::ProviderId(participant, send),
+            audio ? webrtc::FrameCryptorTransformer::MediaType::kAudioFrame
+                  : webrtc::FrameCryptorTransformer::MediaType::kVideoFrame,
+            webrtc::FrameCryptorTransformer::Algorithm::kAesGcm, keys.provider()));
     auto obs = webrtc::make_ref_counted<CryptorObs>(this, mid, audio);
     transformer->RegisterFrameCryptorTransformerObserver(obs);
     transformer->SetKeyIndex(send ? keys.SendSlot(participant) : 0);

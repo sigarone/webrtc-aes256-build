@@ -375,7 +375,7 @@ QTEST(session_buffer_is_wiped_before_any_reply_is_written) {
   StubHandler handler;
   const ServeResult r = Serve(probe, buf, nonce, 1000, handler);
   CHECK(r == ServeResult::Shutdown);
-  CHECK_EQ(probe.writes, 6);  // header + payload for hello_ok, the unsupported err and the ok
+  CHECK_EQ(probe.writes, 3);  // one write per frame: hello_ok, the unsupported err and the ok
   CHECK_EQ(probe.dirty_writes, 0);
 }
 
