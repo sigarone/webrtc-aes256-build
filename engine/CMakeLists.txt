@@ -78,6 +78,8 @@ if(QMEDIA_BUILD_ENGINE)
     # Two engine processes call each other over their pipes (see tests/call_test.cpp).
     add_executable(qmedia_call_test tests/call_test.cpp)
     target_link_libraries(qmedia_call_test PRIVATE qmedia_pipe qmedia_ipc)
+    # The driver shares the engine's C++ library (libc++ runtime), so it links the same way.
+    qmedia_link_webrtc(qmedia_call_test)
     add_dependencies(qmedia_call_test qaudion-media-ci)
     target_compile_definitions(qmedia_call_test PRIVATE
       QMEDIA_ENGINE_CI_EXE="$<TARGET_FILE:qaudion-media-ci>")
