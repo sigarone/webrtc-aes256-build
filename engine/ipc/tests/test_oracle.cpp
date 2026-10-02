@@ -205,23 +205,28 @@ QTEST(oracle_looks_inside_nested_objects_arrays_and_scalar_maps) {
 }
 
 QTEST(oracle_pins_the_key_and_nonce_sizes_independently_of_the_table) {
+  // Decoded values are views into the message bytes, so every message is kept in a named buffer.
+  GenOptions o;
   Buf key16;
   cbor::PutBin(key16, Buf(16, 0x5A));
-  GenOptions o;
+  const Buf short_key = GenMessageWith(Spec("install_key"), o, "key", &key16);
   Value v;
-  CHECK_EQ(cbor::Decode(GenMessageWith(Spec("install_key"), o, "key", &key16), &v), Err::Ok);
+  CHECK_EQ(cbor::Decode(short_key, &v), Err::Ok);
   CHECK(!oracle::PinnedInvariantsHold(v, Spec("install_key")));
   Buf zero;
   cbor::PutBin(zero, Buf(32, 0));
+  const Buf zero_key = GenMessageWith(Spec("install_key"), o, "key", &zero);
   Value z;
-  CHECK_EQ(cbor::Decode(GenMessageWith(Spec("install_key"), o, "key", &zero), &z), Err::Ok);
+  CHECK_EQ(cbor::Decode(zero_key, &z), Err::Ok);
   CHECK(!oracle::PinnedInvariantsHold(z, Spec("install_key")));
   Buf nonce31;
   cbor::PutBin(nonce31, Buf(31, 1));
+  const Buf short_nonce = GenMessageWith(Spec("hello"), o, "nonce", &nonce31);
   Value h;
-  CHECK_EQ(cbor::Decode(GenMessageWith(Spec("hello"), o, "nonce", &nonce31), &h), Err::Ok);
+  CHECK_EQ(cbor::Decode(short_nonce, &h), Err::Ok);
   CHECK(!oracle::PinnedInvariantsHold(h, Spec("hello")));
+  const Buf good_msg = GenMessage(Spec("install_key"), o);
   Value good;
-  CHECK_EQ(cbor::Decode(GenMessage(Spec("install_key"), o), &good), Err::Ok);
+  CHECK_EQ(cbor::Decode(good_msg, &good), Err::Ok);
   CHECK(oracle::PinnedInvariantsHold(good, Spec("install_key")));
 }
