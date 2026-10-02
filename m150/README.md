@@ -29,6 +29,11 @@ m150/ci/sync.sh              <- pinned depot_tools + gclient sync + hard pin ver
 m150/ci/package-android.sh   <- plain passthrough + G1 spot-check
 m150/ci/kat2inc.py          <- shared frame-crypto KAT (sha256-pinned) -> api/crypto/frame_crypto_kat_vectors.inc (T7)
 m150/kat/group-calls-v2-frame-crypto.json <- the KAT file (byte-identical copy; desktop, Android and iOS pin the same hash)
+m150/ci/apply-tests.py       <- adds the Q-Audion unit tests (T6, T11) to a patched checkout (not part of the shipped series)
+m150/tests/                  <- T6 (qaudion_tuning_unittest.cc) and T11 (ssl_stream_adapter_strict_tests.inc)
+m150/ci/package-windows.py   <- Windows: webrtc.lib, libcxx.lib, webrtc-headers.zip (public headers + libc++ headers)
+m150/ci/collect-build-flags.sh, gen-build-flags.py <- Windows: build-flags.json from the real GN build
+m150/smoke/consumer.cc, m150/ci/link-smoke.py <- Windows: out-of-tree consumer compiled and linked from the release files only
 m150/ios/reclaim-disk.sh
 m150/ios/check-dsym-uuids.sh
 ```
@@ -90,10 +95,34 @@ T1/T2 tests can run.)
 3. The build publishes to `webrtc-android-m150-<suffix>` (iOS:
    `webrtc-ios-m150-<suffix>`).
 
+### Windows release contents and the consumer contract
+
+`build-webrtc-windows-m150-hardened` publishes `webrtc.lib`, `libcxx.lib`,
+`webrtc-headers.zip`, `build-flags.json`, `BUILDINFO.json`, `PINS.txt` and
+`SHA256SUMS` (lib, libcxx.lib, headers, build-flags.json and SHA256SUMS carry a
+build-provenance attestation). The library is built by Chromium's clang-cl
+against Chromium's libc++ (`std::__Cr`) with the static CRT (`/MT`); webrtc.lib
+does not carry the libc++ runtime objects, which is why `libcxx.lib` ships
+next to it, and the zip carries Chromium's libc++ headers. `build-flags.json`
+is generated from the real GN build (defines, include dirs, ABI flags, C++
+standard, STL and CRT mode, RTTI, exceptions, toolchain and SDK versions,
+system libs, the exact compiler package and its sha256). The `link-smoke` job
+builds `m150/smoke/consumer.cc` with nothing but those files and runs it: two
+PeerConnections in one process, loopback, audio track, DTLS 1.3 /
+TLS_AES_256_GCM_SHA384 / AEAD_AES_256_GCM / X25519MLKEM768. The release is
+published only if that job is green. The group id is read from
+`DtlsTransportInformation::ssl_group_id()`: getStats has no field for it.
+
+PDBs: the library is built with `symbol_level=0`; a separate PDB artifact would
+need a second build with symbols and is not produced (not cheap, not required
+for S0).
+
 `test-webrtc-m150-patches` (ubuntu, free) should be green first - it applies
-the same series against a host x64 build in both GN configs and runs T1-T9
-(T7-T9: P12 - shared KAT through the real FrameCryptorTransformer, replay
-window, upstream FrameCryptor gtests).
+the same series against a host x64 build in both GN configs and runs T1-T11
+(T6: tuning API and marker; T7-T9: P12 - shared KAT through the real
+FrameCryptorTransformer, replay window, upstream FrameCryptor gtests; T10: P9
+certificate stats cache; T11: strict-transport negative tests, strict config
+only).
 
 ## Open items (for the orchestrator / source-patch author, not done here)
 

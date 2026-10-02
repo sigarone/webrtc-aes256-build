@@ -51,7 +51,7 @@ env:
   WORKDIR: /home/runner/webrtc
   DEPOT_TOOLS_UPDATE: "0"
   NO_CCACHE: ${{ github.event.inputs.no_ccache }}
-  # T1-T10 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
+  # T1-T11 gtest filters live in m150/ci/run-tests.sh (shared with the Windows
   # workflow, build-m150-windows.yml).
 
 jobs:
@@ -109,6 +109,11 @@ jobs:
         run: |
           set -euo pipefail
           bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
+
+      - name: Add the Q-Audion unit tests (T6 tuning, T11 strict negatives; not part of the shipped series)
+        run: |
+          set -euo pipefail
+          python3 ctrl/m150/ci/apply-tests.py "$WORKDIR/src"
 
       # Compiler cache - THIS (non-shipping) workflow only. The release builds
       # (build-m150-android/ios/windows) never use it: a shipped binary must be
@@ -168,7 +173,7 @@ jobs:
           { echo "### ccache (${{ matrix.config }})"; echo '```'; ccache --show-stats || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           du -sh "$CCACHE_DIR" || true
 
-      - name: Run T1-T10 (${{ matrix.config }})
+      - name: Run T1-T11 (${{ matrix.config }})
         working-directory: /home/runner/webrtc/src
         env:
           CONFIG: ${{ matrix.config }}
