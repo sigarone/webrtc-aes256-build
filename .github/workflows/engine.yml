@@ -228,14 +228,48 @@ jobs:
       - name: Verify the build provenance attestation of webrtc.lib
         shell: pwsh
         run: |
+          # Strict: the signature, the repository and the builder workflow must verify. A transient
+          # failure is retried; there is no weaker fallback (an attestation record that merely
+          # exists proves nothing).
           $lib = Join-Path $env:RUNNER_TEMP "qm/release/webrtc.lib"
-          gh attestation verify $lib --repo sigarone/webrtc-aes256-build
-          if ($LASTEXITCODE -eq 0) { Write-Host "attestation: verified with gh attestation verify"; exit 0 }
-          Write-Host "gh attestation verify failed (exit $LASTEXITCODE); checking the attestations API"
-          $sha = (Get-FileHash -Algorithm SHA256 $lib).Hash.ToLower()
-          $resp = gh api "repos/sigarone/webrtc-aes256-build/attestations/sha256:$sha" | ConvertFrom-Json
-          if ($resp.attestations.Count -lt 1) { throw "no attestation found for webrtc.lib" }
-          Write-Host "attestation: $($resp.attestations.Count) record(s) exist for webrtc.lib (signature NOT verified here)"
+          $ok = $false
+          foreach ($attempt in 1..4) {
+            gh attestation verify $lib --repo sigarone/webrtc-aes256-build --signer-workflow sigarone/webrtc-aes256-build/.github/workflows/build-m150-windows.yml
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "gh attestation verify failed (attempt $attempt, exit $LASTEXITCODE)"
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+          if (-not $ok) { throw "the build provenance attestation of webrtc.lib did not verify" }
+          Write-Host "attestation: verified with gh attestation verify (repo and signer workflow pinned)"
+
+      - name: The pins cannot be bypassed (missing file, changed file, stale headers all fail)
+        shell: pwsh
+        run: |
+          $qm = Join-Path $env:RUNNER_TEMP "qm"
+          $rel = Join-Path $qm "release"
+          $clang = Join-Path $qm "clang"
+          # The real directories pass.
+          cmake "-DQMEDIA_WEBRTC_DIR=$rel" "-DQMEDIA_CLANG_ROOT=$clang" -P engine/cmake/verify_pins.cmake
+          if ($LASTEXITCODE -ne 0) { throw "the verified directories do not pass verify_pins.cmake" }
+          function Expect-Fail($dir, $why) {
+            $out = cmake "-DQMEDIA_WEBRTC_DIR=$dir" "-DQMEDIA_CLANG_ROOT=$clang" -P engine/cmake/verify_pins.cmake 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) { throw "verify_pins.cmake accepted: $why" }
+            Write-Host "refused as it must: $why"
+          }
+          $bad = Join-Path $env:RUNNER_TEMP "qm-bad"
+          if (Test-Path $bad) { Remove-Item -Recurse -Force $bad }
+          New-Item -ItemType Directory $bad | Out-Null
+          Expect-Fail $bad "an empty directory"
+          Copy-Item -Recurse (Join-Path $rel "*") $bad
+          Add-Content -Path (Join-Path $bad "PINS.txt") -Value "x"
+          Expect-Fail $bad "a changed PINS.txt"
+          Copy-Item (Join-Path $rel "PINS.txt") (Join-Path $bad "PINS.txt") -Force
+          Remove-Item (Join-Path $bad "libcxx.lib")
+          Expect-Fail $bad "a missing libcxx.lib"
+          Copy-Item (Join-Path $rel "libcxx.lib") (Join-Path $bad "libcxx.lib")
+          Set-Content -NoNewline -Path (Join-Path $bad "hdr/.qmedia-archive-sha256") -Value "00"
+          Expect-Fail $bad "headers that do not come from the pinned archive"
+          Remove-Item -Recurse -Force $bad
 
       - name: Configure (Chromium clang-cl, Ninja, flags from build-flags.json)
         shell: cmd
@@ -264,6 +298,14 @@ jobs:
           # The production engine has no way to read or write audio files.
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
           if ($text.Contains("ci-audio-in") -or $text.Contains("FileAudioDevice")) { throw "CI-only code found in the production engine" }
+          if ($text.Contains("ci-audio-out") -or $text.Contains("ci-allow-loopback")) { throw "CI-only code found in the production engine" }
+          # Behaviour of the binary itself: the CI flags are not options of the production
+          # executable (exit code 2 = bad command line, before anything is read or opened).
+          foreach ($flagArgs in @(@("--ci-allow-loopback"), @("--ci-audio-in", "x"), @("--ci-audio-out", "x"))) {
+            & $exe --pipe '\\.\pipe\qmedia-flag-check' @flagArgs
+            if ($LASTEXITCODE -ne 2) { throw "the production engine accepted $($flagArgs[0]) (exit $LASTEXITCODE)" }
+          }
+          Write-Host "the production engine rejects every CI flag (exit 2)"
           $ci = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path build-rtc\qaudion-media-ci.exe).Path))
           if (-not $ci.Contains("ci-audio-in")) { throw "the CI engine lacks its CI flags" }
           Write-Host ("size: " + $bytes.Length + " bytes")

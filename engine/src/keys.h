@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -45,7 +46,10 @@ class SessionKeys {
   SessionKeys(const SessionKeys&) = delete;
   SessionKeys& operator=(const SessionKeys&) = delete;
 
-  webrtc::scoped_refptr<webrtc::KeyProvider> provider() const { return provider_; }
+  webrtc::scoped_refptr<webrtc::KeyProvider> provider() const {
+    std::lock_guard<std::mutex> l(mu_);
+    return provider_;
+  }
 
   // The id under which the provider knows (participant, direction).
   static std::string ProviderId(const std::string& participant, bool send);
@@ -67,6 +71,7 @@ class SessionKeys {
   void UnregisterSender(const webrtc::FrameCryptorTransformer* transformer);
 
  private:
+  mutable std::mutex mu_;  // the host thread owns this object today; the lock keeps it true if that changes
   webrtc::scoped_refptr<webrtc::KeyProvider> provider_;
   std::set<std::pair<std::string, int>> filled_;  // (provider id, slot)
   std::map<std::string, int> send_slot_;

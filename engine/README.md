@@ -235,8 +235,31 @@ Implemented for a 1:1 audio call (`src/`): `engine.*` (command dispatch, session
 - Statistics: `get_stats` passes on an allowlist of attributes of inbound/outbound/remote RTP,
   media source, transport, candidate pair and codec entries. Fractional and negative numbers are
   decimal text, ids are `n<index>`, no address, certificate, stream id or SDP detail is included.
-- Events can interleave with replies: a candidate event may arrive before the `ok` of the
-  `set_local_description` that started gathering. The host must handle events at any time.
+- Ordering of replies and events (what the host may rely on, and what it may not):
+  - Replies are written by the session loop after the command has been handled, in the order the
+    commands arrived; one command is handled at a time, so the reply to command N is always written
+    before the reply to command N+1.
+  - Events (id 0) are written from libwebrtc threads as they happen. They are serialised with each
+    other and with replies (a frame is never torn), but there is no order between an event and the
+    reply of the command that caused it: a candidate event may arrive before the `ok` of the
+    `set_local_description` that started gathering, `cryptor_state` and `pc_state` may arrive before
+    the `ok` of the command that triggered them, and an event for a peer connection can arrive
+    before the host has read the `pc_created` reply that names it. The host must therefore accept
+    events for a pc or session it has been told about at any time, and key its state on the ids in
+    the event, not on the order of messages.
+  - Events of one peer connection are in the order libwebrtc reports them (they come from one
+    thread). `transport_info` is written right after the `pc_state` event that says `connected`
+    (a later `connected` or an ICE restart makes the engine look at transports it has not reported).
+  - `shutdown`: no event is written after the engine has started to shut down, and its `ok` is the
+    last message. After `session_close` or `pc_close` the engine stops emitting events for that
+    session or peer connection; an event that was already being written at that moment can still
+    reach the host next to the reply.
+  - The engine does not hold audio back until the host has bound the frame cryptors. A host that
+    wants end-to-end frame encryption on a call installs the keys, and sends `bind_media` for the
+    audio section as soon as its `mid` is known (the offerer after `create_offer`, the answerer
+    after `set_remote_description`), before the connection comes up, and treats a `cryptor_state`
+    other than `ok` as a failure. `require_frame_encryption` is off, exactly like the mobile apps:
+    the DTLS-SRTP transport is always AES-256-GCM, the frame layer is the host's to bind.
 
 Core Audio: the published library (dplc-10) contains only the original Windows Core Audio device
 module (`AudioDeviceWindowsCore`, reached through `kPlatformDefaultAudio`). The newer Core Audio 2
@@ -312,7 +335,14 @@ another release means changing that file.
    `build-flags.json` names (url pattern and sha256 checked), verifies it, unpacks it and writes
    `<dir>/toolchain.cmake`.
 2. CI verifies the build provenance attestation of `webrtc.lib` with `gh attestation verify`
-   (when that is not possible it checks that the attestations API has a record and says so).
+   (repository and builder workflow pinned, retried on transient errors, no weaker fallback: a
+   failure stops the job).
+   The pins are checked again at configure time by `cmake/verify_pins.cmake`, which the toolchain
+   file includes before any compiler runs and `cmake/webrtc.cmake` includes too: every release
+   file must exist and match its pin, the headers must come from the pinned archive and the compiler
+   directory from the package `build-flags.json` names, otherwise the configure stops. CI
+   runs it against a tampered copy to show it refuses (empty directory, changed file, missing file,
+   wrong header stamp).
 3. `cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<dir>/toolchain.cmake -DQMEDIA_WITH_WEBRTC=ON`
    from a Visual Studio developer environment (the Windows SDK and CRT headers and libraries come
    from it). `cmake/webrtc.cmake` reads `build-flags.json` and applies exactly its defines, flags

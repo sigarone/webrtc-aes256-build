@@ -27,6 +27,10 @@ function(qmedia_webrtc_setup)
     message(FATAL_ERROR "QMEDIA_WITH_WEBRTC needs -DCMAKE_BUILD_TYPE=Release")
   endif()
 
+  # The pins are checked again here, at configure time, whoever produced the directories (also
+  # included by the toolchain file, before any compiler runs).
+  include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/verify_pins.cmake")
+
   file(READ "${QMEDIA_WEBRTC_DIR}/build-flags.json" json)
   string(JSON schema GET "${json}" schema)
   if(NOT schema STREQUAL "qaudion-webrtc-buildflags/1")

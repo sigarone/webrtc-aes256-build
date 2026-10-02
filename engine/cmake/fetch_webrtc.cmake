@@ -80,10 +80,13 @@ foreach(n webrtc.lib libcxx.lib webrtc-headers.zip build-flags.json BUILDINFO.js
   endif()
 endforeach()
 
-# 3. Headers.
-if(NOT EXISTS "${REL}/hdr/include")
-  file(ARCHIVE_EXTRACT INPUT "${REL}/webrtc-headers.zip" DESTINATION "${REL}/hdr")
-endif()
+# 3. Headers. Always unpacked fresh from the verified archive; the stamp inside it records which archive the
+# directory came from, and the engine configure step refuses a directory whose stamp differs from
+# the pin (so a stale or edited hdr/ cannot be used).
+file(REMOVE_RECURSE "${REL}/hdr")
+
+file(ARCHIVE_EXTRACT INPUT "${REL}/webrtc-headers.zip" DESTINATION "${REL}/hdr")
+file(WRITE "${REL}/hdr/.qmedia-archive-sha256" "${QMEDIA_SHA256_webrtc-headers.zip}")
 
 # 4. The compiler package named by build-flags.json.
 file(READ "${REL}/build-flags.json" flags_json)
@@ -101,21 +104,26 @@ if(NOT clang_sha MATCHES "^[0-9a-f]+$" OR NOT clang_sha_len EQUAL 64)
   message(FATAL_ERROR "build-flags.json carries no valid clang package sha256")
 endif()
 qm_download("${clang_url}" "${OUT}/clang.tar.xz" "${clang_sha}")
-if(NOT EXISTS "${OUT}/clang/bin/clang-cl.exe")
-  file(ARCHIVE_EXTRACT INPUT "${OUT}/clang.tar.xz" DESTINATION "${OUT}/clang")
-endif()
+file(REMOVE_RECURSE "${OUT}/clang")
+
+file(ARCHIVE_EXTRACT INPUT "${OUT}/clang.tar.xz" DESTINATION "${OUT}/clang")
+file(WRITE "${OUT}/clang/.qmedia-package-sha256" "${clang_sha}")
 if(NOT EXISTS "${OUT}/clang/bin/clang-cl.exe" OR NOT EXISTS "${OUT}/clang/bin/lld-link.exe")
   message(FATAL_ERROR "the clang package has no clang-cl.exe / lld-link.exe")
 endif()
 
-# 5. Toolchain file for the engine configure step.
+# 5. Toolchain file for the engine configure step. It re-checks every pin before the compiler it
+# names is run for the first time (not in try_compile sub-projects, which do not see the cache).
 file(WRITE "${OUT}/toolchain.cmake"
-"set(CMAKE_SYSTEM_NAME Windows)
+"set(QMEDIA_WEBRTC_DIR \"${REL}\" CACHE PATH \"\")
+set(QMEDIA_CLANG_ROOT \"${OUT}/clang\" CACHE PATH \"\")
+if(NOT IN_TRY_COMPILE)
+  include(\"${CMAKE_CURRENT_LIST_DIR}/verify_pins.cmake\")
+endif()
+set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_C_COMPILER \"${OUT}/clang/bin/clang-cl.exe\")
 set(CMAKE_CXX_COMPILER \"${OUT}/clang/bin/clang-cl.exe\")
 set(CMAKE_LINKER \"${OUT}/clang/bin/lld-link.exe\")
 set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
-set(QMEDIA_WEBRTC_DIR \"${REL}\" CACHE PATH \"\")
-set(QMEDIA_CLANG_ROOT \"${OUT}/clang\" CACHE PATH \"\")
 ")
 message(STATUS "done: ${OUT}/toolchain.cmake")

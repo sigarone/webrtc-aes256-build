@@ -18,6 +18,7 @@
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
 #include "rtc_base/buffer.h"
+#include "rtc_base/logging.h"
 #include "rtc_base/qaudion_tuning.h"
 #include "rtc_base/ssl_adapter.h"
 
@@ -105,6 +106,12 @@ std::unique_ptr<Runtime> Runtime::Create(const Options& opts) {
 }
 
 bool Runtime::Init(const Options& opts) {
+  // The engine never logs, and neither does the library: SDP, candidates, fingerprints and key
+  // handling must not end up on stderr or in a debugger output. Release builds of libwebrtc
+  // already log nothing; this keeps it that way whatever the build flags are.
+  webrtc::LogMessage::LogToDebug(webrtc::LS_NONE);
+  webrtc::LogMessage::SetLogToStderr(false);
+
   // The library must be the strict build. These are not tunable: a library that is not strict
   // (or that allows the frame-cryptor magic-bytes bypass) is refused outright.
   if (webrtc::qaudion::TransportLevel() != 3 || webrtc::qaudion::MagicBytesBypassAllowed() ||
@@ -158,11 +165,17 @@ bool Runtime::Init(const Options& opts) {
       /*audio_mixer=*/nullptr, apm_);
   if (!factory_) return false;
 
+#if defined(QMEDIA_CI_BUILD)
+  // CI only: the test runner has no other network path between its two engine processes. This
+  // code is not compiled into the production executable.
   if (opts.allow_loopback) {
     webrtc::PeerConnectionFactoryInterface::Options o;
     o.network_ignore_mask = 0;
     factory_->SetOptions(o);
   }
+#else
+  if (opts.allow_loopback) return false;  // cannot be requested from the production executable
+#endif
   return true;
 }
 

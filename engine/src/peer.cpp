@@ -505,6 +505,12 @@ void Peer::OnNegotiationNeededEvent(uint32_t) { Emit(ipc::BuildNegotiationNeeded
 
 void Peer::OnStandardizedIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState state) {
   Emit(ipc::BuildIceConnectionState(id_, IceStateName(state)));
+  // A transport that was not connected at the last check (a later negotiation, an ICE restart) is
+  // looked at again; transports already reported are skipped.
+  if (state == webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionConnected ||
+      state == webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionCompleted) {
+    CheckTransport();
+  }
 }
 
 void Peer::OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState state) {
