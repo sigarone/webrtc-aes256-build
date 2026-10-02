@@ -4,7 +4,19 @@
 usage: gen-build-flags.py <raw_dir> <gn_args> > build-flags.json
 
 <raw_dir> holds the raw facts the workflow collected from the REAL build (same
-GN output directory the library was compiled in, no hand-written values):
+GN output directory the library was compiled in). Every value below is derived
+from them, with ONE deliberate exception: the BoringSSL include directory
+(../../third_party/boringssl/src/include) is written by hand in main(), on
+purpose. The public headers a consumer includes pull in <openssl/...>, and the
+zip ships that tree, but no translation unit of the library lists the directory
+on its own command line (the library reaches BoringSSL through a dependency's
+public config, which the probed command line does not repeat). Deriving it from
+the build therefore finds nothing, and probing a different translation unit
+until it shows up would make the contract depend on which file was probed. A
+consumer needs it because of what the public headers include, not because of
+how the library was compiled, so the contract states it explicitly. Pinned in
+the release by the BoringSSL revision in PINS.txt; if the BoringSSL layout ever
+moves, this constant and the header zip must change together.
 
   desc-webrtc.json   gn desc <out> //:webrtc --format=json
   compdb.json        ninja -C <out> -t compdb cxx   (the real compiler command

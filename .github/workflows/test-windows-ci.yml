@@ -1,0 +1,46 @@
+name: test-windows-ci
+
+# Free and fast (seconds): tests of the Windows release CI itself, no build.
+#   - m150/ci/link-smoke.py validate_flags against the real build-flags.json
+#     shape and a list of hostile path / library values (include-dir escapes,
+#     "//", "..", drive letters, a leading "-" "+" "/" "@")
+#   - the "publish=true only from main" step of build-m150-windows.yml (precheck)
+#   - the "release is exactly the 6 expected files" step of build-m150-windows.yml
+#     (publish)
+# The two workflow steps are extracted from build-m150-windows.yml and run with
+# bash, so removing or weakening one of them fails here. Nothing in this
+# workflow can publish anything.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'm150/ci/link-smoke.py'
+      - 'm150/ci/gen-build-flags.py'
+      - 'm150/ci/test-windows-ci.py'
+      - '.github/workflows/build-m150-windows.yml'
+      - '.github/workflows/test-windows-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'm150/ci/link-smoke.py'
+      - 'm150/ci/gen-build-flags.py'
+      - 'm150/ci/test-windows-ci.py'
+      - '.github/workflows/build-m150-windows.yml'
+      - '.github/workflows/test-windows-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Run the tests
+        run: python3 m150/ci/test-windows-ci.py
