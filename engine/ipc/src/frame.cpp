@@ -85,15 +85,11 @@ Err ReadFrame(ByteStream& s, FrameBuffer& buf, uint32_t idle_timeout_ms, size_t 
 Err WriteFrame(ByteStream& s, std::span<const uint8_t> payload, uint32_t timeout_ms) {
   if (payload.empty()) return Err::FrameEmpty;
   if (payload.size() > kMaxFramePayload) return Err::FrameTooLarge;
-  const Deadline deadline(timeout_ms);
-  const uint32_t len = static_cast<uint32_t>(payload.size());
-  const uint8_t hdr[kFrameHeaderBytes] = {static_cast<uint8_t>(len >> 24),
-                                          static_cast<uint8_t>(len >> 16),
-                                          static_cast<uint8_t>(len >> 8), static_cast<uint8_t>(len)};
-  IoResult r = s.WriteAll(hdr, sizeof hdr, deadline.Remaining());
-  if (r != IoResult::Ok) return MapIo(r);
-  r = s.WriteAll(payload.data(), payload.size(), deadline.Remaining());
-  return MapIo(r);
+  // Header and payload go out in ONE WriteAll, so a stream whose WriteAll is atomic (HandleStream
+  // holds its write lock for the whole call) keeps frames whole when several threads write: the
+  // engine sends events from libwebrtc threads while the session loop sends replies.
+  const cbor::Buf frame = EncodeFrame(payload);
+  return MapIo(s.WriteAll(frame.data(), frame.size(), timeout_ms));
 }
 
 cbor::Buf EncodeFrame(std::span<const uint8_t> payload) {

@@ -6,9 +6,10 @@ repository next to the libwebrtc build so that library and engine are built, att
 published by the same pipeline.
 
 Status: the IPC layer (framing, deterministic CBOR codec, schema validator, session handshake,
-Windows named-pipe transport, tests, fuzzers, CI) is complete. The engine executable currently
-links only that layer: it answers `ping` and `shutdown` and replies `err unsupported` to every
-other command. Linking the published libwebrtc is the next step (see "Linking libwebrtc").
+Windows named-pipe transport, tests, fuzzers, CI) is complete, and the engine core for a 1:1 AUDIO
+call is linked against the published Windows libwebrtc release (see "The engine core" and "Linking
+libwebrtc"). Video, screen sharing, H.265, the PCM tap, process isolation and group calls are not
+part of this build: their commands answer `err unsupported`.
 
 ## Scope
 
@@ -91,10 +92,15 @@ Keys.
   (it holds up to 1 MiB): a key is in pageable memory only for the time one message is handled.
   The in-memory test stream delivers partial reads the way a pipe does, so the wipe of a partially
   received frame is exercised by the unit tests and the session fuzzer.
-- Code that keeps a key (the frame key provider) copies it once into locked, non-pageable memory,
-  zeroes it with `SecureZero` when the slot is retired or the session ends, and never copies it
-  into logs, exceptions, crash reports or telemetry. `retire_slot` fills the slot with random
-  bytes, never with zeros. An all-zero key in `install_key` is rejected by the schema.
+- The engine copies a key once from the receive buffer into a local buffer, hands it to the frame
+  key provider and zeroes that local copy with `SecureZero` immediately. `retire_slot` fills the
+  slot with random bytes, never with zeros, and ending a session overwrites every slot that was ever
+  filled. An all-zero key in `install_key` is rejected by the schema. Limits that are not hidden:
+  libwebrtc's key provider keeps its own copies of the key (and a derived key) in ordinary heap
+  memory while a slot is live, and the copies it makes on the way (`SetKey` takes the vector by
+  value) are freed without being zeroed. The engine cannot reach those without patching the
+  library; the mitigations are the process boundary, no crash dumps (below) and the short life of
+  a call's keys.
 - A crash must not write key material to disk. The process sets `SEM_NOGPFAULTERRORBOX` at start
   and the host must not enable Windows Error Reporting LocalDumps for `qaudion-media.exe`.
 
@@ -187,13 +193,100 @@ validator with an independent second implementation of the rules (`ipc/fuzz/orac
 descends into every nested object, array element and scalar map, so a validator that fails open
 anywhere in a message is caught without needing a crash.
 
+## The engine core
+
+Implemented for a 1:1 audio call (`src/`): `engine.*` (command dispatch, sessions, certificates),
+`peer.*` (one peer connection), `keys.*` (the per-session frame key provider), `runtime.*`
+(threads, audio device, audio processing, factory), `stats.*`, `devices.*`.
+
+- Certificates: `cert_create` makes an ECDSA P-256 certificate and returns a handle plus the raw
+  SHA-256 of its DER encoding (computed with the operating system's hash). A certificate lives as
+  long as its session, is never regenerated and never evicted; a peer connection created again in
+  the same session with the same handle presents the same certificate.
+- Peer connections: `pc_create` takes the certificate handle; the configuration is compiled in
+  (Unified Plan, max-bundle, rtcp-mux, GCM-only SRTP options, continual gathering, TCP candidates
+  off, jitter buffer cap 17 packets, KEEP_FIRST_READY) and mirrors the mobile apps' native audio
+  call (Android `PeerConnectionHolder.kt`, RTCConfiguration block, main 4f6b3983, lines 4218-4332).
+  The offerer adds the audio transceiver at `create_offer`; the answerer attaches its microphone
+  after `set_remote_description(offer)`. The host owns the SDP: it may rewrite it between
+  `create_*` and `set_local_description`.
+- Frame keys: one libwebrtc key provider per SESSION (so the P12 replay windows survive the
+  re-creation of a peer connection), configured exactly like the mobile apps' 1:1 provider:
+  per-participant keys, empty ratchet salt, ratchet window 0, no magic bytes, failure tolerance -1,
+  key ring 16, frames discarded while no key is installed, HKDF (Android
+  `PeerConnectionHolder.kt` line 2615 of main 4f6b3983, iOS `NativeAudioFrameCryptor.swift` line 90
+  of main 300ce640). Send keys and receive keys of one participant id are kept apart inside the
+  provider. `bind_media` ties the cryptor of a media section (mid) to a participant and a direction;
+  `select_send_slot` moves the sender cryptors of that participant; `cryptor_state` events report
+  ok, missing_key, decryption_failed, encryption_failed, internal_error.
+- Transport: once a peer connection is `connected` the engine reads every DTLS transport and emits
+  `transport_info` (DTLS1.3, TLS_AES_256_GCM_SHA384, X25519MLKEM768, AEAD_AES_256_GCM and the SHA-256
+  of the remote certificate actually negotiated) or, if anything differs from the compiled-in
+  policy, `transport_violation` and closes the connection.
+- Audio: Windows Core Audio (see the note below), AEC3, noise suppression and AGC through the audio
+  processing module. `list_devices`, `select_device` (a running stream is stopped, switched and
+  restarted), `devices_changed` from the Windows endpoint notifications, `set_muted` for the
+  microphone and for remote audio.
+- Opus: the engine takes 60 ms, 32 kbps, CBR and in-band FEC from the host's SDP. `set_audio_tuning`
+  applies `bitrate_bps` (encoder held at that rate on both bounds, adaptive packetisation off) and
+  `fec_floor_pct` (0 to 20, process-wide in libwebrtc, so it affects every call of the process; the
+  engine serves one host and in practice one call). `ptime_ms` and `cbr` are SDP parameters and
+  are refused with `unsupported` and a static detail; nothing is applied when one is present.
+- Statistics: `get_stats` passes on an allowlist of attributes of inbound/outbound/remote RTP,
+  media source, transport, candidate pair and codec entries. Fractional and negative numbers are
+  decimal text, ids are `n<index>`, no address, certificate, stream id or SDP detail is included.
+- Ordering of replies and events (what the host may rely on, and what it may not):
+  - Replies are written by the session loop after the command has been handled, in the order the
+    commands arrived; one command is handled at a time, so the reply to command N is always written
+    before the reply to command N+1.
+  - Events (id 0) are written from libwebrtc threads as they happen. They are serialised with each
+    other and with replies (a frame is never torn), but there is no order between an event and the
+    reply of the command that caused it: a candidate event may arrive before the `ok` of the
+    `set_local_description` that started gathering, `cryptor_state` and `pc_state` may arrive before
+    the `ok` of the command that triggered them, and an event for a peer connection can arrive
+    before the host has read the `pc_created` reply that names it. The host must therefore accept
+    events for a pc or session it has been told about at any time, and key its state on the ids in
+    the event, not on the order of messages.
+  - Events of one peer connection are in the order libwebrtc reports them (they come from one
+    thread). `transport_info` is written right after the `pc_state` event that says `connected`
+    (a later `connected` or an ICE restart makes the engine look at transports it has not reported).
+  - `shutdown`: no event is written after the engine has started to shut down, and its `ok` is the
+    last message. After `session_close` or `pc_close` the engine stops emitting events for that
+    session or peer connection; an event that was already being written at that moment can still
+    reach the host next to the reply.
+  - The engine does not hold audio back until the host has bound the frame cryptors. A host that
+    wants end-to-end frame encryption on a call installs the keys, and sends `bind_media` for the
+    audio section as soon as its `mid` is known (the offerer after `create_offer`, the answerer
+    after `set_remote_description`), before the connection comes up, and treats a `cryptor_state`
+    other than `ok` as a failure. `require_frame_encryption` is off, exactly like the mobile apps:
+    the DTLS-SRTP transport is always AES-256-GCM, the frame layer is the host's to bind.
+
+Core Audio: the published library (dplc-10) contains only the original Windows Core Audio device
+module (`AudioDeviceWindowsCore`, reached through `kPlatformDefaultAudio`). The newer Core Audio 2
+module and its factory are not in it, so the plan's wording "Core Audio 2" does not apply to this
+build. Device ids are the endpoint ids it reports plus the aliases `default` and `communications`.
+This was exercised in CI only with the file device below; real hardware, Bluetooth profiles and
+device removal are not verified.
+
+Frame tests without a sound card: the CI executable `qaudion-media-ci` (compiled with
+`QMEDIA_CI_BUILD`, a separate target) replaces the sound card with libwebrtc's `FileAudioDevice`
+(`--ci-audio-in` raw 48 kHz stereo 16-bit file as the microphone, `--ci-audio-out` raw file for the
+played-out audio) and allows ICE on the loopback interface (`--ci-allow-loopback`). The production
+executable rejects these flags and a CI step checks that none of that code is in it.
+
+Not in this build: video, screen sharing, H.265, `pcm_tap`, `request_keyframe`, `set_simulcast`,
+Job Object and token restriction (host side), Control Flow Guard (libwebrtc.lib is not built with
+`/guard:cf`; a guarded indirect call into it would fail, so the executable has ASLR, high-entropy
+ASLR and DEP only).
+
 ## Layout
 
 ```
 engine/
   CMakeLists.txt        project root (IPC library, tests, optional fuzzers, qaudion-media on Windows)
-  cmake/webrtc.cmake    hook for linking the published libwebrtc
-  src/main.cpp          engine entry point
+  cmake/                pinned release (webrtc-release.cmake), fetch script, libwebrtc wiring (webrtc.cmake)
+  src/                  main.cpp and the engine core (engine, peer, keys, runtime, stats, devices)
+  tests/call_test.cpp   two engine processes driven through a full audio call (CI)
   ipc/
     schema.cddl         the contract
     include/qmedia/ipc  public headers (limits.h lists every bound in one place)
@@ -204,10 +297,15 @@ engine/
 
 ## Building and testing
 
-CI (`.github/workflows/engine.yml`, filtered on `engine/**`) runs three jobs: unit tests on Linux
+CI (`.github/workflows/engine.yml`, filtered on `engine/**`) runs four jobs: unit tests on Linux
 with clang under ASan and UBSan and with gcc in Release, both with warnings as errors; two
-libFuzzer targets for a fixed time with the committed seed corpus; and the Windows build with
-MSVC that runs the unit tests and the pipe tests against the real `qaudion-media.exe`.
+libFuzzer targets for a fixed time with the committed seed corpus; the Windows build with MSVC that
+runs the unit tests and the pipe tests against the stub `qaudion-media.exe`; and `engine-webrtc`,
+which builds the real engine against the pinned libwebrtc and runs `qmedia_call_test.exe`: two
+engine processes, a complete call, DTLS 1.3 / TLS_AES_256_GCM_SHA384 / X25519MLKEM768 /
+AEAD_AES_256_GCM asserted on both ends, remote fingerprint equal to the peer's `cert_create`
+fingerprint, cryptors OK, decoded non-silent audio on both sides, and the negative cases (wrong
+key, retired slot).
 
 Local use on a machine with CMake and a C++20 compiler:
 
@@ -227,10 +325,34 @@ the committed files differ from what the generator produces.
 
 ## Linking libwebrtc
 
-The engine core will link `webrtc.lib` from the Windows release of this repository (tag suffix
-`a256-dplc-9` or later). The hook is `cmake/webrtc.cmake`, function `qmedia_link_webrtc`. It is
-not wired yet because it needs `build-flags.json` from that release (compile definitions, CRT mode,
-STL and RTTI settings of the library), which the library workflow has not published at the time of
-writing. Until then `-DQMEDIA_WITH_WEBRTC=ON` stops the configure step on purpose. The comment
-block in `cmake/webrtc.cmake` lists the four steps to wire it, including verifying the sha256 of
-`webrtc.lib` against the release before use.
+The engine links the Windows release `webrtc-windows-m150-a256-dplc-10` of this repository. The
+tag and the sha256 of all seven release files are pinned in `cmake/webrtc-release.cmake`; moving to
+another release means changing that file.
+
+1. `cmake -DQMEDIA_FETCH_DIR=<dir> -P cmake/fetch_webrtc.cmake` downloads the release files and
+   verifies every one against the pinned sha256 (the release's own `SHA256SUMS` must agree with the
+   pins and list nothing else), unpacks the headers, downloads the Chromium clang package that
+   `build-flags.json` names (url pattern and sha256 checked), verifies it, unpacks it and writes
+   `<dir>/toolchain.cmake`.
+2. CI verifies the build provenance attestation of `webrtc.lib` with `gh attestation verify`
+   (repository and builder workflow pinned, retried on transient errors, no weaker fallback: a
+   failure stops the job).
+   The pins are checked again at configure time by `cmake/verify_pins.cmake`, which the toolchain
+   file includes before any compiler runs and `cmake/webrtc.cmake` includes too: every release
+   file must exist and match its pin, the headers must come from the pinned archive and the compiler
+   directory from the package `build-flags.json` names, otherwise the configure stops. CI
+   runs it against a tampered copy to show it refuses (empty directory, changed file, missing file,
+   wrong header stamp).
+3. `cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<dir>/toolchain.cmake -DQMEDIA_WITH_WEBRTC=ON`
+   from a Visual Studio developer environment (the Windows SDK and CRT headers and libraries come
+   from it). `cmake/webrtc.cmake` reads `build-flags.json` and applies exactly its defines, flags
+   and include directories (in the recorded order, so Chromium's libc++ headers win over the MSVC
+   ones) to every target, links `webrtc.lib`, `libcxx.lib`, the system libraries and the
+   compiler-rt builtins it lists and adds `/DEFAULTLIB:libcpmt.lib`. Every token from the JSON is
+   validated before it reaches a command line. The whole project is built this way in this mode:
+   the IPC library shares types with the engine and must use the same C++ library.
+4. Targets: `qaudion-media` (production), `qaudion-media-ci` (file audio device), `qmedia_call_test`
+   (the call driver). `ctest` has no entry for them; CI runs `qmedia_call_test.exe`.
+
+The MSVC build of the IPC layer (`QMEDIA_WITH_WEBRTC=OFF`, the default) is unchanged and still
+produces the stub `qaudion-media.exe` that the pipe tests use.

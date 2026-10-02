@@ -131,6 +131,28 @@ QTEST(frame_eof_and_truncation) {
   }
 }
 
+// Several threads write frames to one stream (events from libwebrtc threads, replies from the
+// session loop). A stream with an atomic WriteAll can only keep frames whole if a frame is ONE call.
+class CountingStream final : public ByteStream {
+ public:
+  IoResult ReadExact(uint8_t*, size_t, uint32_t) override { return IoResult::Eof; }
+  IoResult WriteAll(const uint8_t* src, size_t n, uint32_t) override {
+    ++calls;
+    last.assign(src, src + n);
+    return IoResult::Ok;
+  }
+  int calls = 0;
+  Buf last;
+};
+
+QTEST(frame_write_is_one_write_call) {
+  CountingStream out;
+  const Buf payload{9, 8, 7};
+  CHECK_EQ(WriteFrame(out, payload, 1000), Err::Ok);
+  CHECK_EQ(out.calls, 1);
+  CHECK(out.last == EncodeFrame(payload));
+}
+
 QTEST(frame_write_validates_size) {
   MemoryStream out({});
   CHECK_EQ(WriteFrame(out, std::span<const uint8_t>(), 1000), Err::FrameEmpty);
