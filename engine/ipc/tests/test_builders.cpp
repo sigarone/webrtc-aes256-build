@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "qmedia/ipc/cbor.h"
+#include "qmedia/ipc/limits.h"
 #include "qmedia/ipc/message.h"
 #include "qmedia/ipc/schema.h"
 #include "testing.h"
