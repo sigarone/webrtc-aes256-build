@@ -98,7 +98,8 @@ cbor::Buf BuildPcState(uint32_t pc, std::string_view state);
 cbor::Buf BuildNegotiationNeeded(uint32_t pc);
 cbor::Buf BuildTransportInfo(uint32_t pc, std::string_view tls_version, std::string_view dtls_cipher,
                              std::string_view group, std::string_view srtp_cipher,
-                             std::span<const uint8_t> remote_cert_fingerprint);
+                             std::span<const uint8_t> remote_cert_fingerprint,
+                             std::span<const uint8_t> local_cert_fingerprint);
 cbor::Buf BuildTransportViolation(uint32_t pc, std::string_view reason);
 cbor::Buf BuildCryptorState(uint32_t pc, std::string_view mid, std::string_view participant,
                             std::string_view kind, std::string_view state);

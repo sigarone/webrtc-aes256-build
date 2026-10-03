@@ -3,6 +3,8 @@
 // libwebrtc messages is copied into a reply or an event except the values the schema asks for.
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -15,6 +17,7 @@
 #include "api/media_stream_interface.h"
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
+#include "api/stats/rtc_stats_report.h"
 #include "keys.h"
 #include "qmedia/ipc/cbor.h"
 #include "qmedia/ipc/limits.h"
@@ -40,6 +43,16 @@ struct IceServerSpec {
 struct PeerParams {
   bool relay_only = false;
   std::vector<IceServerSpec> ice_servers;
+};
+
+class Peer;
+
+// Lets an asynchronous libwebrtc callback reach its peer without keeping it alive: Peer::Close()
+// clears `peer` under the lock, so a callback either runs completely before Close() returns or
+// finds nothing to call.
+struct PeerLink {
+  std::recursive_mutex m;  // recursive: a statistics report may be delivered inside GetStats()
+  Peer* peer = nullptr;
 };
 
 class Peer final : public webrtc::PeerConnectionObserver {
@@ -81,6 +94,11 @@ class Peer final : public webrtc::PeerConnectionObserver {
   void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
   void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
+  // Called by the statistics callback that CheckTransport starts (signaling thread, under the
+  // PeerLink lock). Reads the local certificate of the DTLS transports from `report` and emits
+  // transport_info together with `remote_fp`, or transport_violation if it cannot be established.
+  void OnLocalCertStats(const webrtc::RTCStatsReport& report, const std::array<uint8_t, 32>& remote_fp);
+
   // Called by the cryptor observers.
   void OnCryptorState(const std::string& mid, const std::string& participant, bool audio,
                       webrtc::FrameCryptionState state);
@@ -96,6 +114,10 @@ class Peer final : public webrtc::PeerConnectionObserver {
 
   Status EnsureLocalAudio();
   void CheckTransport();
+  // Asks libwebrtc for a statistics report; the answer arrives in OnLocalCertStats.
+  void RequestLocalCertStats(const std::array<uint8_t, 32>& remote_fp);
+  // Emits transport_violation and closes the peer connection (not from inside the callback).
+  void FailTransport(const char* reason);
   void Emit(ipc::cbor::Buf payload);
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc() const;
 
@@ -103,6 +125,7 @@ class Peer final : public webrtc::PeerConnectionObserver {
   const uint32_t session_;
   Runtime& rt_;
   Emitter& out_;
+  const std::shared_ptr<PeerLink> link_;
 
   mutable std::mutex mu_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
@@ -112,6 +135,8 @@ class Peer final : public webrtc::PeerConnectionObserver {
   bool remote_audio_muted_ = false;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> track_;
   std::set<const void*> reported_transports_;
+  // Start of the window of the local certificate lookup: the latest transition to connected.
+  std::chrono::steady_clock::time_point confirm_window_start_{};
   std::vector<Bound> bound_;
   SessionKeys* keys_ = nullptr;  // set by BindMedia; only used to unregister sender cryptors
 };

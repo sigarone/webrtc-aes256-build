@@ -104,7 +104,8 @@ cbor::Buf BuildNegotiationNeeded(uint32_t pc) {
 
 cbor::Buf BuildTransportInfo(uint32_t pc, std::string_view tls_version, std::string_view dtls_cipher,
                              std::string_view group, std::string_view srtp_cipher,
-                             std::span<const uint8_t> remote_cert_fingerprint) {
+                             std::span<const uint8_t> remote_cert_fingerprint,
+                             std::span<const uint8_t> local_cert_fingerprint) {
   return BeginMessage("transport_info", 0)
       .Uint("pc", pc)
       .Str("tls_version", tls_version)
@@ -112,6 +113,7 @@ cbor::Buf BuildTransportInfo(uint32_t pc, std::string_view tls_version, std::str
       .Str("group", group)
       .Str("srtp_cipher", srtp_cipher)
       .Bin("remote_cert_fingerprint", remote_cert_fingerprint)
+      .Bin("local_cert_fingerprint", local_cert_fingerprint)
       .Finish();
 }
 

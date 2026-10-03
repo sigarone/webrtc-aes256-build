@@ -132,7 +132,8 @@ constexpr FieldSpec kFTransportInfo[] = {
     Str("dtls_cipher", 1, 64),
     Str("group", 0, 64),
     Str("srtp_cipher", 1, 64),
-    Bin("remote_cert_fingerprint", kFingerprintBytes, kFingerprintBytes)};
+    Bin("remote_cert_fingerprint", kFingerprintBytes, kFingerprintBytes),
+    Bin("local_cert_fingerprint", kFingerprintBytes, kFingerprintBytes)};
 constexpr FieldSpec kFViolation[] = {Hnd("pc"), En("reason", kViolation)};
 constexpr FieldSpec kFCryptor[] = {Hnd("pc"), Str("mid", 1, 16), Str("participant", 1, 64),
                                    En("kind", kMediaKind), En("state", kCryptorState)};

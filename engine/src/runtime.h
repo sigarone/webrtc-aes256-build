@@ -80,6 +80,11 @@ class Runtime {
 // library names or sizes its own digest.
 bool CertSha256(const webrtc::SSLCertificate& cert, std::array<uint8_t, 32>* out);
 
+// The same digest for a certificate given as the standard base64 of its DER encoding, which is how
+// the library's certificate statistics carry it. The identical hash path as CertSha256, so a
+// fingerprint read from the statistics equals the one cert_create returns for the same certificate.
+bool CertBase64Sha256(const std::string& base64_der, std::array<uint8_t, 32>* out);
+
 // Replaces every control character by a space and cuts the text to at most max_bytes at a UTF-8
 // boundary, so it satisfies the schema's text rules. Used for device names and ids.
 std::string SanitizeText(const std::string& in, size_t max_bytes);

@@ -347,11 +347,24 @@ QTEST(schema_transport_info_requires_a_32_byte_fingerprint) {
   GenOptions o;
   Value r;
   CHECK_EQ(Check(GenMessage(ti, o), Dir::EngineToClient, &r), Err::Ok);
-  for (size_t n : {0u, 20u, 31u, 33u, 48u}) {
-    const Buf f = Bin(n, 0x33);
-    Value rr;
-    CHECK_EQ(Check(GenMessageWith(ti, o, "remote_cert_fingerprint", &f), Dir::EngineToClient, &rr),
-             Err::SchemaLength);
+  // Both certificate fingerprints follow the same rule: exactly 32 bytes, a byte string, present.
+  for (const char* field : {"remote_cert_fingerprint", "local_cert_fingerprint"}) {
+    for (size_t n : {0u, 20u, 31u, 33u, 48u}) {
+      const Buf f = Bin(n, 0x33);
+      Value rr;
+      CHECK_EQ(Check(GenMessageWith(ti, o, field, &f), Dir::EngineToClient, &rr), Err::SchemaLength);
+    }
+    const Buf good = Bin(32, 0x33);
+    Value ok;
+    CHECK_EQ(Check(GenMessageWith(ti, o, field, &good), Dir::EngineToClient, &ok), Err::Ok);
+    const Buf txt = Str("0123456789abcdef0123456789abcdef");
+    Value rt;
+    CHECK_EQ(Check(GenMessageWith(ti, o, field, &txt), Dir::EngineToClient, &rt), Err::SchemaType);
+    const Buf num = Uint(7);
+    Value rn;
+    CHECK_EQ(Check(GenMessageWith(ti, o, field, &num), Dir::EngineToClient, &rn), Err::SchemaType);
+    Value rm;
+    CHECK_EQ(Check(GenMessageWith(ti, o, field, nullptr), Dir::EngineToClient, &rm), Err::SchemaMissingField);
   }
 }
 

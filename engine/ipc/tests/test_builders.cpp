@@ -161,15 +161,22 @@ QTEST(builders_events_validate) {
     CHECK(Accepts(w, &v, &m, "negotiation_needed"));
   }
   {
-    const Buf fp = Fp(9);
+    const Buf remote_fp = Fp(9);
+    const Buf local_fp = Fp(41);
     const Buf w = BuildTransportInfo(4, "DTLS1.3", "TLS_AES_256_GCM_SHA384", "X25519MLKEM768",
-                                     "AEAD_AES_256_GCM", fp);
+                                     "AEAD_AES_256_GCM", remote_fp, local_fp);
     Value v;
     ValidatedMessage m;
     CHECK(Accepts(w, &v, &m, "transport_info"));
     CHECK(FieldText(m, "group") == "X25519MLKEM768");
     const Value* f = Field(m, "remote_cert_fingerprint");
     CHECK(f != nullptr && f->raw.size() == kFingerprintBytes);
+    CHECK(f != nullptr && Buf(f->raw.begin(), f->raw.end()) == remote_fp);
+    // The local fingerprint is its own field: it must not be the remote one echoed back.
+    const Value* l = Field(m, "local_cert_fingerprint");
+    CHECK(l != nullptr && l->raw.size() == kFingerprintBytes);
+    CHECK(l != nullptr && Buf(l->raw.begin(), l->raw.end()) == local_fp);
+    CHECK(local_fp != remote_fp);
   }
   for (const char* r : {"no_dtls", "tls_version", "dtls_cipher", "group", "srtp_cipher"}) {
     const Buf w = BuildTransportViolation(5, r);
