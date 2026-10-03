@@ -798,8 +798,7 @@ void Call2(const std::string& dir) {
 // library must refuse the handshake on the caller, so no transport_info (which would carry the
 // callee's real fingerprint next to a connection the caller believes is up) can appear there.
 void Call3(const std::string& dir) {
-  std::printf("[call] ---- call 3: the caller is told a wrong fingerprint for the callee ----
-");
+  std::printf("[call] ---- call 3: the caller is told a wrong fingerprint for the callee ----\n");
   Side a, b;
   SetupSide(a, dir, "c3a", 0.5);
   SetupSide(b, dir, "c3b", 2.1);
