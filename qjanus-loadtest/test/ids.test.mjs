@@ -11,7 +11,7 @@ test('ids follow the contract formulas (fixed vectors from openssl)', () => {
   assert.equal(roomId(SEED, 0), 'ac51824bf5d867b6072fb04edda4b662');
   assert.equal(roomSecret(SEED, 'abc'), '0ebe16edd5f5fd77f93a89d10bc9e49203265051ee2f6242c34da1d65e225849');
   assert.equal(pseudonym(SEED, 3, 5), 'df4817b4328a7144a28c1d277195965e');
-  assert.equal(joinToken(SEED, 3, 5), 'a599107f6bdd0e6b10988bc029c6eb67');
+  assert.equal(joinToken(SEED, 3, 5), 'df4817b4328a7144a28c1d277195965e:a599107f6bdd0e6b10988bc029c6eb67');
   assert.equal(e2eeKey(SEED, 3), '8a28eea340cb4044df69ace744af0df3f4dbdd34fd851f9cef74cc9e2d2e0f25');
 });
 
@@ -23,7 +23,7 @@ test('ids equal the HMAC-SHA256 definitions computed independently', () => {
     assert.equal(e2eeKey(SEED, k), hmac(SEED, `e2ee|${k}`));
     for (const i of [0, 1, 15]) {
       assert.equal(pseudonym(SEED, k, i), hmac(SEED, `pseudo|${k}|${i}`).slice(0, 32));
-      assert.equal(joinToken(SEED, k, i), hmac(SEED, `join|${k}|${i}`).slice(0, 32));
+      assert.equal(joinToken(SEED, k, i), `${pseudonym(SEED, k, i)}:${hmac(SEED, `join|${k}|${i}`).slice(0, 32)}`);
     }
   }
 });
@@ -31,9 +31,16 @@ test('ids equal the HMAC-SHA256 definitions computed independently', () => {
 test('length and charset: lowercase hex of 32 or 64 chars', () => {
   const room = roomId(SEED, 4);
   const cases = [
-    [room, 32], [roomSecret(SEED, room), 64], [pseudonym(SEED, 4, 2), 32], [joinToken(SEED, 4, 2), 32], [e2eeKey(SEED, 4), 64],
+    [room, 32], [roomSecret(SEED, room), 64], [pseudonym(SEED, 4, 2), 32], [e2eeKey(SEED, 4), 64],
   ];
   for (const [value, len] of cases) assert.match(value, new RegExp(`^[0-9a-f]{${len}}$`));
+});
+
+test('a join token has the qjanus bound form "<pseudonym>:<32 hex>" (patch 0007)', () => {
+  const t = joinToken(SEED, 4, 2);
+  assert.match(t, /^[0-9a-f]{32}:[0-9a-f]{32}$/);
+  assert.equal(t.slice(0, 32), pseudonym(SEED, 4, 2));
+  assert.notEqual(t.slice(33), pseudonym(SEED, 4, 2)); // the secret part is a different derivation
 });
 
 test('deterministic: same inputs give the same ids, in any call order', () => {

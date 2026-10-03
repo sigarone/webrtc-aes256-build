@@ -156,9 +156,9 @@ class FakeHost {
 
 const BASE_ARGS = ['--scenario', 'audio8', '--hold-sec', '30', '--settle-sec', '10', '--join-rate', '2', '--run-id', 'test', '--quiet'];
 
-async function harness(argv, { host: hostOpts = {}, deps = {}, clockStart = T0 } = {}) {
+async function harness(argv, { host: hostOpts = {}, deps = {}, clockStart = T0, env = ENV } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'qjl-ramp-'));
-  const cfg = parseCli([...argv.slice(0, 1), ...BASE_ARGS, ...argv.slice(1), '--out', dir], ENV).cfg;
+  const cfg = parseCli([...argv.slice(0, 1), ...BASE_ARGS, ...argv.slice(1), '--out', dir], env, { now: () => new Date(clockStart) }).cfg;
   const clock = new FakeClock(clockStart);
   const host = new FakeHost(clock, hostOpts);
   const logs = [];
@@ -501,6 +501,26 @@ test('session tokens are refreshed for all live bots before they expire', withHa
   for (let i = 1; i < calls.length; i++) assert.ok(calls[i].t - calls[i - 1].t <= 64_000);
   assert.ok(calls[0].t - T0 <= 62_000);
   await assertNoSecrets(h);
+}));
+
+test('pre-minted mode: bot (k, i) gets token k*size+i, nothing is minted or refreshed, no secret is needed', withHarness(async (run) => {
+  const tokens = Array.from({ length: 16 }, (_, n) => `${Math.floor(T0 / 1000) + 7200},janus,janus.plugin.videoroom:PREMINTED${String(n).padStart(2, '0')}${'A'.repeat(31)}=`);
+  const env = { QJANUS_WS_URL: WS, QJANUS_LOADTEST_SEED: 'SEEDVALUE123', QJANUS_SESSION_TOKENS: JSON.stringify(tokens) };
+  // no mintToken dep: the orchestrator's own default (the pre-minted list) is used
+  const h = await run(['run', '--rooms', '2', '--hold-sec', '700'], { env, deps: { mintToken: undefined } });
+  assert.equal(h.summary.ok, true);
+  assert.equal(h.host.bots.size, 16);
+  for (const [id, b] of h.host.bots) {
+    const k = Number(id.slice(1, 5));
+    const i = Number(id.slice(7));
+    assert.equal(b.cfg.sessionToken, tokens[k * 8 + i], `token of ${id}`);
+  }
+  assert.equal(h.host.tokenCalls.length, 0, 'pre-minted tokens are never refreshed (the run lasted > 700 s)');
+  assert.equal(h.cfg.secrets.tokenSecret, null);
+  for (const name of await readdir(h.dir)) {
+    const text = await h.read(name);
+    for (const t of tokens) assert.ok(!text.includes(t.split(':')[1]), `${name} contains a session token`);
+  }
 }));
 
 test('a transport policy violation is fatal, not a capacity result, even with a saturated client', withHarness(async (run) => {

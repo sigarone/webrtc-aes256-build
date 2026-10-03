@@ -25,6 +25,8 @@
 #   f         audio8  run of 2 rooms as two concurrent shards (0/2, 1/2, --start-at)
 #   report    merge f0 + f1 + the sampler CSV with `qjanus-load report` (runs with f)
 #   g         audio8  run with --manage-rooms ON (the harness creates and destroys its room)
+#   p         PRE-MINTED tokens (production mode): tokens minted by aruba/aruba_tool.py, the token secret withheld
+#             from scripts/run-shard.sh (see step_p)
 #   i         remote mode as the workflow's shard step runs it: two concurrent scripts/run-shard.sh
 #             processes (shards 0/2 and 1/2, audio8 ramp 1..2 rooms), then `qjanus-load report`
 #   h         audio8  ramp under injected UDP loss: expects stopReason loss (see step_h). Runs LAST;
@@ -34,7 +36,7 @@
 # Environment
 #   PREFIX             build-deps.sh prefix, default /opt/qjanus-loadtest (Janus in $PREFIX/janus)
 #   OUT                output dir, default <qjanus-loadtest>/out/smoke
-#   SMOKE_ONLY         comma list of steps to run (negative,a,b,c,d,e,f,report,g,i,h)
+#   SMOKE_ONLY         comma list of steps to run (negative,a,b,c,d,e,f,report,g,i,p,h)
 #   SMOKE_ICE_LITE     0 switches Janus ICE lite off (default on)
 #   SMOKE_DEBUG_LEVEL  Janus debug level (default 5; the DTLS-POLICY lines need >= 4)
 #   SMOKE_STEP_TIMEOUT time limit in seconds of every load / negative run (default 600)
@@ -51,7 +53,7 @@ OUT=${OUT:-$ROOT/out/smoke}
 ICE_LITE=true; [ "${SMOKE_ICE_LITE:-1}" = 0 ] && ICE_LITE=false
 DEBUG_LEVEL=${SMOKE_DEBUG_LEVEL:-5}
 STEP_TIMEOUT=${SMOKE_STEP_TIMEOUT:-600}
-ALL_STEPS="negative a b c d e f report g i h"
+ALL_STEPS="negative a b c d e f report g i p h"
 ONLY=${SMOKE_ONLY:-}
 
 for s in ${ONLY//,/ }; do
@@ -312,6 +314,37 @@ step_i() {
   return "$rc"
 }
 
+# p: the production mode. The tokens are minted by aruba/aruba_tool.py (the on-node helper) from a copy of the
+# Janus token secret in a private env file, exactly as on the production node; run-shard.sh then gets ONLY the
+# tokens (no token secret in its environment) and the real Janus must accept them. Afterwards no token may
+# appear in the shard's output files.
+step_p() {
+  ensure_rooms || return 1
+  local envf="$RUN/p-node.env" tokens rc=0
+  ( umask 077; printf '%s\n' "QJANUS_TOKEN_SECRET=$QJANUS_TOKEN_SECRET" "QJANUS_ADMIN_KEY=$QJANUS_ADMIN_KEY" 'QJANUS_HTTP_BIND=127.0.0.1' > "$envf" )
+  tokens=$(QJANUS_ENV_FILE=$envf python3 "$ROOT/aruba/aruba_tool.py" mint --count 8 --ttl-sec 3600) || return 1
+  echo "::add-mask::$tokens"
+  env -u QJANUS_TOKEN_SECRET QJANUS_SESSION_TOKENS="$tokens"     SHARD=0 SHARDS=1 START_AT=$(( $(date +%s) + 5 )) RUN_ID=smoke-p SCENARIO=audio8 RUN_MODE=run ROOMS=1     HOLD_SEC=15 JOIN_RATE=4 SETTLE_SEC=6 VIDEO_PROFILE=spec BOTS_PER_BROWSER=16 OUT_DIR="$OUT/p"     EXTRA_ARGS="--cpu-file $OUT/sampler.csv"     timeout -k 20 "$STEP_TIMEOUT" bash "$HERE/run-shard.sh" > "$RUN/p.out" 2>&1 || rc=1
+  sed 's/^/[pre-minted] /' "$RUN/p.out"
+  node - "$OUT/p" "$tokens" <<'JS' || rc=1
+const fs = require('node:fs');
+const path = require('node:path');
+const [dir, raw] = process.argv.slice(2);
+const sigs = JSON.parse(raw).map((t) => t.split(':')[1]);
+const s = JSON.parse(fs.readFileSync(path.join(dir, 'summary.json'), 'utf8'));
+const problems = [];
+if (s.ok !== true || s.stopReason !== null) problems.push(`run not ok (stopReason ${s.stopReason})`);
+if (!s.steps?.length) problems.push('no steps');
+for (const f of fs.readdirSync(dir)) {
+  const text = fs.readFileSync(path.join(dir, f), 'utf8');
+  for (const sig of sigs) if (text.includes(sig)) problems.push(`a session token leaked into ${f}`);
+}
+if (problems.length) { console.error('step p: ' + problems.join('; ')); process.exit(1); }
+console.log(`step p: pre-minted run ok (${s.steps.length} step(s))`);
+JS
+  return "$rc"
+}
+
 # ---- step h: injected loss on the loopback interface, like the feasibility probe (withLoss)
 # 6 % of all UDP datagrams delivered over `lo` are dropped (browser <-> Janus media and DTLS
 # alike). The rule is ALWAYS removed again: at the end of the step, and from the EXIT/INT/TERM
@@ -367,7 +400,7 @@ if wanted e; then
 fi
 sleep 3                                            # a few baseline rows before the first load
 
-for id in negative a b c d e f report g i h; do
+for id in negative a b c d e f report g i p h; do
   wanted "$id" || continue
   case $id in
     negative) run_step negative "access control: tokens, admin key, join tokens, kick" step_negative ;;
@@ -380,6 +413,7 @@ for id in negative a b c d e f report g i h; do
     report) run_step report "merge shards + sampler into a report" step_report ;;
     g) run_step g "audio8 run with --manage-rooms" step_g ;;
     i) run_step i "remote-mode shards via run-shard.sh (ramp 1..2 rooms, 2 shards)" step_i ;;
+    p) run_step p "pre-minted tokens via run-shard.sh, no token secret (production mode)" step_p ;;
     h) run_step h "audio8 ramp under injected UDP loss (expects stopReason loss)" step_h ;;
   esac
 done
@@ -425,7 +459,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const out = process.argv[2];
 const rows = [];
-for (const d of ['a', 'b', 'c', 'd', 'e', 'f0', 'f1', 'g', 'i0', 'i1', 'h']) {
+for (const d of ['a', 'b', 'c', 'd', 'e', 'f0', 'f1', 'g', 'i0', 'i1', 'p', 'h']) {
   const f = path.join(out, d, 'summary.json');
   if (!fs.existsSync(f)) continue;
   const s = JSON.parse(fs.readFileSync(f, 'utf8'));
