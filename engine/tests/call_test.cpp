@@ -10,6 +10,8 @@
 //           both sides (stats and the played-out file). Then retires the receive slot of one side
 //           and asserts that decryption fails and the decoded audio stops.
 //   call 2  the receiver holds a wrong key: decryption fails and no audio comes out.
+//   call 2  (continued) both sides then rebuild their peer connection in the same session with the same
+//           certificate handle and connect again: each side again reports its own certificate as local.
 //   call 3  the caller is given an answer whose fingerprint is not the callee's certificate: the
 //           caller's DTLS must fail, so it never reaches "connected" and never reports a
 //           transport_info that could pass the host's remote check.
@@ -545,27 +547,28 @@ void ForwardIce(Side& from, Side& to) {
 
 bool WaitConnected(Side& a, Side& b, int timeout_s) {
   const auto end = Clock::now() + std::chrono::seconds(timeout_s);
-  auto connected = [](Side& s) {
-    return s.proc.FindEvent([&](const Parsed& e) { return e.kind() == "pc_state" && e.Text("state") == "connected"; }) != nullptr;
+  // Only the events of the side's current peer connection count (a side can rebuild its own).
+  auto state = [](Side& s, const char* name) {
+    return s.proc.FindEvent([&](const Parsed& e) {
+             return e.kind() == "pc_state" && e.Uint("pc") == s.pc && e.Text("state") == name;
+           }) != nullptr;
   };
   while (Clock::now() < end) {
     ForwardIce(a, b);
     ForwardIce(b, a);
-    if (connected(a) && connected(b)) return true;
-    if (a.proc.FindEvent([](const Parsed& e) { return e.kind() == "pc_state" && e.Text("state") == "failed"; }) ||
-        b.proc.FindEvent([](const Parsed& e) { return e.kind() == "pc_state" && e.Text("state") == "failed"; })) {
-      return false;
-    }
+    if (state(a, "connected") && state(b, "connected")) return true;
+    if (state(a, "failed") || state(b, "failed")) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   return false;
 }
 
-void CheckTransport(Side& s, const Side& peer, const std::string& label) {
+// `pc` (when not 0) restricts the check to the transport_info of that peer connection.
+void CheckTransport(Side& s, const Side& peer, const std::string& label, uint32_t pc = 0) {
   // The negative checks below only mean something when the two certificates differ.
   Check(!s.fingerprint.empty() && s.fingerprint != peer.fingerprint,
         label + ": the two sides hold different certificates");
-  Msg t = s.proc.WaitEvent([](const Parsed& e) { return e.kind() == "transport_info"; }, 20);
+  Msg t = s.proc.WaitEvent([pc](const Parsed& e) { return e.kind() == "transport_info" && (pc == 0 || e.Uint("pc") == pc); }, 20);
   Check(t != nullptr, label + ": transport_info event");
   if (!t) return;
   Check(t->Text("tls_version") == "DTLS1.3", label + ": DTLS 1.3");
@@ -609,6 +612,8 @@ std::string WithWrongFingerprint(const std::string& sdp) {
   return out;
 }
 
+void Handshake(Side& a, Side& b, bool corrupt_answer_fp);
+
 // Negotiates and connects two sides. `b_recv_key` is what B holds for A's direction. With
 // `corrupt_answer_fp` the caller is handed an answer whose fingerprint is not the callee's.
 void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_recv_key,
@@ -622,6 +627,12 @@ void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_re
       return BeginMessage("select_send_slot", id).Uint("session", s->session).Str("participant", "local").Uint("slot", 0).Finish();
     });
   }
+  Handshake(a, b, corrupt_answer_fp);
+}
+
+// Offer, answer, media binding and tuning on the current peer connections of both sides (the keys
+// of the sessions are already in place).
+void Handshake(Side& a, Side& b, bool corrupt_answer_fp) {
   Msg offer = a.proc.Call("create_offer", [&](uint32_t id) { return BeginMessage("create_offer", id).Uint("pc", a.pc).Finish(); });
   if (offer->kind() != "sdp_ready") Abort("create_offer failed " + offer->Text("code") + " " + offer->Text("detail"));
   const std::string offer_sdp = MungeOpus(offer->Text("sdp"));
@@ -778,17 +789,38 @@ void Call2(const std::string& dir) {
   });
   a.proc.CallOk("restart_ice", [&](uint32_t id) { return BeginMessage("restart_ice", id).Uint("pc", a.pc).Finish(); });
 
-  // A peer connection rebuilt in the same session presents the same certificate (R-CERT).
-  a.proc.CallOk("pc_close", [&](uint32_t id) { return BeginMessage("pc_close", id).Uint("pc", a.pc).Finish(); });
-  Msg again = a.proc.Call("pc_create again", [&](uint32_t id) {
-    return BeginMessage("pc_create", id).Uint("session", a.session).Uint("cert", a.cert).Finish();
-  });
-  Check(again->kind() == "pc_created", "a second peer connection is created with the same certificate handle");
-  if (again->kind() == "pc_created") {
-    const uint32_t pc2 = static_cast<uint32_t>(again->Uint("pc"));
-    Msg offer2 = a.proc.Call("create_offer again", [&](uint32_t id) { return BeginMessage("create_offer", id).Uint("pc", pc2).Finish(); });
-    Check(offer2->kind() == "sdp_ready" && FingerprintOfSdp(offer2->Text("sdp")) == a.fingerprint,
-          "the rebuilt peer connection announces the same certificate fingerprint");
+  // Peer connections rebuilt in the same session present the same certificates (R-CERT): both
+  // sides close their connection and build another one with the certificate handle they already
+  // hold, connect again, and each reports its own certificate as the local one, the same as before.
+  const uint32_t old_a = a.pc;
+  const uint32_t old_b = b.pc;
+  for (Side* s : {&a, &b}) {
+    s->proc.CallOk("pc_close", [&](uint32_t id) { return BeginMessage("pc_close", id).Uint("pc", s->pc).Finish(); });
+    Msg again = s->proc.Call("pc_create again", [&](uint32_t id) {
+      return BeginMessage("pc_create", id).Uint("session", s->session).Uint("cert", s->cert).Str("ice_policy", "all").Finish();
+    });
+    Check(again->kind() == "pc_created", s->proc.tag() + ": a second peer connection is created with the same certificate handle");
+    if (again->kind() != "pc_created") Abort("pc_create again failed");
+    s->pc = static_cast<uint32_t>(again->Uint("pc"));
+  }
+  Check(a.pc != old_a && b.pc != old_b, "the rebuilt peer connections have new handles");
+  Handshake(a, b, false);
+  const bool up2 = WaitConnected(a, b, 90);
+  Check(up2, "call 2: the rebuilt peer connections connect over loopback");
+  if (up2) {
+    CheckTransport(a, b, "call 2 rebuilt caller", a.pc);
+    CheckTransport(b, a, "call 2 rebuilt callee", b.pc);
+    for (Side* s : {&a, &b}) {
+      const uint32_t before = s == &a ? old_a : old_b;
+      const uint32_t now = s->pc;
+      Msg first = s->proc.FindEvent([before](const Parsed& e) { return e.kind() == "transport_info" && e.Uint("pc") == before; });
+      Msg second = s->proc.FindEvent([now](const Parsed& e) { return e.kind() == "transport_info" && e.Uint("pc") == now; });
+      Check(first && second && first->Bytes("local_cert_fingerprint") == second->Bytes("local_cert_fingerprint"),
+            s->proc.tag() + ": the local fingerprint is the same before and after the rebuild");
+    }
+  } else {
+    a.proc.DumpStderr();
+    b.proc.DumpStderr();
   }
   Finish(a, b);
   Check(!a.proc.invalid_message() && !b.proc.invalid_message(), "call 2: every engine message validated against the schema");
