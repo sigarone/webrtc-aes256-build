@@ -232,9 +232,16 @@ Implemented for a 1:1 audio call (`src/`): `engine.*` (command dispatch, session
   controller installed in the DTLS transports: it is set on all of them in one step and cannot be
   replaced, and the engine builds the connection with exactly one certificate (the `pc_create`
   handle), so under this strict factory it is the certificate the handshake used. The engine hashes
-  the DER of that object with the same code as `cert_create`, so the two compare byte for byte. If
-  no local certificate can be read within 3 seconds, or two transports disagree, the verdict is
-  `transport_violation` with reason `no_dtls` and the connection is closed.
+  the DER of that object with the same code as `cert_create`, so the two compare byte for byte.
+  No legitimate call is ended by a short timer: the lookup asks for a statistics report every
+  250 ms and keeps asking for `CONFIRM_TIMEOUT` = 15 s after each transition to `connected`
+  (WIRE_SPEC section 3.8.4; one constant, `kConfirmTimeoutMs` in `src/local_cert_policy.h`), and
+  every new transition opens its own 15 s, also for a lookup that is still running. A slow
+  statistics collector or a loaded machine costs time, not the call. Only if no local certificate
+  was readable during the whole window is the verdict `transport_violation` with reason `no_dtls`
+  (and the connection is closed). Two transports that report different certificates, or a
+  certificate that cannot be decoded, are a finding and give that verdict at once. The lookup is
+  cancelled by `pc_close` and by the end of the session: it holds no reference to the peer.
 - Audio: Windows Core Audio (see the note below), AEC3, noise suppression and AGC through the audio
   processing module. `list_devices`, `select_device` (a running stream is stopped, switched and
   restarted), `devices_changed` from the Windows endpoint notifications, `set_muted` for the
@@ -261,8 +268,9 @@ Implemented for a 1:1 audio call (`src/`): `engine.*` (command dispatch, session
     the event, not on the order of messages.
   - Events of one peer connection are in the order libwebrtc reports them (they come from one
     thread). `transport_info` follows the `pc_state` event that says `connected`, normally within a
-    few milliseconds: the local certificate is read from an asynchronous statistics report, so other
-    events of the connection may be written in between. A later `connected` or an ICE restart makes
+    few milliseconds but, if the statistics collector is slow, up to 15 s later: the local certificate
+    is read from an asynchronous statistics report, so other events of the connection may be written
+    in between. A later `connected` or an ICE restart makes
     the engine look at transports it has not reported.
   - `shutdown`: no event is written after the engine has started to shut down, and its `ok` is the
     last message. After `session_close` or `pc_close` the engine stops emitting events for that
@@ -301,6 +309,7 @@ engine/
   cmake/                pinned release (webrtc-release.cmake), fetch script, libwebrtc wiring (webrtc.cmake)
   src/                  main.cpp and the engine core (engine, peer, keys, runtime, stats, devices)
   tests/call_test.cpp   two engine processes driven through a full audio call (CI)
+  tests/local_cert_policy_test.cpp  the 250 ms / 15 s lookup rules of src/local_cert_policy.h (ctest, every platform)
   ipc/
     schema.cddl         the contract
     include/qmedia/ipc  public headers (limits.h lists every bound in one place)
@@ -367,7 +376,8 @@ another release means changing that file.
    validated before it reaches a command line. The whole project is built this way in this mode:
    the IPC library shares types with the engine and must use the same C++ library.
 4. Targets: `qaudion-media` (production), `qaudion-media-ci` (file audio device), `qmedia_call_test`
-   (the call driver). `ctest` has no entry for them; CI runs `qmedia_call_test.exe`.
+   (the call driver). `ctest` has no entry for them; CI runs `qmedia_call_test.exe`. The timing
+   rules of the local certificate lookup are in `qmedia_engine_policy_tests` (ctest `engine_policy`).
 
 The MSVC build of the IPC layer (`QMEDIA_WITH_WEBRTC=OFF`, the default) is unchanged and still
 produces the stub `qaudion-media.exe` that the pipe tests use.

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -50,7 +51,7 @@ class Peer;
 // clears `peer` under the lock, so a callback either runs completely before Close() returns or
 // finds nothing to call.
 struct PeerLink {
-  std::mutex m;
+  std::recursive_mutex m;  // recursive: a statistics report may be delivered inside GetStats()
   Peer* peer = nullptr;
 };
 
@@ -96,8 +97,7 @@ class Peer final : public webrtc::PeerConnectionObserver {
   // Called by the statistics callback that CheckTransport starts (signaling thread, under the
   // PeerLink lock). Reads the local certificate of the DTLS transports from `report` and emits
   // transport_info together with `remote_fp`, or transport_violation if it cannot be established.
-  void OnLocalCertStats(const webrtc::RTCStatsReport& report, const std::array<uint8_t, 32>& remote_fp,
-                        int attempt);
+  void OnLocalCertStats(const webrtc::RTCStatsReport& report, const std::array<uint8_t, 32>& remote_fp);
 
   // Called by the cryptor observers.
   void OnCryptorState(const std::string& mid, const std::string& participant, bool audio,
@@ -115,7 +115,7 @@ class Peer final : public webrtc::PeerConnectionObserver {
   Status EnsureLocalAudio();
   void CheckTransport();
   // Asks libwebrtc for a statistics report; the answer arrives in OnLocalCertStats.
-  void RequestLocalCertStats(const std::array<uint8_t, 32>& remote_fp, int attempt);
+  void RequestLocalCertStats(const std::array<uint8_t, 32>& remote_fp);
   // Emits transport_violation and closes the peer connection (not from inside the callback).
   void FailTransport(const char* reason);
   void Emit(ipc::cbor::Buf payload);
@@ -135,6 +135,8 @@ class Peer final : public webrtc::PeerConnectionObserver {
   bool remote_audio_muted_ = false;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> track_;
   std::set<const void*> reported_transports_;
+  // Start of the window of the local certificate lookup: the latest transition to connected.
+  std::chrono::steady_clock::time_point confirm_window_start_{};
   std::vector<Bound> bound_;
   SessionKeys* keys_ = nullptr;  // set by BindMedia; only used to unregister sender cryptors
 };

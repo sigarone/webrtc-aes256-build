@@ -48,6 +48,18 @@ endif()
 enable_testing()
 add_subdirectory(ipc)
 
+# The timing rules of the local certificate lookup of the engine (no libwebrtc in it, so it is
+# built and run on every platform): the constants of WIRE_SPEC section 3.8.4 and the retry loop
+# against a fake statistics source.
+if(QMEDIA_BUILD_TESTS)
+  add_executable(qmedia_engine_policy_tests
+    tests/local_cert_policy_test.cpp
+    ipc/tests/test_main.cpp)
+  target_include_directories(qmedia_engine_policy_tests PRIVATE src ipc/tests)
+  add_test(NAME engine_policy COMMAND qmedia_engine_policy_tests)
+  set_tests_properties(engine_policy PROPERTIES TIMEOUT 60)
+endif()
+
 if(QMEDIA_BUILD_ENGINE)
   if(NOT WIN32)
     message(FATAL_ERROR "qaudion-media is a Windows executable")
