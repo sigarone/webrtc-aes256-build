@@ -17,6 +17,8 @@
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
 #include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtcstats_objects.h"
+#include "api/units/time_delta.h"
 #include "rtc_base/buffer.h"
 #include "rtc_base/qaudion_tuning.h"
 #include "rtc_base/ssl_certificate.h"
@@ -32,6 +34,11 @@ constexpr int kDtls13 = 0xfefc;
 constexpr int kTlsAes256GcmSha384 = 0x1302;
 constexpr int kSrtpAeadAes256Gcm = 0x0008;
 constexpr int kX25519Mlkem768 = 0x11ec;
+
+// The local certificate is read from a statistics report. A report can be a few milliseconds old
+// (libwebrtc reuses one for 50 ms) and may not list the transport yet, so the read is repeated.
+constexpr int kLocalCertMaxAttempts = 30;
+constexpr int kLocalCertRetryMs = 100;
 
 class Waiter {
  public:
@@ -110,6 +117,25 @@ class StatsObs : public webrtc::RTCStatsCollectorCallback {
   webrtc::scoped_refptr<const webrtc::RTCStatsReport> report_;
 };
 
+// Delivers the statistics report that CheckTransport asked for to its peer, if the peer is still
+// there.
+class LocalCertObs : public webrtc::RTCStatsCollectorCallback {
+ public:
+  LocalCertObs(std::shared_ptr<PeerLink> link, const std::array<uint8_t, 32>& remote_fp, int attempt)
+      : link_(std::move(link)), remote_fp_(remote_fp), attempt_(attempt) {}
+  void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    if (!report) return;
+    // The call into the peer happens under the lock so Close() cannot return while one is running.
+    std::lock_guard<std::mutex> l(link_->m);
+    if (link_->peer != nullptr) link_->peer->OnLocalCertStats(*report, remote_fp_, attempt_);
+  }
+
+ private:
+  const std::shared_ptr<PeerLink> link_;
+  const std::array<uint8_t, 32> remote_fp_;
+  const int attempt_;
+};
+
 // Forwards the state of one cryptor to its peer. The peer detaches it before it goes away.
 class CryptorObs : public webrtc::FrameCryptorTransformerObserver {
  public:
@@ -184,7 +210,9 @@ webrtc::PeerConnectionInterface::IceServers ToIceServers(const std::vector<IceSe
 }  // namespace
 
 Peer::Peer(uint32_t id, uint32_t session, Runtime& rt, Emitter& out)
-    : id_(id), session_(session), rt_(rt), out_(out) {}
+    : id_(id), session_(session), rt_(rt), out_(out), link_(std::make_shared<PeerLink>()) {
+  link_->peer = this;
+}
 
 Peer::~Peer() { Close(); }
 
@@ -246,6 +274,11 @@ void Peer::Close() {
     pc = std::move(pc_);
     bound = std::move(bound_);
     keys = keys_;
+  }
+  {
+    // Waits for a statistics callback that is running right now; later ones find no peer.
+    std::lock_guard<std::mutex> l(link_->m);
+    link_->peer = nullptr;
   }
   for (Bound& b : bound) {
     auto* obs = static_cast<CryptorObs*>(b.observer.get());
@@ -581,15 +614,79 @@ void Peer::CheckTransport() {
     if (violation == nullptr && !have_fp) violation = "no_dtls";
 
     if (violation != nullptr) {
-      Emit(ipc::BuildTransportViolation(id_, violation));
-      // The policy is broken: close the connection (not from inside this callback).
-      rt_.signaling()->PostTask([p] { p->Close(); });
+      FailTransport(violation);
       return;
     }
+    // The remote fingerprint is known. The local one is not part of DtlsTransportInformation: it
+    // is read from the statistics report, and transport_info is emitted from there.
+    RequestLocalCertStats(digest, 0);
+  }
+}
+
+void Peer::FailTransport(const char* reason) {
+  Emit(ipc::BuildTransportViolation(id_, reason));
+  // The policy is broken: close the connection (not from inside this callback).
+  auto p = pc();
+  if (p) rt_.signaling()->PostTask([p] { p->Close(); });
+}
+
+void Peer::RequestLocalCertStats(const std::array<uint8_t, 32>& remote_fp, int attempt) {
+  auto p = pc();
+  if (!p) return;
+  auto obs = webrtc::make_ref_counted<LocalCertObs>(link_, remote_fp, attempt);
+  p->GetStats(obs.get());
+}
+
+// The certificate that the transport controller of libwebrtc holds for the connection is the one
+// it installed in every DTLS transport (JsepTransportController::SetLocalCertificate_n sets the
+// same object on the JsepTransports and on the DTLS transports, and it cannot be replaced
+// afterwards). getStats() reports that object per transport (transport.localCertificateId), which
+// is the nearest the public API comes to "the certificate the DTLS session used":
+// DtlsTransportInformation carries the remote chain only. The digest is taken over the DER of that
+// certificate with the same hash path as cert_create, so the two values compare byte for byte.
+void Peer::OnLocalCertStats(const webrtc::RTCStatsReport& report, const std::array<uint8_t, 32>& remote_fp,
+                            int attempt) {
+  std::array<uint8_t, 32> local{};
+  bool have = false;
+  bool broken = false;
+  for (const webrtc::RTCTransportStats* t : report.GetStatsOfType<webrtc::RTCTransportStats>()) {
+    if (!t->local_certificate_id.has_value()) continue;
+    const webrtc::RTCCertificateStats* c =
+        report.GetAs<webrtc::RTCCertificateStats>(*t->local_certificate_id);
+    if (c == nullptr || !c->base64_certificate.has_value()) continue;
+    std::array<uint8_t, 32> d{};
+    if (!CertBase64Sha256(*c->base64_certificate, &d)) {
+      broken = true;
+      break;
+    }
+    if (!have) {
+      local = d;
+      have = true;
+    } else if (local != d) {
+      // Every transport of a connection carries the one certificate; two different ones are a bug
+      // somewhere and must not be reported as a verdict.
+      broken = true;
+      break;
+    }
+  }
+  if (have && !broken) {
     Emit(ipc::BuildTransportInfo(id_, "DTLS1.3", "TLS_AES_256_GCM_SHA384", "X25519MLKEM768",
                                  "AEAD_AES_256_GCM",
-                                 std::span<const uint8_t>(digest.data(), digest.size())));
+                                 std::span<const uint8_t>(remote_fp.data(), remote_fp.size()),
+                                 std::span<const uint8_t>(local.data(), local.size())));
+    return;
   }
+  if (!broken && attempt + 1 < kLocalCertMaxAttempts) {
+    rt_.signaling()->PostDelayedTask(
+        [link = link_, remote_fp, attempt] {
+          std::lock_guard<std::mutex> l(link->m);
+          if (link->peer != nullptr) link->peer->RequestLocalCertStats(remote_fp, attempt + 1);
+        },
+        webrtc::TimeDelta::Millis(kLocalCertRetryMs));
+    return;
+  }
+  // Same verdict as a missing remote certificate: no usable DTLS identity, so fail closed.
+  FailTransport("no_dtls");
 }
 
 }  // namespace qmedia::engine

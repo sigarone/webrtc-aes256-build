@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include "api/audio/audio_processing.h"
 #include "api/audio/builtin_audio_processing_builder.h"
@@ -90,13 +91,67 @@ std::string SanitizeText(const std::string& in, size_t max_bytes) {
   return out;
 }
 
+namespace {
+
+bool Sha256(const uint8_t* data, size_t size, std::array<uint8_t, 32>* out) {
+  if (size == 0 || size > 0x7FFFFFFFu) return false;
+  const NTSTATUS st = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<PUCHAR>(data),
+                                 static_cast<ULONG>(size), out->data(), static_cast<ULONG>(out->size()));
+  return st >= 0;
+}
+
+// Standard base64 with padding, no whitespace, no other character. -1 for anything else.
+int B64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+bool Base64DecodeStrict(const std::string& in, std::vector<uint8_t>* out) {
+  if (in.empty() || in.size() % 4 != 0 || in.size() > 16384) return false;
+  out->clear();
+  out->reserve(in.size() / 4 * 3);
+  for (size_t i = 0; i < in.size(); i += 4) {
+    const bool last = i + 4 == in.size();
+    int v[4];
+    int pad = 0;
+    for (int k = 0; k < 4; ++k) {
+      const char c = in[i + k];
+      if (c == '=') {
+        // Padding only in the last quantum, only at its end.
+        if (!last || k < 2) return false;
+        ++pad;
+        v[k] = 0;
+      } else {
+        if (pad != 0) return false;
+        v[k] = B64Value(c);
+        if (v[k] < 0) return false;
+      }
+    }
+    const uint32_t n = (static_cast<uint32_t>(v[0]) << 18) | (static_cast<uint32_t>(v[1]) << 12) |
+                       (static_cast<uint32_t>(v[2]) << 6) | static_cast<uint32_t>(v[3]);
+    out->push_back(static_cast<uint8_t>(n >> 16));
+    if (pad < 2) out->push_back(static_cast<uint8_t>(n >> 8));
+    if (pad < 1) out->push_back(static_cast<uint8_t>(n));
+  }
+  return true;
+}
+
+}  // namespace
+
 bool CertSha256(const webrtc::SSLCertificate& cert, std::array<uint8_t, 32>* out) {
   webrtc::Buffer der;
   cert.ToDER(&der);
-  if (der.size() == 0) return false;
-  const NTSTATUS st = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<PUCHAR>(der.data()),
-                                 static_cast<ULONG>(der.size()), out->data(), static_cast<ULONG>(out->size()));
-  return st >= 0;
+  return Sha256(der.data(), der.size(), out);
+}
+
+bool CertBase64Sha256(const std::string& base64_der, std::array<uint8_t, 32>* out) {
+  std::vector<uint8_t> der;
+  if (!Base64DecodeStrict(base64_der, &der)) return false;
+  return Sha256(der.data(), der.size(), out);
 }
 
 std::unique_ptr<Runtime> Runtime::Create(const Options& opts) {

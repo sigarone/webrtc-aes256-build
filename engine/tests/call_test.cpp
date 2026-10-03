@@ -2,12 +2,17 @@
 // published libwebrtc) are driven over their pipes through a complete 1:1 audio call.
 //
 //   call 1  both sides share the per-direction frame keys. Asserts, on both ends: DTLS 1.3,
-//           TLS_AES_256_GCM_SHA384, X25519MLKEM768, AEAD_AES_256_GCM, and that the remote
-//           certificate fingerprint equals the peer's cert_create fingerprint. Asserts that the
+//           TLS_AES_256_GCM_SHA384, X25519MLKEM768, AEAD_AES_256_GCM, that the remote certificate
+//           fingerprint equals the peer's cert_create fingerprint and that the local certificate
+//           fingerprint equals the side's own cert_create fingerprint (and neither is the
+//           other's). Asserts that the
 //           cryptors report OK, that audio packets arrive and are decoded to non-silent audio on
 //           both sides (stats and the played-out file). Then retires the receive slot of one side
 //           and asserts that decryption fails and the decoded audio stops.
 //   call 2  the receiver holds a wrong key: decryption fails and no audio comes out.
+//   call 3  the caller is given an answer whose fingerprint is not the callee's certificate: the
+//           caller's DTLS must fail, so it never reaches "connected" and never reports a
+//           transport_info that could pass the host's remote check.
 //
 // Audio device: the engine's CI build replaces the sound card with libwebrtc's FileAudioDevice,
 // which reads the "microphone" from a raw 48 kHz stereo file (generated here) and writes the
@@ -557,6 +562,9 @@ bool WaitConnected(Side& a, Side& b, int timeout_s) {
 }
 
 void CheckTransport(Side& s, const Side& peer, const std::string& label) {
+  // The negative checks below only mean something when the two certificates differ.
+  Check(!s.fingerprint.empty() && s.fingerprint != peer.fingerprint,
+        label + ": the two sides hold different certificates");
   Msg t = s.proc.WaitEvent([](const Parsed& e) { return e.kind() == "transport_info"; }, 20);
   Check(t != nullptr, label + ": transport_info event");
   if (!t) return;
@@ -564,7 +572,15 @@ void CheckTransport(Side& s, const Side& peer, const std::string& label) {
   Check(t->Text("dtls_cipher") == "TLS_AES_256_GCM_SHA384", label + ": TLS_AES_256_GCM_SHA384");
   Check(t->Text("group") == "X25519MLKEM768", label + ": X25519MLKEM768");
   Check(t->Text("srtp_cipher") == "AEAD_AES_256_GCM", label + ": AEAD_AES_256_GCM");
-  Check(t->Bytes("remote_cert_fingerprint") == peer.fingerprint, label + ": remote fingerprint equals the peer's cert_create fingerprint");
+  const Buf remote_fp = t->Bytes("remote_cert_fingerprint");
+  const Buf local_fp = t->Bytes("local_cert_fingerprint");
+  Check(remote_fp.size() == kFingerprintBytes && local_fp.size() == kFingerprintBytes,
+        label + ": both certificate fingerprints are 32 bytes");
+  Check(remote_fp == peer.fingerprint, label + ": remote fingerprint equals the peer's cert_create fingerprint");
+  Check(local_fp == s.fingerprint, label + ": local fingerprint equals this side's own cert_create fingerprint");
+  Check(remote_fp != s.fingerprint, label + ": remote fingerprint is not this side's own certificate");
+  Check(local_fp != peer.fingerprint, label + ": local fingerprint is not the peer's certificate");
+  Check(local_fp != remote_fp, label + ": local and remote fingerprints differ");
   Check(s.proc.FindEvent([](const Parsed& e) { return e.kind() == "transport_violation"; }) == nullptr,
         label + ": no transport_violation");
 }
@@ -581,8 +597,22 @@ bool WaitCryptorState(Side& s, const char* participant, const char* state, int t
          }, timeout_s) != nullptr;
 }
 
-// Negotiates and connects two sides. `b_recv_key` is what B holds for A's direction.
-void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_recv_key) {
+// The SDP with the first hex digit of its a=fingerprint line changed, so it no longer matches the
+// certificate of the side that wrote it.
+std::string WithWrongFingerprint(const std::string& sdp) {
+  const std::string key = "a=fingerprint:sha-256 ";
+  const size_t p = sdp.find(key);
+  if (p == std::string::npos) return sdp;
+  std::string out = sdp;
+  char& c = out[p + key.size()];
+  c = (c == '0') ? '1' : '0';
+  return out;
+}
+
+// Negotiates and connects two sides. `b_recv_key` is what B holds for A's direction. With
+// `corrupt_answer_fp` the caller is handed an answer whose fingerprint is not the callee's.
+void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_recv_key,
+               bool corrupt_answer_fp = false) {
   InstallKey(a, "local", o2a, true);
   InstallKey(a, "remote", a2o, false);
   InstallKey(b, "local", a2o, true);
@@ -608,7 +638,7 @@ void Negotiate(Side& a, Side& b, const Buf& o2a, const Buf& a2o, const Buf& b_re
   const std::string answer_sdp = MungeOpus(answer->Text("sdp"));
   Check(FingerprintOfSdp(answer_sdp) == b.fingerprint, "the answer announces the certificate cert_create returned (check a)");
   SetDesc(b, true, "answer", answer_sdp);
-  SetDesc(a, false, "answer", answer_sdp);
+  SetDesc(a, false, "answer", corrupt_answer_fp ? WithWrongFingerprint(answer_sdp) : answer_sdp);
 
   // The mobile apps clamp the encoder to the negotiated rate once the sender exists.
   for (Side* s : {&a, &b}) {
@@ -764,6 +794,37 @@ void Call2(const std::string& dir) {
   Check(!a.proc.invalid_message() && !b.proc.invalid_message(), "call 2: every engine message validated against the schema");
 }
 
+// Negative case for the remote check: the caller expects another certificate than the callee's. The
+// library must refuse the handshake on the caller, so no transport_info (which would carry the
+// callee's real fingerprint next to a connection the caller believes is up) can appear there.
+void Call3(const std::string& dir) {
+  std::printf("[call] ---- call 3: the caller is told a wrong fingerprint for the callee ----
+");
+  Side a, b;
+  SetupSide(a, dir, "c3a", 0.5);
+  SetupSide(b, dir, "c3b", 2.1);
+  const Buf o2a = RandomKey();
+  const Buf a2o = RandomKey();
+  Negotiate(a, b, o2a, a2o, o2a, /*corrupt_answer_fp=*/true);
+  const auto failed = [](const Parsed& e) { return e.kind() == "pc_state" && e.Text("state") == "failed"; };
+  const auto connected = [](const Parsed& e) { return e.kind() == "pc_state" && e.Text("state") == "connected"; };
+  // Keep the ICE candidates flowing until the caller's connection ends one way or the other.
+  const auto end = Clock::now() + std::chrono::seconds(60);
+  while (Clock::now() < end) {
+    ForwardIce(a, b);
+    ForwardIce(b, a);
+    if (a.proc.FindEvent(failed) || a.proc.FindEvent(connected)) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  Check(a.proc.FindEvent(failed) != nullptr, "call 3 caller: the handshake against a wrong fingerprint fails");
+  Check(a.proc.FindEvent(connected) == nullptr, "call 3 caller: the connection never reaches connected");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  Check(a.proc.FindEvent([](const Parsed& e) { return e.kind() == "transport_info"; }) == nullptr,
+        "call 3 caller: no transport_info is reported");
+  Finish(a, b);
+  Check(!a.proc.invalid_message() && !b.proc.invalid_message(), "call 3: every engine message validated against the schema");
+}
+
 }  // namespace
 
 int main() {
@@ -782,6 +843,7 @@ int main() {
 
   Call1(dir);
   Call2(dir);
+  Call3(dir);
 
   if (g_failures != 0) {
     std::printf("[call] FAILED (%d check(s))\n", g_failures);

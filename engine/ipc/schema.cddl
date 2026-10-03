@@ -486,8 +486,11 @@ negotiation-needed = {
   pc: handle,
 }
 
-; Reported once the DTLS handshake has completed. The client checks the values and the
-; remote certificate fingerprint against what the signed handshake promised.
+; Reported once the DTLS handshake has completed. The client checks the values, the remote
+; certificate fingerprint against the one the signed handshake promised for the peer, and the
+; local certificate fingerprint against the one it announced for itself. Both are the SHA-256 of
+; the DER certificate, in the same form cert_created returns. local_cert_fingerprint is the
+; certificate of the DTLS transport as the library reports it, not the handle given to pc_create.
 transport-info = {
   v: 1,
   t: "transport_info",
@@ -498,6 +501,7 @@ transport-info = {
   group: tstr .size (0..64),
   srtp_cipher: tstr .size (1..64),
   remote_cert_fingerprint: bstr .size 32,
+  local_cert_fingerprint: bstr .size 32,
 }
 
 ; The engine saw a transport that breaks the compiled-in policy and closed the peer connection.
