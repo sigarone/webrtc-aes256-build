@@ -255,6 +255,7 @@ struct D3dDev {
   bool vendor_matched = false;  // the adapter belongs to the vendor of the MFT
   bool video_device = false;    // the device exposes ID3D11VideoDevice
   bool video_flag_dropped = false;  // software adapter only: made without VIDEO_SUPPORT
+  std::string fallback_note;        // --ci only: why the WARP software rasterizer was used
 };
 
 // Explicit adapter choice. ordinal >= 0: the n-th non-software adapter. Otherwise
@@ -306,10 +307,12 @@ bool MakeD3DDevice(unsigned vendor_id, int ordinal, D3dDev* out, HRESULT* hr_out
                                       D3D_FEATURE_LEVEL_10_1,
                                       D3D_FEATURE_LEVEL_10_0};
   D3D_FEATURE_LEVEL got{};
+  AdapterInfo used = pick->info;
   HRESULT hr = D3D11CreateDevice(
       pick->adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
       D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
       levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &out->dev, &got, &out->ctx);
+  const HRESULT first_hr = hr;
   if (FAILED(hr) && pick->info.software) {
     // A software adapter (WARP) is only used to run the code path on a machine
     // without a GPU, and it does not offer video support everywhere. A hardware
@@ -321,6 +324,35 @@ bool MakeD3DDevice(unsigned vendor_id, int ordinal, D3dDev* out, HRESULT* hr_out
                            D3D11_SDK_VERSION, &out->dev, &got, &out->ctx);
     if (SUCCEEDED(hr)) out->video_flag_dropped = true;
   }
+  if (FAILED(hr) && g_allow_sw_adapter) {
+    // Virtual machines list display adapters that cannot make a D3D11 device at all.
+    // With --ci the code path still has to run, so the WARP software rasterizer is
+    // used, and the report says so.
+    out->dev.Reset();
+    out->ctx.Reset();
+    HRESULT wh = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &out->dev, &got,
+                                   &out->ctx);
+    bool dropped = false;
+    if (FAILED(wh)) {
+      out->dev.Reset();
+      out->ctx.Reset();
+      wh = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &out->dev, &got, &out->ctx);
+      dropped = SUCCEEDED(wh);
+    }
+    if (SUCCEEDED(wh)) {
+      out->fallback_note = "the D3D11 device could not be made on '" + pick->info.description +
+                           "' (" + HrStr(first_hr) + "); the WARP software rasterizer was used instead (--ci)";
+      out->video_flag_dropped = dropped;
+      used = AdapterInfo();
+      used.description = "WARP software rasterizer";
+      used.vendor_id = 0x1414;
+      used.software = true;
+      hr = S_OK;
+    }
+  }
   *hr_out = hr;
   if (FAILED(hr)) return false;
   // MFTs call into the device from their own threads.
@@ -328,8 +360,8 @@ bool MakeD3DDevice(unsigned vendor_id, int ordinal, D3dDev* out, HRESULT* hr_out
   if (SUCCEEDED(out->dev.As(&mt))) mt->SetMultithreadProtected(TRUE);
   ComPtr<ID3D11VideoDevice> vd;
   out->video_device = SUCCEEDED(out->dev.As(&vd));
-  out->adapter = pick->info;
-  out->vendor_matched = vendor_id == 0 || pick->info.vendor_id == vendor_id;
+  out->adapter = used;
+  out->vendor_matched = vendor_id == 0 || used.vendor_id == vendor_id;
   return true;
 }
 
@@ -977,6 +1009,7 @@ bool PrepareMft(const MftInfo& mi, bool use_d3d, int adapter_ordinal, bool is_de
     r->adapter_vendor = s->d3d.adapter.vendor_id;
     r->adapter_software = s->d3d.adapter.software;
     r->adapter_same_vendor = s->d3d.vendor_matched;
+    if (!s->d3d.fallback_note.empty()) r->notes.push_back(s->d3d.fallback_note);
     if (s->d3d.video_flag_dropped) {
       r->notes.push_back(
           "software adapter: the D3D11 device was made without D3D11_CREATE_DEVICE_VIDEO_SUPPORT "

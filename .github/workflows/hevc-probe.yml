@@ -162,8 +162,14 @@ jobs:
             }
           }
           # On a software adapter a decode must not be counted as a GPU decode.
-          $allSoft = (@($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0)
-          if ($allSoft -and $s.h264_dxva_decode_720p_status -eq 'ok') { throw 'self-test: a software adapter was counted as a GPU decode' }
+          foreach ($t in @($rep.tests | Where-Object { $_.role -eq 'decode' -and $_.status -eq 'ok' -and $_.adapter -and $_.adapter.software_adapter })) {
+            if ($t.gpu_path) { throw "self-test: a decode on the software adapter $($t.adapter.description) was counted as a GPU decode" }
+          }
+          if (@($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0 -and $s.h264_dxva_decode_720p_status -eq 'ok') { throw 'self-test: a software adapter was counted as a GPU decode' }
+          # With --ci the D3D11 decode path must actually have run (WARP when the VM has no usable adapter).
+          $ran = @($d3d | Where-Object { $_.status -ne 'not_attempted' -and $_.d3d11_manager })
+          Write-Host ("D3D11 decode attempts with a manager set: " + $ran.Count)
+          if ($ran.Count -eq 0) { throw 'self-test: no decode attempt got as far as setting the D3D11 manager on the MFT' }
 
       - name: 1080p alone, and 720p alone (attempts independent of each other)
         shell: pwsh
