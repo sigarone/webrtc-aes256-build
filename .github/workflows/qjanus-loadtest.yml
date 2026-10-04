@@ -17,6 +17,11 @@ name: qjanus-loadtest
 # never creates or prints any of them, they are masked in logs):
 #   QJANUS_WS_URL           wss:// URL of the Janus WebSocket endpoint under test
 #   QJANUS_TOKEN_SECRET     the node's core token_auth_secret (HMAC key of the session tokens)
+#                           ... OR, instead of it, for a node whose token secret must not leave it
+#                           (PRODUCTION): the secret named by session_tokens_secret_name holds a JSON
+#                           array of PRE-MINTED session tokens, one per bot (see qjanus-loadtest/aruba/):
+#                           minted on the node with a short expiry, deleted right after the run. The
+#                           token secret is then neither read nor passed to the runner.
 #   QJANUS_LOADTEST_SEED    seed for the deterministic room / participant ids; the rooms
 #                           of that seed must already exist on the node (create them with
 #                           `qjanus-admin create-rooms` on the node: the Janus HTTP API is
@@ -29,6 +34,10 @@ name: qjanus-loadtest
 on:
   push:
     branches: [qjanus-loadtest]
+  pull_request:
+    paths:
+      - 'qjanus-loadtest/**'
+      - '.github/workflows/qjanus-loadtest.yml'
   workflow_dispatch:
     inputs:
       mode:
@@ -45,9 +54,13 @@ on:
         type: string
         default: 'QJANUS_WS_URL'
       token_secret_name:
-        description: 'Name of the secret holding the core token secret'
+        description: 'Name of the secret holding the core token secret (ignored when session_tokens_secret_name is set)'
         type: string
         default: 'QJANUS_TOKEN_SECRET'
+      session_tokens_secret_name:
+        description: 'Pre-minted mode: name of the secret holding a JSON array of Janus session tokens, one per bot. Empty = mint from the token secret.'
+        type: string
+        default: ''
       seed_secret_name:
         description: 'Name of the secret holding the id seed'
         type: string
@@ -110,13 +123,13 @@ permissions:
 # A newer push replaces a running smoke; a manual remote run is never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # --------------------------------------------------------------------- unit
   unit:
     name: unit tests and shell checks
-    if: github.event_name == 'push' || inputs.mode != 'remote'
+    if: github.event_name != 'workflow_dispatch' || inputs.mode != 'remote'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -147,12 +160,15 @@ jobs:
       - name: Node tests
         run: npm test
 
+      - name: Aruba helper tests (Python, stdlib only)
+        run: python3 test/aruba_tool_test.py
+
       - name: Sampler tests (fake /proc and /sys trees)
         run: bash test/sampler.test.sh
 
       - name: Shell scripts (syntax and shellcheck)
         run: |
-          files=(scripts/*.sh test/sampler.test.sh)
+          files=(scripts/*.sh aruba/*.sh test/sampler.test.sh)
           for f in "${files[@]}"; do bash -n "$f"; done
           command -v shellcheck >/dev/null || sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck -S warning -x "${files[@]}"
@@ -160,7 +176,7 @@ jobs:
   # -------------------------------------------------------------------- smoke
   smoke:
     name: smoke (local Janus build)
-    if: github.event_name == 'push' || inputs.mode == 'smoke'
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'smoke'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -316,7 +332,10 @@ jobs:
       # The same scripts/run-shard.sh is exercised by smoke step i.
       - name: Run the load test (shard ${{ matrix.shard }} of ${{ inputs.shards }})
         env:
-          QJANUS_TOKEN_SECRET: ${{ secrets[inputs.token_secret_name] }}
+          # pre-minted mode: the token secret is not even read (secrets[''] is empty); otherwise the usual secret
+          QJANUS_TOKEN_SECRET: ${{ inputs.session_tokens_secret_name == '' && secrets[inputs.token_secret_name] || '' }}
+          QJANUS_SESSION_TOKENS: ${{ inputs.session_tokens_secret_name != '' && secrets[inputs.session_tokens_secret_name] || '' }}
+          SESSION_TOKENS_SECRET_NAME: ${{ inputs.session_tokens_secret_name }}
           QJANUS_LOADTEST_SEED: ${{ secrets[inputs.seed_secret_name] }}
           WS_URL_SECRET: ${{ secrets[inputs.ws_url_secret_name] }}
           WS_URL_INPUT: ${{ inputs.target_ws_url }}
@@ -351,7 +370,24 @@ jobs:
             exit 1
           fi
           missing=0
-          if [ -z "$QJANUS_TOKEN_SECRET" ]; then echo "::error::The secret '$TOKEN_SECRET_NAME' (core token secret) is empty or missing."; missing=1; fi
+          if [ -n "$SESSION_TOKENS_SECRET_NAME" ]; then
+            # pre-minted mode: a secret that is a JSON array is masked as a whole, but its elements are
+            # not masked on their own, so register every token (and its signature) before anything runs
+            if [ -z "$QJANUS_SESSION_TOKENS" ]; then
+              echo "::error::The secret '$SESSION_TOKENS_SECRET_NAME' (pre-minted session tokens) is empty or missing."; missing=1
+            elif ! printf '%s' "$QJANUS_SESSION_TOKENS" | jq -e 'type == "array" and length > 0 and all(type == "string")' > /dev/null; then
+              echo "::error::The secret '$SESSION_TOKENS_SECRET_NAME' is not a JSON array of strings."; missing=1
+            else
+              while IFS= read -r tok; do
+                echo "::add-mask::$tok"
+                echo "::add-mask::${tok#*:}"
+              done < <(printf '%s' "$QJANUS_SESSION_TOKENS" | jq -r '.[]')
+            fi
+            unset QJANUS_TOKEN_SECRET
+            export QJANUS_SESSION_TOKENS
+          elif [ -z "$QJANUS_TOKEN_SECRET" ]; then
+            echo "::error::The secret '$TOKEN_SECRET_NAME' (core token secret) is empty or missing."; missing=1
+          fi
           if [ -z "$QJANUS_LOADTEST_SEED" ]; then echo "::error::The secret '$SEED_SECRET_NAME' (id seed) is empty or missing."; missing=1; fi
           [ "$missing" = 0 ] || exit 1
 

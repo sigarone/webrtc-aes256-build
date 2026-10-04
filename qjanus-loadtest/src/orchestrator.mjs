@@ -58,6 +58,12 @@ function raceTimeout(promise, ms) {
 // Adapters to src/token.mjs, src/ids.mjs and src/janus-admin.mjs, loaded lazily
 // so the orchestrator can be tested without them.
 async function defaultMintToken(cfg) {
+  if (cfg.secrets.sessionTokens) {
+    // Pre-minted mode: one token per bot, minted on the node. Bot (room k, member i) gets
+    // sessionTokens[k * roomSize + i]; config.mjs checked that the list covers every room of the ramp.
+    const { sessionTokens } = cfg.secrets;
+    return (plan, index) => sessionTokens[plan.k * cfg.roomSize + index];
+  }
   const { mintSessionToken } = await import('./token.mjs');
   return () => mintSessionToken({ secret: cfg.secrets.tokenSecret, ttlSec: cfg.token.ttlSec, nonce: true });
 }
@@ -331,7 +337,8 @@ class ShardRun {
         await this.pollOnce(ctx);
         nextPollAt = this.d.now() + POLL_INTERVAL_MS;
       }
-      if (this.d.now() - this.lastRefreshMs >= cfg.token.refreshSec * 1000) await this.refreshTokens();
+      // pre-minted tokens are fixed per bot (they outlive the run, config.mjs): nothing to refresh
+      if (!cfg.token.preminted && this.d.now() - this.lastRefreshMs >= cfg.token.refreshSec * 1000) await this.refreshTokens();
       const wake = Math.min(next < queue.length ? tStart + next * gapMs : Infinity, nextPollAt, tEnd);
       await this.sleep(Math.max(0, wake - this.d.now()));
     }
@@ -350,7 +357,7 @@ class ShardRun {
     this.bots.set(id, rec);
     ctx.newBotIds.push(id);
     try {
-      const sessionToken = await this.d.mintToken();
+      const sessionToken = await this.d.mintToken(plan, index);
       await this.host.startBot(buildBotConfig({ cfg: this.cfg, plan, index, sessionToken }));
       rec.started = true;
       rec.status = { id, state: 'init', error: null, timings: {}, peers: null, transport: { pub: null, sub: null }, tot: null };

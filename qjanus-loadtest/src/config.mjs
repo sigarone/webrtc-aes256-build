@@ -50,6 +50,9 @@ export const DEFAULTS = {
   // ML-KEM DTLS (Chromium <= 148 needs the trial) + all simulcast layers even for small captures
   fieldTrials: 'WebRTC-EnableDtlsPqc/Enabled/WebRTC-LegacySimulcastLayerLimit/Disabled/',
   tokenSecretEnv: 'QJANUS_TOKEN_SECRET',
+  sessionTokensEnv: 'QJANUS_SESSION_TOKENS',
+  // pre-minted tokens must outlive the planned run by this much (seconds)
+  sessionTokenMarginSec: 120,
   seedEnv: 'QJANUS_LOADTEST_SEED',
   adminKeyEnv: 'QJANUS_ADMIN_KEY',
 };
@@ -58,6 +61,8 @@ const OPTIONS = {
   'ws-url': { type: 'string' },
   'token-secret-env': { type: 'string' },
   'token-secret-file': { type: 'string' },
+  'session-tokens-env': { type: 'string' },
+  'session-tokens-file': { type: 'string' },
   'seed-env': { type: 'string' },
   'seed-file': { type: 'string' },
   scenario: { type: 'string' },
@@ -159,6 +164,44 @@ function readSecret(values, env, what, defaultEnv) {
   const v = env[name];
   if (!v) throw new ConfigError(`missing environment variable ${name}`);
   return v;
+}
+
+/** One Janus core session token as token.mjs mints it: "<expiry>,janus[,<plugin>...]:<base64>". */
+const SESSION_TOKEN_RE = /^(\d{1,12}),janus(?:,[^\s,:]+)*:[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Pre-minted session tokens ("pre-minted" mode): a JSON array of strings, one per bot, minted
+ * elsewhere (on the node itself) so the core token secret never reaches this process. Read from
+ * --session-tokens-file, else from the environment variable named by --session-tokens-env.
+ * Returns null when neither is given (HMAC mode with the token secret). Errors name the flag only.
+ */
+function readSessionTokens(values, env) {
+  let raw;
+  const file = values['session-tokens-file'];
+  if (file) {
+    try {
+      raw = readFileSync(file, 'utf8');
+    } catch {
+      throw new ConfigError('cannot read a value from --session-tokens-file');
+    }
+  } else {
+    raw = env[envName(values, 'session-tokens-env', DEFAULTS.sessionTokensEnv)];
+  }
+  if (raw === undefined || raw.trim() === '') return null;
+  const bad = new ConfigError('invalid session tokens (expected a JSON array of Janus session token strings)');
+  let list;
+  try {
+    list = JSON.parse(raw);
+  } catch {
+    throw bad;
+  }
+  if (!Array.isArray(list) || list.length === 0 || !list.every((t) => typeof t === 'string' && SESSION_TOKEN_RE.test(t))) throw bad;
+  return list;
+}
+
+/** Expiry (unix seconds) of a session token, as Janus reads it (the first field). */
+export function sessionTokenExpiry(token) {
+  return Number.parseInt(String(token).split(',', 1)[0], 10) || 0;
 }
 
 function readUrl(values, env, flag, envVar, protocols) {
@@ -281,9 +324,12 @@ function buildLoadConfig(command, values, env, now) {
   const scenario = enumOpt(values, 'scenario', DEFAULTS.scenario, Object.keys(SCENARIOS));
   const roomSize = SCENARIOS[scenario].roomSize;
 
+  // Pre-minted mode (tokens given): the core token secret is neither needed nor read.
+  const sessionTokens = readSessionTokens(values, env);
   const secrets = {
     wsUrl: readUrl(values, env, 'ws-url', 'QJANUS_WS_URL', ['ws:', 'wss:']),
-    tokenSecret: readSecret(values, env, 'token-secret', DEFAULTS.tokenSecretEnv),
+    tokenSecret: sessionTokens ? null : readSecret(values, env, 'token-secret', DEFAULTS.tokenSecretEnv),
+    sessionTokens,
     seed: readSecret(values, env, 'seed', DEFAULTS.seedEnv),
     adminUrl: null,
     adminKey: null,
@@ -291,6 +337,9 @@ function buildLoadConfig(command, values, env, now) {
     dtlsFingerprint: readFingerprint(values, env),
   };
   const manageRooms = values['manage-rooms'] === true;
+  if (manageRooms && sessionTokens) {
+    throw new ConfigError('--manage-rooms needs the token secret and cannot be combined with pre-minted session tokens');
+  }
   if (manageRooms) {
     secrets.adminUrl = readUrl(values, env, 'admin-url', 'QJANUS_ADMIN_URL', ['http:', 'https:']);
     secrets.adminKey = readSecret(values, env, 'admin-key', DEFAULTS.adminKeyEnv);
@@ -360,7 +409,7 @@ function buildLoadConfig(command, values, env, now) {
       breachWindows: numOpt(values, 'breach-windows', DEFAULTS.breachWindows, { min: 1, int: true }),
       joinFailPct: numOpt(values, 'join-fail-limit-pct', DEFAULTS.joinFailLimitPct, { min: 0 }),
     },
-    token: { ttlSec: tokenTtlSec, refreshSec: tokenRefreshSec },
+    token: { ttlSec: tokenTtlSec, refreshSec: tokenRefreshSec, preminted: false },
     fieldTrials: values['field-trials'] ?? DEFAULTS.fieldTrials,
     chromiumArgs: values['chromium-arg'] ?? [],
     chromiumPath: values['chromium-path'] ?? null,
@@ -373,6 +422,23 @@ function buildLoadConfig(command, values, env, now) {
   };
   if (cfg.cpu.file && cfg.cpu.cmd) throw new ConfigError('use either --cpu-file or --cpu-cmd, not both');
   cfg.schedule = buildSchedule({ ks, roomSize, shard, joinRate, settleSec, holdSec });
+  if (sessionTokens) {
+    // bot (room k, member i) uses sessionTokens[k * roomSize + i]: all rooms the ramp can reach need one
+    const needed = ks[ks.length - 1] * roomSize;
+    if (sessionTokens.length < needed) {
+      throw new ConfigError(`not enough pre-minted session tokens: ${needed} needed for ${ks[ks.length - 1]} room(s) of ${roomSize}, ${sessionTokens.length} given`);
+    }
+    // A token is checked on EVERY request, so it must outlive the whole run (no refresh in this mode).
+    const nowMs = now().getTime();
+    const endMs = Math.max(nowMs, startAtRaw === null ? 0 : startAtRaw * 1000) + cfg.schedule.totalSec * 1000;
+    const minExpiry = Math.min(...sessionTokens.slice(0, needed).map(sessionTokenExpiry));
+    if (minExpiry * 1000 < endMs + DEFAULTS.sessionTokenMarginSec * 1000) {
+      throw new ConfigError('pre-minted session tokens expire before the planned end of the run (mint them with a longer lifetime or shorten the run)');
+    }
+    cfg.token.preminted = true;
+    cfg.token.count = sessionTokens.length;
+    cfg.token.minExpiresInSec = Math.floor(minExpiry - nowMs / 1000);
+  }
   return cfg;
 }
 
@@ -471,7 +537,7 @@ export function redactedConfig(cfg) {
 export function scrubSecrets(text, cfg) {
   let out = String(text ?? '');
   const s = (cfg && cfg.secrets) || {};
-  const known = [s.tokenSecret, s.seed, s.adminKey, s.wsUrl, s.adminUrl];
+  const known = [s.tokenSecret, s.seed, s.adminKey, s.wsUrl, s.adminUrl, ...(s.sessionTokens || [])];
   for (const ice of s.iceServers || []) known.push(ice.username, ice.credential);
   for (const v of known) {
     if (typeof v === 'string' && v.length >= 6) out = out.split(v).join('<redacted>');
