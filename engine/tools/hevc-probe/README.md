@@ -224,7 +224,10 @@ An MFT that a variant other than `default` returned and `default` did not is lis
 flags: `mft_class` is `store_flag_only` when only variants with the store flag returned it,
 `needs_other_flags` when a variant without it did. `default_mfts_missing_with_store_flag` lists
 default MFTs that the store flag variant did not return, in case the flag restricts instead of
-adds. Every MFT also carries `returned_by`, the variants that returned it.
+adds. Every MFT also carries `returned_by`, the variants that returned it. In the two `unfiltered_all*`
+variants the hardware, async and sync flags of an MFT come only from the MFT's own flag
+attribute (`MF_TRANSFORM_FLAGS_Attribute`), because one query returns all three kinds; in the
+other two they also follow the query that returned it.
 
 How to read it on the lab PC when the HEVC decoder count is 0:
 
@@ -262,10 +265,14 @@ every DXGI adapter the probe makes a D3D11 device with `D3D11_CREATE_DEVICE_VIDE
   [CreateVideoDecoder](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11videodevice-createvideodecoder))
 - A profile is `ok` when it is listed, its native output format is supported, a 1080p decoder
   configuration exists and the decoder object could be made; otherwise `failed` with
-  `failed_stage` (`profile_not_listed`, `output_format_nv12_not_supported`,
-  `output_format_p010_not_supported`, `no_decoder_config_1080p`, `get_config`,
-  `create_decoder`), `hresult` and `reason`. An adapter is `failed` when its D3D11 device or video
-  device could not be made (`create_d3d_device`, `query_video_device`), and `not_attempted` for a
+  `failed_stage` (`profile_not_listed`; `output_format_nv12_not_supported` or
+  `output_format_p010_not_supported` when `CheckVideoDecoderFormat` answered FALSE, and
+  `check_video_decoder_format` when the call itself failed; `no_decoder_config_1080p` when
+  `GetVideoDecoderConfigCount` returned 0, and `get_decoder_config_count` when the call failed;
+  `get_config` or `create_decoder` for the decoder object), `hresult` and `reason`: a call that
+  failed is never reported as a clean "no". An adapter is `failed` when its D3D11 device or video
+  device could not be made (`create_d3d_device`, `query_video_device`) or its profile list could
+  not be read completely (`list_profiles`), and `not_attempted` for a
   software adapter that was not asked, or a software adapter without a video device.
 - The summary values `d3d11va_decode_supported` and `d3d11va_main10_decode_supported` (see the
   table above) fold this into one tri-state value for the codec, with `..._by_adapter` per adapter.

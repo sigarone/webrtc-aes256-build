@@ -261,6 +261,7 @@ jobs:
           if (-not $c.output_formats.NV12.supported -or $c.output_formats.P010.supported) { throw 'HEVC_VLD_MAIN output formats' }
           $c = Check 'HEVC_VLD_MAIN10'
           if ($c.status -ne 'failed' -or $c.failed_stage -ne 'output_format_p010_not_supported' -or -not $c.listed -or $c.decoder_object.status -ne 'not_attempted') { throw 'HEVC_VLD_MAIN10 should fail on its native P010 format and not make a decoder object' }
+          if ($c.reason -notmatch 'answered FALSE') { throw "a clean no must say so: $($c.reason)" }
           $c = Check 'VP9_VLD_PROFILE0'
           if ($c.status -ne 'failed' -or $c.failed_stage -ne 'no_decoder_config_1080p' -or $c.decoder_object.status -ne 'not_attempted') { throw 'VP9_VLD_PROFILE0 should fail on the missing 1080p configuration' }
           $c = Check 'VP9_VLD_10BIT_PROFILE2'
@@ -268,6 +269,18 @@ jobs:
           if ($null -ne $c.output_formats.NV12.supported -or $null -ne $c.decoder_config_count.'1920x1080'.count) { throw 'an unlisted profile must not be asked anything else (the answers are null)' }
           $c = Check 'AV1_VLD_PROFILE0'
           if ($c.status -ne 'failed' -or $c.failed_stage -ne 'create_decoder' -or $c.hresult -ne '0x8007000E' -or @($c.decoder_object.tries).Count -ne 2) { throw 'AV1_VLD_PROFILE0 should fail at the decoder object after two tries' }
+          if ($c.reason -notmatch '^CreateVideoDecoder failed') { throw "AV1 reason: $($c.reason)" }
+          # The same checks when the calls themselves fail (a failed call is not a clean "no").
+          function CheckB($name) { $c = @($r.checked_calls_fail | Where-Object { $_.profile -eq $name }); if ($c.Count -ne 1) { throw "no check_b for $name" }; return $c[0] }
+          if (@($r.checked_calls_fail).Count -ne 6) { throw 'the six profiles are checked in the second scenario' }
+          if ((CheckB 'H264_VLD_NOFGT').status -ne 'ok' -or (CheckB 'HEVC_VLD_MAIN').status -ne 'ok') { throw 'second scenario: H264 and HEVC main are ok' }
+          $c = CheckB 'HEVC_VLD_MAIN10'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'check_video_decoder_format' -or $c.hresult -ne '0x80004005' -or $c.reason -notmatch '^CheckVideoDecoderFormat failed') { throw "a failing CheckVideoDecoderFormat call is not a clean no: $($c.failed_stage) $($c.hresult) $($c.reason)" }
+          $c = CheckB 'VP9_VLD_PROFILE0'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'get_decoder_config_count' -or $c.hresult -ne '0x8007000E' -or $c.reason -notmatch '^GetVideoDecoderConfigCount failed') { throw "a failing GetVideoDecoderConfigCount call is not zero configurations: $($c.failed_stage) $($c.hresult)" }
+          $c = CheckB 'AV1_VLD_PROFILE0'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'get_config' -or $c.hresult -ne '0x80070057' -or $c.reason -notmatch '^GetVideoDecoderConfig failed' -or @($c.decoder_object.tries).Count -ne 2) { throw "a failing GetVideoDecoderConfig call is blamed on get_config: $($c.failed_stage) $($c.hresult) $($c.reason)" }
+          if ((CheckB 'VP9_VLD_10BIT_PROFILE2').failed_stage -ne 'profile_not_listed') { throw 'second scenario: VP9 profile 2 is not listed' }
           # Verdicts: a software adapter never counts; a failed hardware adapter is a failure; nothing asked is not_attempted.
           function Verdict($case) { $v = @($r.verdict_cases | Where-Object { $_.case -eq $case }); if ($v.Count -ne 1) { throw "no verdict case $case" }; return $v[0] }
           $v = Verdict 'a_hardware_ok_and_hardware_failed'
@@ -314,10 +327,15 @@ jobs:
           if ($v.status -ne 'failed' -or $v.reason -notmatch '0x80070005') { throw 'activation a: a refused activation is a failure that names the HRESULT' }
           $v = Act 'b_refused_and_created'
           if ($v.status -ne 'ok') { throw 'activation b: one activation that worked makes it ok' }
-          foreach ($c in 'c_only_default_ones', 'd_never_reached_activate', 'e_other_class_refused') {
+          foreach ($c in 'c_only_default_ones', 'e_other_class_refused') {
             $v = Act $c
-            if ($v.status -ne 'not_attempted' -or $v.reason -ne 'none was returned') { throw "activation $c must be not_attempted: $($v.status)" }
+            if ($v.status -ne 'not_attempted' -or $v.reason -ne 'none was returned') { throw "activation $c must be not_attempted with the none reason: $($v.status) $($v.reason)" }
           }
+          # Returned and selected, but an earlier step stopped the attempt: not "none was returned", and not a refusal.
+          $v = Act 'd_never_reached_activate'
+          if ($v.status -ne 'not_attempted' -or $v.reason -notmatch 'ActivateObject was not reached \(the last step was create_d3d_device 0x80004005\)') { throw "activation d: $($v.status) $($v.reason)" }
+          $v = Act 'f_two_refusals'
+          if ($v.status -ne 'failed' -or $v.reason -notmatch '0x80070005.*0x80004002|0x80004002.*0x80070005') { throw "activation f must keep every refusal: $($v.reason)" }
           # Package full names.
           $pk = @($r.package_name_cases)
           if ($pk.Count -ne 5) { throw 'package_name_cases' }
@@ -639,6 +657,9 @@ jobs:
           if ($r.declares_hevc_video_decoder -or -not $r.declares_hevc_video_encoder) { throw 'an encoder-only package must not declare a decoder' }
           $r = Get-MediaCodecsFromManifest (Manifest (Codec 'H264Dec' 'videoDecoder' $h264 ''))
           if ($r.declares_hevc_video_decoder -or $r.declares_hevc_video_encoder) { throw 'a decoder for another codec must not count' }
+          # A subtype written with braces and in upper case is the same GUID.
+          $r = Get-MediaCodecsFromManifest (Manifest (Codec 'BraceDec' 'videoDecoder' ('{' + $hevc.ToUpperInvariant() + '}') ''))
+          if (-not $r.declares_hevc_video_decoder) { throw 'a subtype with braces must still be recognised' }
           $r = Get-MediaCodecsFromManifest (Manifest '')
           if (@($r.media_codecs).Count -ne 0 -or $r.declares_hevc_video_decoder -or $r.declares_hevc_video_encoder) { throw 'a manifest without a codec extension must declare nothing' }
           Write-Host 'manifest fixtures ok'

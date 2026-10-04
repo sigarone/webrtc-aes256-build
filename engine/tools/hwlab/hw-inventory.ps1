@@ -449,12 +449,12 @@ function Get-MediaCodecsFromManifest($Manifest) {
     $seen[$key] = $true
     $inHevc = $false
     foreach ($t in @($n.SelectNodes(".//*[local-name()='InputType']"))) {
-      $sub = ([string]$t.GetAttribute('SubType')).ToLowerInvariant()
+      $sub = ([string]$t.GetAttribute('SubType')).Trim('{', '}').ToLowerInvariant()
       if ($sub -eq $hevc -or $sub -eq $hevcEs) { $inHevc = $true }
     }
     $outHevc = $false
     foreach ($t in @($n.SelectNodes(".//*[local-name()='OutputType']"))) {
-      $sub = ([string]$t.GetAttribute('SubType')).ToLowerInvariant()
+      $sub = ([string]$t.GetAttribute('SubType')).Trim('{', '}').ToLowerInvariant()
       if ($sub -eq $hevc -or $sub -eq $hevcEs) { $outHevc = $true }
     }
     if ($cat -eq 'videoDecoder' -and $inHevc) { $dec = $true }

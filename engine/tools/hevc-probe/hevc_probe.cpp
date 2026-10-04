@@ -475,6 +475,7 @@ std::vector<MftInfo> EnumMfts(const GUID& category, const GUID& subtype, bool su
       if (errors) (*errors)[q.label] = HrStr(hr);
       continue;
     }
+    if (!acts) n = 0;  // a count without an array: nothing to read
     for (UINT32 i = 0; i < n; ++i) {
       // The activation objects are only read here and released; every test
       // enumerates again and gets an activation object of its own.
@@ -547,6 +548,7 @@ ComPtr<IMFActivate> FreshActivate(const MftInfo& mi, HRESULT* hr_out) {
       last = hr;
       continue;
     }
+    if (!acts) n = 0;
     for (UINT32 i = 0; i < n; ++i) {
       ComPtr<IMFActivate> a;
       a.Attach(acts[i]);
@@ -1649,20 +1651,37 @@ void CheckProfile(ID3D11VideoDevice* vd, const VaProfileDef& def, const std::vec
   ask_config(kVaWidth1080, kVaHeight1080, &c->cfg1080);
   ask_config(kVaWidth2160, kVaHeight2160, &c->cfg2160);
 
+  // A call that failed is not the same answer as a clean "no": the stage and the reason say which.
   const VaFormat& native_fmt = def.ten_bit ? c->p010 : c->nv12;
+  const char* const native_name = def.ten_bit ? "P010" : "NV12";
+  if (FAILED(native_fmt.hr)) {
+    c->outcome = Outcome::kFailed;
+    c->stage = "check_video_decoder_format";
+    c->hr = native_fmt.hr;
+    c->reason = std::string("CheckVideoDecoderFormat failed for the native output format ") + native_name +
+                " although the profile is listed";
+    return;
+  }
   if (!native_fmt.supported) {
     c->outcome = Outcome::kFailed;
     c->stage = def.ten_bit ? "output_format_p010_not_supported" : "output_format_nv12_not_supported";
-    c->hr = FAILED(native_fmt.hr) ? native_fmt.hr : E_FAIL;
-    c->reason = std::string("the driver does not support the native output format ") +
-                (def.ten_bit ? "P010" : "NV12") + " for this profile (CheckVideoDecoderFormat)";
+    c->hr = E_FAIL;
+    c->reason = std::string("the driver does not support the native output format ") + native_name +
+                " for this profile (CheckVideoDecoderFormat answered FALSE)";
     return;
   }
-  if (FAILED(c->cfg1080.hr) || c->cfg1080.count == 0) {
+  if (FAILED(c->cfg1080.hr)) {
+    c->outcome = Outcome::kFailed;
+    c->stage = "get_decoder_config_count";
+    c->hr = c->cfg1080.hr;
+    c->reason = "GetVideoDecoderConfigCount failed at 1920x1080";
+    return;
+  }
+  if (c->cfg1080.count == 0) {
     c->outcome = Outcome::kFailed;
     c->stage = "no_decoder_config_1080p";
-    c->hr = FAILED(c->cfg1080.hr) ? c->cfg1080.hr : E_FAIL;
-    c->reason = "no decoder configuration for 1920x1080 (GetVideoDecoderConfigCount)";
+    c->hr = E_FAIL;
+    c->reason = "no decoder configuration for 1920x1080 (GetVideoDecoderConfigCount returned 0)";
     return;
   }
 
@@ -1693,7 +1712,8 @@ void CheckProfile(ID3D11VideoDevice* vd, const VaProfileDef& def, const std::vec
     c->outcome = Outcome::kFailed;
     c->stage = c->tries.back().stage;
     c->hr = c->tries.back().hr;
-    c->reason = "the decoder object could not be created (tried " + std::to_string(c->tries.size()) +
+    c->reason = std::string(c->stage == "get_config" ? "GetVideoDecoderConfig" : "CreateVideoDecoder") +
+                " failed, the decoder object could not be made (tried " + std::to_string(c->tries.size()) +
                 " size(s))";
     return;
   }
@@ -1767,6 +1787,7 @@ Attempt<VaAdapterResult> DoVaAdapter(const AdapterInfo& want, bool warp_stand_in
   }
 
   v.profile_count = vd->GetVideoDecoderProfileCount();
+  HRESULT list_hr = S_OK;
   for (UINT i = 0; i < v.profile_count; ++i) {
     GUID g{};
     HRESULT h = vd->GetVideoDecoderProfile(i, &g);
@@ -1774,9 +1795,12 @@ Attempt<VaAdapterResult> DoVaAdapter(const AdapterInfo& want, bool warp_stand_in
       v.profiles.push_back(g);
     } else {
       r.notes.push_back("GetVideoDecoderProfile(" + std::to_string(i) + ") " + HrStr(h));
+      if (SUCCEEDED(list_hr)) list_hr = h;
     }
   }
-  r.Step("list_profiles", S_OK);
+  // A profile list with a hole would report the missing profile as "not listed": the adapter's
+  // answer is then a failure, not a capability report.
+  if (!r.Check("list_profiles", list_hr)) return a;
   for (const VaProfileDef& def : kVaProfiles) {
     if (!def.probed) continue;
     VaProfileCheck c;
@@ -1984,6 +2008,7 @@ PackageHit ParsePackageFullName(const std::string& full, const std::vector<std::
 bool ScanPackageNames(const std::string& needle_lower, const std::vector<std::string>& known_families,
                       std::vector<PackageHit>* out, LONG* rc) {
   *rc = ERROR_SUCCESS;
+  out->clear();
   HKEY key = nullptr;
   LONG r = RegOpenKeyExW(HKEY_CURRENT_USER,
                          L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\"
@@ -1999,7 +2024,12 @@ bool ScanPackageNames(const std::string& needle_lower, const std::vector<std::st
     DWORD n = ARRAYSIZE(name);
     const LONG e = RegEnumKeyExW(key, i, name, &n, nullptr, nullptr, nullptr, nullptr);
     if (e == ERROR_NO_MORE_ITEMS) break;
-    if (e == ERROR_MORE_DATA) continue;  // longer than any package full name
+    if (e == ERROR_MORE_DATA) {
+      // Longer than a package full name can be (127 characters), but it was not read: say so.
+      *rc = e;
+      complete = false;
+      continue;
+    }
     if (e != ERROR_SUCCESS) {
       *rc = e;
       complete = false;
@@ -2591,6 +2621,8 @@ Verdict VaVerdict(const std::vector<VaAdapterResult>& va, const char* profile) {
     } else if (const VaProfileCheck* c = FindCheck(v, profile)) {
       if (c->outcome == Outcome::kOk) {
         ++ok;
+      } else if (c->outcome == Outcome::kNotAttempted) {
+        na.push_back(who + ": the profile was not checked");
       } else {
         failed.push_back(who + ": " + c->reason + " [" + c->stage + "]");
       }
@@ -2643,8 +2675,8 @@ void WriteVaByAdapter(Json& j, const std::vector<VaAdapterResult>& va, const cha
 // when every one that was reached was refused, not_attempted when none was returned.
 Verdict ActivationVerdict(const std::vector<TestResult>& tests, const std::string& mft_class,
                           const std::string& none_reason) {
-  int ok = 0, refused = 0;
-  std::string why;
+  int ok = 0;
+  std::vector<std::string> refused, unreached;
   for (const TestResult& t : tests) {
     if (t.role != "decode" || t.mft_class != mft_class) continue;
     bool reached = false;
@@ -2655,16 +2687,35 @@ Verdict ActivationVerdict(const std::vector<TestResult>& tests, const std::strin
         ah = st.hr;
       }
     }
-    if (!reached) continue;
+    if (!reached) {
+      // Returned and selected for a test, but an earlier step (no D3D11 adapter, a device that could
+      // not be made, a fresh enumeration that did not find it again) stopped the attempt: that is not
+      // "none was returned", and it is not a refusal either.
+      std::string why = t.mft + ": ActivateObject was not reached (";
+      if (t.outcome == Outcome::kNotAttempted) {
+        why += t.reason;
+      } else if (t.steps.empty()) {
+        why += "no step was recorded";
+      } else {
+        why += "the last step was " + t.steps.back().stage + " " + HrStr(t.steps.back().hr);
+      }
+      unreached.push_back(why + ")");
+      continue;
+    }
     if (SUCCEEDED(ah)) {
       ++ok;
     } else {
-      ++refused;
-      why = t.mft + ": ActivateObject was refused, " + HrStr(ah);
+      refused.push_back(t.mft + ": ActivateObject was refused, " + HrStr(ah));
     }
   }
+  auto join = [](const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& x : v) s += (s.empty() ? "" : "; ") + x;
+    return s;
+  };
   if (ok) return {"ok", std::string()};
-  if (refused) return {"failed", why};
+  if (!refused.empty()) return {"failed", join(refused)};
+  if (!unreached.empty()) return {"not_attempted", join(unreached)};
   return {"not_attempted", none_reason};
 }
 
@@ -2723,6 +2774,8 @@ struct MockProfile {
   HRESULT config_hr;    // GetVideoDecoderConfig
   HRESULT create_1080;  // CreateVideoDecoder at 1920x1080
   HRESULT create_1088;  // CreateVideoDecoder at 1920x1088
+  HRESULT format_hr = S_OK;  // CheckVideoDecoderFormat (the call itself)
+  HRESULT count_hr = S_OK;   // GetVideoDecoderConfigCount (the call itself)
 };
 
 class MockVideoDevice : public ID3D11VideoDevice {
@@ -2795,6 +2848,7 @@ class MockVideoDevice : public ID3D11VideoDevice {
     if (!g || !ok) return E_POINTER;
     const MockProfile* p = Find(*g);
     if (!p) return E_INVALIDARG;  // per docs: a profile the driver does not support
+    if (FAILED(p->format_hr)) return p->format_hr;
     *ok = (f == DXGI_FORMAT_NV12 && p->nv12) || (f == DXGI_FORMAT_P010 && p->p010);
     return S_OK;
   }
@@ -2802,6 +2856,7 @@ class MockVideoDevice : public ID3D11VideoDevice {
     if (!d || !n) return E_POINTER;
     const MockProfile* p = Find(d->Guid);
     if (!p) return E_INVALIDARG;
+    if (FAILED(p->count_hr)) return p->count_hr;
     *n = d->SampleWidth >= 3840 ? p->cfg2160 : p->cfg1080;
     return S_OK;
   }
@@ -2868,6 +2923,31 @@ std::string VaLogicSelfTest() {
     checks.push_back(std::move(c));
   }
 
+  // A second scripted device: the calls themselves fail (not a clean "no").
+  MockVideoDevice dev_b;
+  dev_b.profiles = {
+      {VaGuid("H264_VLD_NOFGT"), true, false, 1, 1, S_OK, S_OK, S_OK},
+      {VaGuid("HEVC_VLD_MAIN"), true, false, 1, 1, S_OK, S_OK, S_OK},
+      // CheckVideoDecoderFormat itself fails although the profile is listed
+      {VaGuid("HEVC_VLD_MAIN10"), true, true, 1, 1, S_OK, S_OK, S_OK, E_FAIL, S_OK},
+      // GetVideoDecoderConfigCount itself fails
+      {VaGuid("VP9_VLD_PROFILE0"), true, false, 1, 1, S_OK, S_OK, S_OK, S_OK, E_OUTOFMEMORY},
+      // GetVideoDecoderConfig itself fails (the counts say there is a configuration)
+      {VaGuid("AV1_VLD_PROFILE0"), true, false, 1, 1, E_INVALIDARG, S_OK, S_OK},
+  };
+  std::vector<GUID> listed_b;
+  for (UINT i = 0; i < dev_b.GetVideoDecoderProfileCount(); ++i) {
+    GUID g{};
+    if (SUCCEEDED(dev_b.GetVideoDecoderProfile(i, &g))) listed_b.push_back(g);
+  }
+  std::vector<VaProfileCheck> checks_b;
+  for (const VaProfileDef& def : kVaProfiles) {
+    if (!def.probed) continue;
+    VaProfileCheck c;
+    CheckProfile(&dev_b, def, listed_b, &c);
+    checks_b.push_back(std::move(c));
+  }
+
   auto adapter = [&](const char* name, unsigned vendor, bool software, Outcome outcome) {
     VaAdapterResult v;
     v.adapter.description = name;
@@ -2903,6 +2983,10 @@ std::string VaLogicSelfTest() {
   for (const VaProfileCheck& c : checks) WriteVaCheck(j, c);
   j.EndArray();
   j.KvI("mock_decoder_objects_left", g_mock_decoders_alive.load());
+  j.Key("checked_calls_fail");
+  j.BeginArray();
+  for (const VaProfileCheck& c : checks_b) WriteVaCheck(j, c);
+  j.EndArray();
 
   // The classification of the MFTs that only a non-default enumeration returns, on fabricated
   // variants: default {A, E}, store flag {A, B}, unfiltered {A, C, E}, unfiltered with the store flag
@@ -2953,6 +3037,7 @@ std::string VaLogicSelfTest() {
       {"c_only_default_ones", {decode_test("default", {E_ACCESSDENIED}), decode_test("default", {S_OK})}},
       {"d_never_reached_activate", {not_reached}},
       {"e_other_class_refused", {decode_test("needs_other_flags", {E_ACCESSDENIED})}},
+      {"f_two_refusals", {decode_test("store_flag_only", {E_ACCESSDENIED}), decode_test("store_flag_only", {E_NOINTERFACE})}},
   };
   j.Key("activation_cases");
   j.BeginArray();
