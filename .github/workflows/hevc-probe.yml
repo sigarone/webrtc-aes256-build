@@ -166,10 +166,13 @@ jobs:
             if ($t.gpu_path) { throw "self-test: a decode on the software adapter $($t.adapter.description) was counted as a GPU decode" }
           }
           if (@($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0 -and $s.h264_dxva_decode_720p_status -eq 'ok') { throw 'self-test: a software adapter was counted as a GPU decode' }
-          # With --ci the D3D11 decode path must actually have run (WARP when the VM has no usable adapter).
-          $ran = @($d3d | Where-Object { $_.status -ne 'not_attempted' -and $_.d3d11_manager })
-          Write-Host ("D3D11 decode attempts with a manager set: " + $ran.Count)
-          if ($ran.Count -eq 0) { throw 'self-test: no decode attempt got as far as setting the D3D11 manager on the MFT' }
+          # With --ci the D3D11 decode path must actually have run, up to the call that gives the D3D
+          # manager to the MFT (on the WARP software rasterizer, which has no video support, the
+          # in-box decoder may refuse it: that is a reported failure at that step, not a skipped one).
+          $ran = @($d3d | Where-Object { @($_.steps | Where-Object { $_.stage -eq 'set_d3d_manager' }).Count -gt 0 })
+          Write-Host ("D3D11 decode attempts that reached set_d3d_manager: " + $ran.Count)
+          $d3d | ForEach-Object { Write-Host ("  {0} {1}: {2}" -f $_.mft, $_.resolution, ((@($_.steps) | ForEach-Object { "{0}={1}" -f $_.stage, $_.hresult }) -join ' ')) }
+          if ($ran.Count -eq 0) { throw 'self-test: no decode attempt got as far as the set_d3d_manager call' }
 
       - name: 1080p alone, and 720p alone (attempts independent of each other)
         shell: pwsh
@@ -317,6 +320,12 @@ jobs:
             if ($plan.IndexOf("/$tag/$f") -lt 0) { throw "the plan does not list $f" }
           }
           if (Test-Path (Join-Path $work 'webrtc-fetch')) { throw 'plan mode created the fetch folder' }
+          # Not in plan mode, and without -AllowDownload: the script must still refuse to download
+          # (exit 10) and must create nothing, neither a fetch folder, a build folder nor a report.
+          $work2 = Join-Path $env:RUNNER_TEMP 'lab-gate'
+          powershell -NoProfile -ExecutionPolicy Bypass -File engine/tools/hwlab/engine-local-build.ps1 -RepoDir $PWD.Path -WorkDir $work2 -ReportDir (Join-Path $work2 'reports') *> (Join-Path $env:RUNNER_TEMP 'gate.txt')
+          if ($LASTEXITCODE -ne 10) { throw "without -AllowDownload the script exited with $LASTEXITCODE, expected 10 (nothing downloaded)" }
+          if (Test-Path $work2) { throw 'the download gate created files without -AllowDownload' }
           # The CLAUDE.md of the lab lists the same hosts as allowed.
           $cl = Get-Content -Raw engine/tools/hwlab/CLAUDE.md
           if ($cl.IndexOf('commondatastorage.googleapis.com') -lt 0) { throw 'CLAUDE.md does not mention the clang package host' }
