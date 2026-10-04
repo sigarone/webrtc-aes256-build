@@ -230,7 +230,7 @@ jobs:
       # The lab runs Windows PowerShell 5.1: parse with that grammar (shell: powershell).
       # A script that is not pure ASCII is read as ANSI by 5.1 when it has no BOM, so
       # non-ASCII bytes are an error.
-      - name: Parse every hwlab script with Windows PowerShell 5.1, ASCII only
+      - name: Parse every hwlab script with Windows PowerShell 5.1, ASCII only, no control characters
         shell: powershell
         run: |
           $scripts = @(Get-ChildItem -Path engine/tools/hwlab -Filter *.ps1)
@@ -245,8 +245,10 @@ jobs:
             } else {
               Write-Host ("parsed {0} (PowerShell {1})" -f $f.Name, $PSVersionTable.PSVersion)
             }
-            $nonAscii = @([System.IO.File]::ReadAllBytes($f.FullName) | Where-Object { $_ -gt 127 }).Count
-            if ($nonAscii -gt 0) { $bad++; Write-Host ("{0}: {1} non-ASCII byte(s)" -f $f.Name, $nonAscii) }
+            # Non-ASCII bytes, and control characters other than tab, line feed and carriage return
+            # (a stray backspace from a bad escape once ended up inside a path string).
+            $odd = @([System.IO.File]::ReadAllBytes($f.FullName) | Where-Object { $_ -gt 127 -or $_ -eq 127 -or ($_ -lt 32 -and $_ -ne 9 -and $_ -ne 10 -and $_ -ne 13) }).Count
+            if ($odd -gt 0) { $bad++; Write-Host ("{0}: {1} non-ASCII or control byte(s)" -f $f.Name, $odd) }
           }
           if ($bad -gt 0) { throw "$bad problem(s) in the hwlab scripts" }
 

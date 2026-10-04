@@ -319,7 +319,7 @@ function Find-VisualStudio {
 
 # Runs vcvars64.bat in a cmd.exe and copies the environment it sets into this process.
 function Import-VcVars([string]$VcVars) {
-  $r = Invoke-Capture $env:ComSpec ('/d /s /c ""' + $VcVars + '" >nul 2>&1 && set"') 120
+  $r = Invoke-Capture $env:ComSpec ('/d /s /c ""' + $VcVars + '" >nul 2>&1 && set"') 300
   if ($r.Code -ne 0) { return $false }
   $n = 0
   foreach ($line in ($r.Out -split "`r?`n")) {
@@ -515,7 +515,7 @@ try {
   }
   $null = Run-Step 'verify_pins' $cmakeExe @(('-DQMEDIA_WEBRTC_DIR=' + (ConvertTo-Slash (Join-Path $FetchDir 'release'))), ('-DQMEDIA_CLANG_ROOT=' + (ConvertTo-Slash (Join-Path $FetchDir 'clang'))), '-P', (ConvertTo-Slash $verifyScript)) 10 2
   $pinsVerified = $true
-  $clangPkg = Get-ClangPackage $pins (Join-Path $FetchDir 'releaseuild-flags.json')
+  $clangPkg = Get-ClangPackage $pins (Join-Path $FetchDir 'release\build-flags.json')
   $clangCl = Join-Path $FetchDir 'clang\bin\clang-cl.exe'
   $toolchain['clang_cl'] = Get-ToolVersion $clangCl '--version' ''
 
