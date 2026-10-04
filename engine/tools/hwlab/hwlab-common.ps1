@@ -128,8 +128,19 @@ function Test-Elevated {
 #                             that already exist.
 #
 # $null always means "could not be read", never "no".
+#
+# Besides the known families, any package registered for the current user whose name matches
+# *HEVC* is listed (hevc_named_packages_current_user), with a flag that says whether its family
+# is in the list below, so that a new variant of the extension is seen the day it appears, and
+# is not reported as "not installed" because nobody added its name yet. The families are:
+#   Microsoft.HEVCVideoExtension_8wekyb3d8bbwe              HEVC Video Extensions
+#   Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe             HEVC Video Extensions from Device Manufacturer
+#   Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe    seen on the lab PC (Windows build 26300),
+#                                                           not described in any public documentation
+#                                                           found when it was added
+# The probe (engine/tools/hevc-probe) checks the same three families; CI compares the names.
 function Get-HevcExtensionStatus {
-  $families = @('Microsoft.HEVCVideoExtension_8wekyb3d8bbwe', 'Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe')
+  $families = @('Microsoft.HEVCVideoExtension_8wekyb3d8bbwe', 'Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe', 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe')
   $names = @($families | ForEach-Object { $_.Substring(0, $_.IndexOf('_')) })
   $elevated = $false
   try {
@@ -147,6 +158,21 @@ function Get-HevcExtensionStatus {
     $current = ($found.Count -gt 0)
     foreach ($p in $found) { $currentList += ('{0} {1}' -f $p.Name, $p.Version) }
   } catch { $current = $null }
+
+  $named = $null
+  $namedNotListed = $null
+  try {
+    $named = @(Get-AppxPackage -Name '*HEVC*' -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+          name                 = [string]$_.Name
+          version              = [string]$_.Version
+          family               = [string]$_.PackageFamilyName
+          status               = [string]$_.Status
+          in_known_family_list = ($families -contains $_.PackageFamilyName)
+        }
+      })
+    $namedNotListed = @($named | Where-Object { -not $_.in_known_family_list }).Count
+  } catch { $named = $null; $namedNotListed = $null }
 
   $anyUser = $null
   if ($elevated) {
@@ -176,6 +202,8 @@ function Get-HevcExtensionStatus {
     installed                        = $current
     registered_current_user          = $current
     registered_current_user_packages = @($currentList)
+    hevc_named_packages_current_user = $named
+    hevc_named_packages_not_in_family_list = $namedNotListed
     registered_any_user              = $anyUser
     provisioned_system_image         = $prov
     elevated                         = $elevated

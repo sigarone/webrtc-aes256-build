@@ -8,8 +8,16 @@ name: hevc-probe
 #
 # The second job (hwlab-scripts) checks the scripts of the hardware lab kit
 # (engine/tools/hwlab) without installing or downloading anything: a parse check
-# with Windows PowerShell 5.1, the shared HEVC Video Extensions definition, the
-# inventory script, and the offline plan of engine-local-build.ps1.
+# with Windows PowerShell 5.1, the shared HEVC Video Extensions definition (and that the
+# probe checks the same package families), the inventory script and its reading of
+# package manifests (on fixture manifests), and the offline plan of engine-local-build.ps1.
+#
+# What the hosted runner can and cannot prove about the HEVC decoder visibility and the
+# D3D11VA checks: it has no GPU and no HEVC package, so it proves the shape of every new
+# report section, that nothing is reported ok that was not measured, that a software
+# adapter never counts, and (through the SDK header) that the decoder profile GUIDs are
+# the right ones. Whether a Store HEVC decoder is returned with MFT_ENUM_FLAG_UNTRUSTED_STOREMFT,
+# and what the GPU of the lab offers through D3D11VA, is measured on the lab PC.
 
 on:
   workflow_dispatch:
@@ -71,6 +79,7 @@ jobs:
       - name: Validate the HEVC report
         shell: pwsh
         run: |
+          . engine/tools/hevc-probe/ci-helpers.ps1
           $txt = Get-Content runner-report.json -Raw
           $rep = $txt | ConvertFrom-Json
           $rep.summary | Format-List
@@ -78,7 +87,7 @@ jobs:
           $rep.hevc_video_extensions | Format-List
           $rep.adapters | Format-Table description, vendor_id, dedicated_memory_mb
           if ($rep.tool.name -ne 'hevc-probe') { throw 'unexpected report' }
-          if ($rep.tool.report_version -ne 2) { throw 'unexpected report version' }
+          if ($rep.tool.report_version -ne 3) { throw 'unexpected report version' }
           # The file next to the exe must carry the same document.
           $file = Get-Content build/Release/hevc-probe-report.json -Raw
           if ($file.Trim() -ne $txt.Trim()) { throw 'stdout and report file differ' }
@@ -106,12 +115,123 @@ jobs:
             if (-not $s.reasons.$k) { throw "$k carries no reason" }
           }
           if ($s.hevc_hardware_accelerated_decode_status -eq 'ok') { throw 'unexpected hardware accelerated decode on the hosted runner' }
-          if ($s.video_send_possible) { throw 'unexpected hardware encode on the hosted runner' }
-          # The extension report names both package families and the registration scope.
+          # video_send_possible and the two like it are derived from the *_status values, and tri-state
+          # like them: a value that was not asked is never false.
+          foreach ($k in 'video_send_possible', 'video_send_1080p_possible', 'video_receive_possible') {
+            if ($s.$k -isnot [string] -or $s.$k -notin @('ok', 'failed', 'not_attempted')) { throw "$k is not tri-state: $($s.$k)" }
+          }
+          if ($s.video_send_possible -ne $s.hevc_hardware_encode_720p_status) { throw 'video_send_possible differs from hevc_hardware_encode_720p_status' }
+          if ($s.video_send_1080p_possible -ne $s.hevc_hardware_encode_1080p_status) { throw 'video_send_1080p_possible differs from hevc_hardware_encode_1080p_status' }
+          if ($s.video_send_possible -eq 'ok') { throw 'unexpected hardware encode on the hosted runner' }
+          if ($s.video_receive_possible -eq 'ok') { throw 'unexpected video receive on the hosted runner (no HEVC decoder)' }
+          # The extension report names the three package families, the registration scope, and every
+          # registered package with HEVC in its name.
           $ext = $rep.hevc_video_extensions
-          if (@($ext.family_names_checked).Count -ne 2) { throw 'the report does not name both package families' }
+          if (@($ext.family_names_checked).Count -ne 3) { throw 'the report does not name the three package families' }
+          if ($ext.family_names_checked -notcontains 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe') { throw 'the FirstParty family is not checked' }
           if ($null -eq $ext.registered_current_user) { throw 'registered_current_user is missing' }
-          if (-not $ext.provisioned_system_image) { throw 'provisioned_system_image is missing' }
+          # provisioned_system_image has the same type everywhere: null means "could not be read".
+          if (-not $ext.PSObject.Properties['provisioned_system_image']) { throw 'provisioned_system_image is missing' }
+          if ($null -ne $ext.provisioned_system_image) { throw "provisioned_system_image must be null (not read by the probe), it is: $($ext.provisioned_system_image)" }
+          if (-not $ext.provisioned_system_image_note) { throw 'provisioned_system_image_note is missing' }
+          $named = $ext.hevc_named_packages_current_user
+          if ($null -eq $named -or $named.readable -isnot [bool] -or -not $named.source) { throw 'hevc_named_packages_current_user is incomplete' }
+          if (-not $named.PSObject.Properties['packages'] -or $named.not_in_family_list_count -isnot [int]) { throw 'hevc_named_packages_current_user has no package list or count' }
+          # Why there is no decoder is said as measured: the enumerations are named, and a missing
+          # registration is not claimed while a package is registered.
+          $why = [string]$s.reasons.hevc_decode_720p_status
+          if ($why -match 'Extensions are not registered') { throw 'the old, misleading reason text is back' }
+          Write-Host "decode reason: $why"
+          $none = ($s.hevc_decoder_mft_count_default -eq 0 -and $s.hevc_decoder_mft_count_with_store_flag -le 0 -and $s.hevc_decoder_mft_count_unfiltered -le 0 -and $s.hevc_decoder_mft_count_unfiltered_with_store_flag -le 0)
+          if ($none -and $why -notmatch '^MFTEnumEx returns no HEVC decoder MFT to this process') { throw "the decode reason does not say what was measured: $why" }
+
+          # MFTEnumEx with and without MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered.
+          $st = $rep.store_mft_enumeration
+          if ($null -eq $st) { throw 'store_mft_enumeration is missing' }
+          if ($st.flag.name -ne 'MFT_ENUM_FLAG_UNTRUSTED_STOREMFT' -or $st.flag.value -ne '0x00000400') { throw 'the store flag is not named or has the wrong value' }
+          foreach ($cat in 'decoders', 'encoders') {
+            $vs = @($st.$cat.variants)
+            if ((($vs | ForEach-Object { $_.label }) -join ',') -ne 'default,store_flag,unfiltered_all,unfiltered_all_store_flag') { throw "store_mft_enumeration.$cat does not have the four variants in order" }
+            foreach ($v in $vs) {
+              foreach ($q in $v.queries.PSObject.Properties) {
+                if (($q.Value.count -isnot [int] -and $q.Value.count -isnot [long]) -or $q.Value.count -lt -1) { throw "bad count in $cat/$($v.label)/$($q.Name)" }
+                Write-Host ("{0}/{1}/{2}: flags {3}, count {4} {5}" -f $cat, $v.label, $q.Name, $q.Value.flags, $q.Value.count, $q.Value.hresult)
+              }
+              # The flags that were passed are the ones the variant says: the store bit (0x400) only in the
+              # variants that carry it, the sort-and-filter bit (0x40) only where it is set, all six
+              # selection bits (0x3F) in the "all" queries.
+              foreach ($q in $v.queries.PSObject.Properties) {
+                $f = [Convert]::ToUInt32($q.Value.flags.Substring(2), 16)
+                if ((($f -band 0x400) -ne 0) -ne [bool]$v.store_flag) { throw "store bit mismatch in $cat/$($v.label)/$($q.Name): $($q.Value.flags)" }
+                if ((($f -band 0x40) -ne 0) -ne [bool]$v.sort_and_filter) { throw "sort-and-filter bit mismatch in $cat/$($v.label)/$($q.Name): $($q.Value.flags)" }
+                if ([bool]$v.all_flags -and ($f -band 0x3F) -ne 0x3F) { throw "the all query of $cat/$($v.label) lacks a selection bit: $($q.Value.flags)" }
+              }
+            }
+            if (-not $st.$cat.PSObject.Properties['only_outside_the_default_enumeration'] -or -not $st.$cat.PSObject.Properties['default_mfts_missing_with_store_flag']) { throw "store_mft_enumeration.$cat lacks the difference lists" }
+          }
+          foreach ($k in 'hevc_decoder_mft_count_default', 'hevc_decoder_mft_count_with_store_flag', 'hevc_decoder_mft_count_unfiltered', 'hevc_decoder_mft_count_unfiltered_with_store_flag', 'hevc_encoder_mft_count_default', 'hevc_encoder_mft_count_with_store_flag') {
+            if (($s.$k -isnot [int] -and $s.$k -isnot [long]) -or $s.$k -lt -1) { throw "$k is not a count: $($s.$k)" }
+          }
+          if ($s.hevc_decoder_mft_count_default -ne 0) { throw 'the hosted runner is expected to have no HEVC decoder MFT by default' }
+          foreach ($k in 'hevc_store_mft_activation_status', 'hevc_store_mft_decode_720p_status', 'hevc_store_mft_decode_1080p_status', 'hevc_other_flags_mft_activation_status', 'hevc_other_flags_mft_decode_720p_status', 'hevc_other_flags_mft_decode_1080p_status') {
+            if ($s.$k -notin @('ok', 'failed', 'not_attempted')) { throw "$k is not tri-state: $($s.$k)" }
+            if ($s.$k -ne 'ok' -and -not $s.reasons.$k) { throw "$k carries no reason" }
+          }
+          # Nothing that was not returned may be reported as tested.
+          if (@($s.hevc_store_mft_decoders).Count -eq 0 -and $s.hevc_store_mft_decode_720p_status -ne 'not_attempted') { throw 'a store MFT decode is reported although no store MFT was returned' }
+          if (@($s.hevc_other_flags_mft_decoders).Count -eq 0 -and $s.hevc_other_flags_mft_decode_720p_status -ne 'not_attempted') { throw 'an other-flags MFT decode is reported although none was returned' }
+          if (@($rep.tests | Where-Object { $_.mft_class -ne 'default' }).Count -gt 0 -and @($s.hevc_store_mft_decoders).Count + @($s.hevc_other_flags_mft_decoders).Count -eq 0) { throw 'a test of a non-default MFT exists without a listed MFT' }
+          foreach ($t in @($rep.tests)) { if ($t.mft_class -notin @('default', 'store_flag_only', 'needs_other_flags')) { throw "bad mft_class: $($t.mft_class)" } }
+
+          # D3D11VA: what the D3D11 video device of each adapter offers, without any MFT. The hosted
+          # runner has no GPU: a software adapter is asked (--ci), run through the same code, and never counts.
+          $va = $rep.d3d11va
+          if ($null -eq $va -or -not $va.basis) { throw 'd3d11va is missing' }
+          if (@($va.profiles_checked).Count -ne 6) { throw 'd3d11va does not check the six profiles' }
+          foreach ($need in 'H264_VLD_NOFGT', 'HEVC_VLD_MAIN', 'HEVC_VLD_MAIN10', 'VP9_VLD_PROFILE0', 'VP9_VLD_10BIT_PROFILE2', 'AV1_VLD_PROFILE0') {
+            if (-not (@($va.profiles_checked) | Where-Object { $_.profile -eq $need })) { throw "d3d11va does not check $need" }
+          }
+          if (@($va.adapters).Count -lt 1) { throw 'd3d11va lists no adapter (--ci must run it on a software adapter or WARP)' }
+          Test-VaAdapters $va
+          foreach ($k in 'hevc_d3d11va_decode_supported', 'hevc_d3d11va_main10_decode_supported') {
+            if ($s.$k -notin @('ok', 'failed', 'not_attempted')) { throw "$k is not tri-state: $($s.$k)" }
+            if ($s.$k -eq 'ok' -and @($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0) { throw "$k is ok on a machine with no non-software adapter" }
+            if ($s.$k -ne 'ok' -and -not $s.reasons.$k) { throw "$k carries no reason" }
+          }
+          foreach ($k in 'hevc_d3d11va_decode_by_adapter', 'hevc_d3d11va_main10_decode_by_adapter') {
+            foreach ($a in @($s.$k)) {
+              if ($a.status -notin @('ok', 'failed', 'not_attempted')) { throw "bad status in $k" }
+              if ($a.status -eq 'ok' -and $a.software_adapter) { throw "a software adapter is reported ok in $k" }
+            }
+          }
+
+      # The decoder profile GUIDs of the probe are written out in its source (the SDK declares them as
+      # extern GUIDs that would need dxguid.lib, and the newer ones only exist in newer SDKs). Every
+      # value must be the one of d3d11.h in the Windows SDK of this runner; a profile the SDK does not
+      # know (older SDK) is skipped and said so, but the six that are checked must all be compared.
+      - name: The decoder profile GUIDs agree with the Windows SDK
+        shell: pwsh
+        run: |
+          $inc = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+          $dir = Get-ChildItem $inc -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'um\d3d11.h') } | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $dir) { throw 'no Windows SDK with d3d11.h on the runner' }
+          Write-Host "Windows SDK $($dir.Name)"
+          $text = Get-Content -Raw (Join-Path $dir.FullName 'um\d3d11.h')
+          $rep = Get-Content runner-report.json -Raw | ConvertFrom-Json
+          $compared = @()
+          foreach ($p in @($rep.d3d11va.profile_names_known)) {
+            $m = [regex]::Match($text, 'DEFINE_GUID\(\s*D3D11_DECODER_PROFILE_' + [regex]::Escape($p.profile) + '\s*,\s*([^)]*)\)')
+            if (-not $m.Success) { Write-Host "the SDK header has no D3D11_DECODER_PROFILE_$($p.profile): not compared"; continue }
+            $v = @($m.Groups[1].Value -split ',' | ForEach-Object { [Convert]::ToUInt64($_.Trim().Substring(2), 16) })
+            if ($v.Count -ne 11) { throw "unexpected DEFINE_GUID for $($p.profile)" }
+            $guid = '{0:X8}-{1:X4}-{2:X4}-{3:X2}{4:X2}-{5:X2}{6:X2}{7:X2}{8:X2}{9:X2}{10:X2}' -f $v[0], $v[1], $v[2], $v[3], $v[4], $v[5], $v[6], $v[7], $v[8], $v[9], $v[10]
+            if ($guid -ne $p.guid) { throw "profile $($p.profile): the probe has $($p.guid), the SDK has $guid" }
+            $compared += $p.profile
+          }
+          Write-Host ("compared with the SDK header: {0}" -f ($compared -join ', '))
+          foreach ($need in 'H264_VLD_NOFGT', 'HEVC_VLD_MAIN', 'HEVC_VLD_MAIN10', 'VP9_VLD_PROFILE0', 'VP9_VLD_10BIT_PROFILE2', 'AV1_VLD_PROFILE0') {
+            if ($compared -notcontains $need) { throw "the GUID of $need was not compared with the SDK (the SDK on the runner is too old, or the name is wrong)" }
+          }
 
       - name: Self-test of the encode and decode machinery (same pipeline, H.264, D3D11 on the software adapter)
         shell: pwsh
@@ -138,7 +258,43 @@ jobs:
           }
           if ($s.best_encode_fps_720p -le 0) { throw 'self-test: no encode throughput measured' }
           if (-not $s.stream_source_720p -or -not $s.stream_source_1080p) { throw 'self-test: the stream sources are not reported' }
-          if (-not $s.video_receive_possible) { throw 'self-test: video_receive_possible is false although decoding worked' }
+          if ($s.video_receive_possible -ne 'ok') { throw "self-test: video_receive_possible is $($s.video_receive_possible) although decoding worked" }
+          if ($s.video_send_possible -ne $s.h264_hardware_encode_720p_status) { throw 'self-test: video_send_possible is not derived from the hardware encode status' }
+          # MFTEnumEx with and without the store flag runs for H.264 too: the four variants, counts, and the
+          # default enumeration must still find the in-box decoder and encoder.
+          if ($s.h264_decoder_mft_count_default -lt 1 -or $s.h264_encoder_mft_count_default -lt 1) { throw 'self-test: the default enumeration finds no H.264 MFT' }
+          foreach ($k in 'h264_decoder_mft_count_with_store_flag', 'h264_decoder_mft_count_unfiltered', 'h264_decoder_mft_count_unfiltered_with_store_flag', 'h264_encoder_mft_count_with_store_flag') {
+            if (($s.$k -isnot [int] -and $s.$k -isnot [long]) -or $s.$k -lt -1) { throw "self-test: $k is not a count: $($s.$k)" }
+          }
+          foreach ($cat in 'decoders', 'encoders') {
+            foreach ($v in @($rep.store_mft_enumeration.$cat.variants)) {
+              Write-Host ("self-test enumeration {0}/{1}: unique {2}; " -f $cat, $v.label, $v.unique_mfts) -NoNewline
+              Write-Host ((@($v.queries.PSObject.Properties) | ForEach-Object { "{0}={1}{2}" -f $_.Name, $_.Value.count, $(if ($_.Value.hresult) { '(' + $_.Value.hresult + ')' } else { '' }) }) -join ' ')
+            }
+            $def = @($rep.store_mft_enumeration.$cat.variants)[0]
+            foreach ($q in $def.queries.PSObject.Properties) { if ($q.Value.hresult) { throw "self-test: the default enumeration failed: $cat/$($q.Name) $($q.Value.hresult)" } }
+          }
+          Write-Host "self-test store MFT decoders: $(@($s.h264_store_mft_decoders) -join '; '); other flags: $(@($s.h264_other_flags_mft_decoders) -join '; ')"
+          foreach ($k in 'h264_store_mft_activation_status', 'h264_store_mft_decode_720p_status', 'h264_other_flags_mft_activation_status', 'h264_other_flags_mft_decode_720p_status') {
+            if ($s.$k -notin @('ok', 'failed', 'not_attempted')) { throw "self-test: $k is not tri-state: $($s.$k)" }
+          }
+          # Any MFT that only a non-default enumeration returned was tested like the others: its tests
+          # carry the class, the clsid, and (when ActivateObject failed) say it was refused.
+          foreach ($t in @($rep.tests | Where-Object { $_.mft_class -ne 'default' })) {
+            if (-not $t.clsid) { throw "self-test: a test of the non-default MFT $($t.mft) has no clsid" }
+            if ($t.failed_stage -eq 'activate' -and -not $t.activation_refused) { throw "self-test: $($t.mft) failed to activate without activation_refused" }
+            Write-Host ("self-test non-default MFT test: {0} class {1} {2} {3}" -f $t.mft, $t.mft_class, $t.status, $t.failed_stage)
+          }
+          # D3D11VA runs for H.264 too (primary profile H264_VLD_NOFGT), on the software adapter with --ci.
+          . engine/tools/hevc-probe/ci-helpers.ps1
+          Test-VaAdapters $rep.d3d11va
+          if (@($rep.d3d11va.adapters).Count -lt 1) { throw 'self-test: d3d11va asked no adapter' }
+          if ($rep.d3d11va.primary_profile -ne 'H264_VLD_NOFGT') { throw 'self-test: the primary d3d11va profile is not H264_VLD_NOFGT' }
+          if ($s.h264_d3d11va_decode_supported -notin @('ok', 'failed', 'not_attempted')) { throw "self-test: h264_d3d11va_decode_supported is $($s.h264_d3d11va_decode_supported)" }
+          if ($s.h264_d3d11va_decode_supported -eq 'ok' -and @($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0) { throw 'self-test: a software adapter was counted as D3D11VA decode support' }
+          if ($s.h264_d3d11va_decode_supported -ne 'ok' -and -not $s.reasons.h264_d3d11va_decode_supported) { throw 'self-test: h264_d3d11va_decode_supported carries no reason' }
+          if ($s.PSObject.Properties['h264_d3d11va_main10_decode_supported']) { throw 'self-test: the HEVC Main10 summary key belongs to the HEVC run only' }
+          Write-Host ("self-test d3d11va: {0}; by adapter: {1}" -f $s.h264_d3d11va_decode_supported, ((@($s.h264_d3d11va_decode_by_adapter) | ForEach-Object { "{0}={1}" -f $_.adapter, $_.status }) -join ', '))
           # Every attempt that reached the MFT must say what it did: the HRESULT of each step,
           # and the MFT must have been shut down and released after it.
           $reached = @($rep.tests | Where-Object { $_.status -ne 'not_attempted' -and $_.mode })
@@ -279,12 +435,58 @@ jobs:
           . (Join-Path (Resolve-Path engine/tools/hwlab) 'hwlab-common.ps1')
           $s = Get-HevcExtensionStatus
           $s | ConvertTo-Json -Depth 4
-          if (@($s.family_names).Count -ne 2) { throw 'both package families must be named' }
+          if (@($s.family_names).Count -ne 3) { throw 'the three package families must be named' }
           if ($s.family_names -notcontains 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe') { throw 'family 1 missing' }
           if ($s.family_names -notcontains 'Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe') { throw 'family 2 missing' }
+          if ($s.family_names -notcontains 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe') { throw 'family 3 (FirstParty) missing' }
+          # Every registered package with HEVC in its name is listed, so that a new variant is seen.
+          if ($s.Keys -notcontains 'hevc_named_packages_current_user' -or $s.Keys -notcontains 'hevc_named_packages_not_in_family_list') { throw 'the *HEVC* package list is missing' }
+          if ($null -ne $s.hevc_named_packages_current_user -and $s.hevc_named_packages_not_in_family_list -ne @($s.hevc_named_packages_current_user | Where-Object { -not $_.in_known_family_list }).Count) { throw 'hevc_named_packages_not_in_family_list is not the count of unlisted packages' }
+          # The probe (C++) checks the same families as the scripts: one list, compared here.
+          $cpp = Get-Content -Raw -Encoding UTF8 engine/tools/hevc-probe/hevc_probe.cpp
+          $block = [regex]::Match($cpp, '(?s)kExtFamilies\[\]\s*=\s*\{(.*?)\};').Groups[1].Value
+          $inProbe = @([regex]::Matches($block, 'L"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+          $inScripts = @($s.family_names | Sort-Object)
+          if (($inProbe -join '|') -ne ($inScripts -join '|')) { throw ("the package families of the probe ({0}) and of the scripts ({1}) differ" -f ($inProbe -join ', '), ($inScripts -join ', ')) }
+          Write-Host ("probe and scripts check the same {0} families" -f $inProbe.Count)
           if ($s.summary_basis -ne 'registered_current_user') { throw 'the summary must use the current-user registration' }
           if ($s.installed -ne $s.registered_current_user) { throw 'installed must equal registered_current_user' }
           if ($null -ne $s.provisioned_system_image -and $s.provisioned_system_image -isnot [bool]) { throw 'provisioned_system_image is true, false or null' }
+
+      # The manifest reading of hw-inventory.ps1 is pure: run it on fixture manifests (an HEVC decoder
+      # and encoder with a duplicate, an encoder only, a decoder for another codec, no codec extension).
+      - name: Get-MediaCodecsFromManifest reads the codecs a package declares (fixture manifests)
+        shell: powershell
+        run: |
+          $errs = $null; $tok = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path engine/tools/hwlab/hw-inventory.ps1).Path, [ref]$tok, [ref]$errs)
+          $fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-MediaCodecsFromManifest' }, $true)
+          if ($fn.Count -ne 1) { throw 'Get-MediaCodecsFromManifest not found in hw-inventory.ps1' }
+          Invoke-Expression $fn[0].Extent.Text
+          $ns = 'xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap4="http://schemas.microsoft.com/appx/manifest/uap/windows10/4" xmlns:wincap3="http://schemas.microsoft.com/appx/manifest/foundation/windows10/windowscapabilities/3"'
+          $hevc = '43564548-0000-0010-8000-00AA00389B71'
+          $h264 = '34363248-0000-0010-8000-00AA00389B71'
+          function Codec([string]$name, [string]$cat, [string]$in, [string]$out) {
+            $i = if ($in) { "<uap4:InputTypes><uap4:InputType SubType=`"$in`" /></uap4:InputTypes>" } else { '' }
+            $o = if ($out) { "<uap4:OutputTypes><uap4:OutputType SubType=`"$out`" /></uap4:OutputTypes>" } else { '' }
+            return "<uap4:MediaCodec DisplayName=`"$name`" Category=`"$cat`" wincap3:ActivatableClassId=`"X.$name`">$i$o</uap4:MediaCodec>"
+          }
+          function Manifest([string]$codecs) {
+            if (-not $codecs) { return [xml]"<Package $ns><Identity Name=`"Fixture`" /></Package>" }
+            return [xml]"<Package $ns><Identity Name=`"Fixture`" /><Extensions><uap4:Extension Category=`"windows.mediaCodec`">$codecs</uap4:Extension></Extensions></Package>"
+          }
+          $both = (Codec 'HEVCDec' 'videoDecoder' $hevc '') + (Codec 'HEVCEnc' 'videoEncoder' '' $hevc) + (Codec 'HEVCEnc' 'videoEncoder' '' $hevc)
+          $r = Get-MediaCodecsFromManifest (Manifest $both)
+          if (@($r.media_codecs).Count -ne 2) { throw "duplicates are not folded: $(@($r.media_codecs).Count) codecs" }
+          if (-not $r.declares_hevc_video_decoder -or -not $r.declares_hevc_video_encoder) { throw 'decoder and encoder were not both found' }
+          if (-not ($r.media_codecs | Where-Object { $_.display_name -eq 'HEVCDec' -and $_.category -eq 'videoDecoder' -and $_.takes_hevc_input -and $_.activatable_class_id -eq 'X.HEVCDec' })) { throw 'the decoder entry is wrong' }
+          $r = Get-MediaCodecsFromManifest (Manifest (Codec 'HEVCEnc' 'videoEncoder' '' $hevc))
+          if ($r.declares_hevc_video_decoder -or -not $r.declares_hevc_video_encoder) { throw 'an encoder-only package must not declare a decoder' }
+          $r = Get-MediaCodecsFromManifest (Manifest (Codec 'H264Dec' 'videoDecoder' $h264 ''))
+          if ($r.declares_hevc_video_decoder -or $r.declares_hevc_video_encoder) { throw 'a decoder for another codec must not count' }
+          $r = Get-MediaCodecsFromManifest (Manifest '')
+          if (@($r.media_codecs).Count -ne 0 -or $r.declares_hevc_video_decoder -or $r.declares_hevc_video_encoder) { throw 'a manifest without a codec extension must declare nothing' }
+          Write-Host 'manifest fixtures ok'
 
       - name: hw-inventory.ps1 runs and its report is free of this machine's names
         shell: powershell
@@ -299,7 +501,13 @@ jobs:
           $ext = $rep.hevc_video_extensions
           if ($null -eq $ext.registered_current_user) { throw 'registered_current_user missing in the inventory' }
           if ($ext.summary_basis -ne 'registered_current_user') { throw 'the inventory summary must use the current-user registration' }
-          if (@($ext.family_names).Count -ne 2) { throw 'the inventory does not name both package families' }
+          if (@($ext.family_names).Count -ne 3) { throw 'the inventory does not name the three package families' }
+          if (-not $ext.PSObject.Properties['hevc_named_packages_current_user']) { throw 'the inventory does not list the packages with HEVC in their name' }
+          if (-not $rep.PSObject.Properties['hevc_package_media_codecs']) { throw 'the inventory has no hevc_package_media_codecs' }
+          if ($txt -notmatch '"hevc_package_media_codecs":\s*\[') { throw 'hevc_package_media_codecs is not a JSON array' }
+          foreach ($pc in @($rep.hevc_package_media_codecs)) {
+            if ($pc.manifest_read -isnot [bool] -or -not $pc.name) { throw 'a package entry of hevc_package_media_codecs is incomplete' }
+          }
           foreach ($s in @($env:COMPUTERNAME, $env:USERNAME)) {
             if ($s -and $s.Length -ge 4 -and $txt.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw 'the inventory contains a machine or user name' }
           }
@@ -338,6 +546,12 @@ jobs:
           # The CLAUDE.md of the lab lists the same hosts as allowed.
           $cl = Get-Content -Raw engine/tools/hwlab/CLAUDE.md
           if ($cl.IndexOf('commondatastorage.googleapis.com') -lt 0) { throw 'CLAUDE.md does not mention the clang package host' }
+          # The GitHub hosts are listed exactly, never with a wildcard; the plan names the same download host.
+          if ($cl -match '\*\.githubusercontent\.com') { throw 'CLAUDE.md allows a wildcard githubusercontent.com host' }
+          foreach ($h in 'release-assets.githubusercontent.com', 'raw.githubusercontent.com') {
+            if ($cl.IndexOf('`' + $h + '`') -lt 0) { throw "CLAUDE.md does not list $h" }
+          }
+          if ($plan.IndexOf('release-assets.githubusercontent.com') -lt 0) { throw 'the plan does not name the release download host' }
           # Toolchain discovery: vswhere, any edition, no hard-coded path.
           powershell -NoProfile -ExecutionPolicy Bypass -File engine/tools/hwlab/engine-local-build.ps1 -RepoDir $PWD.Path -WorkDir $work -ReportDir (Join-Path $work 'reports') -PreflightOnly
           if ($LASTEXITCODE -ne 0) { throw "preflight exited with $LASTEXITCODE" }

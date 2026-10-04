@@ -14,6 +14,15 @@
 // "failed" or "not_attempted" (with the reason); an attempt that was not made is
 // never reported as a failure.
 //
+// Two more things are reported besides the MFT tests. First, which MFTs MFTEnumEx
+// returns with and without MFT_ENUM_FLAG_UNTRUSTED_STOREMFT (and unfiltered), so that a
+// codec that is installed as a Microsoft Store package but not enumerated by default can
+// be seen, and decoded with when it is returned. Second, what the D3D11 video device of
+// each adapter offers directly (ID3D11VideoDevice: decoder profiles, output formats,
+// decoder configurations, and one decoder object per supported profile, created and
+// released at once): whether the GPU can decode a codec through D3D11VA without any MFT.
+// Both are read-only capability probes.
+//
 // Privacy: the report carries no user name, machine name, serial numbers, MAC or
 // IP addresses and no file system paths. Adapter and MFT names are product names
 // only.
@@ -38,6 +47,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -386,6 +396,12 @@ struct MftInfo {
   GUID category{};
   GUID subtype{};
   bool subtype_is_output = false;
+  // Which enumeration variant (kVariants) returned it first, and every one that did. An
+  // MFT that the default enumeration does not return is only tested through the variant
+  // that returned it, and the report says which class it is in (see MftEnumeration).
+  int variant = 0;
+  std::vector<std::string> seen_in;
+  std::string mft_class = "default";
 };
 
 unsigned ParseVendorId(const std::string& s) {
@@ -394,27 +410,71 @@ unsigned ParseVendorId(const std::string& s) {
   return static_cast<unsigned>(std::strtoul(s.c_str() + p + 4, nullptr, 16));
 }
 
-std::vector<MftInfo> EnumMfts(const GUID& category, const GUID& subtype,
-                              bool subtype_is_output, std::map<std::string, int>* counts) {
-  struct Q {
-    const char* label;
-    UINT32 flags;
-  };
-  const Q queries[] = {
-      {"hardware", MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER},
-      {"async", MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER},
-      {"sync", MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER},
-  };
+// MFT_ENUM_FLAG_UNTRUSTED_STOREMFT. Per docs: the constant is listed in _MFT_ENUM_FLAG with the
+// value 0x00000400, and Microsoft Learn gives it no description (the pages for _MFT_ENUM_FLAG
+// and MFTEnumEx were read on 2026-10-04). What it does is not assumed: the probe enumerates
+// with and without it and reports both. The value is written out here so that the probe does
+// not depend on the SDK that builds it.
+constexpr UINT32 kEnumFlagUntrustedStoreMft = 0x00000400u;
+
+// The enumerations the probe runs for the codec, in this order. The first one is what every
+// earlier version of the probe did. Per docs (MFTEnumEx, "Registering and Enumerating MFTs"),
+// the default enumeration excludes MFTs with field-of-use restrictions, transcode-only MFTs and
+// local MFTs, and MFT_ENUM_FLAG_SORTANDFILTER drops blocked MFTs; the unfiltered variants lift
+// exactly those. Whether the store flag adds MFTs is what the lab measures.
+struct EnumVariant {
+  const char* label;
+  UINT32 extra_flags;  // ORed into every query of the variant
+  bool all;            // one query with MFT_ENUM_FLAG_ALL instead of hardware, async, sync
+  bool sort;           // MFT_ENUM_FLAG_SORTANDFILTER
+  bool store;          // carries MFT_ENUM_FLAG_UNTRUSTED_STOREMFT
+};
+
+const EnumVariant kVariants[] = {
+    {"default", 0, false, true, false},
+    {"store_flag", kEnumFlagUntrustedStoreMft, false, true, true},
+    {"unfiltered_all", 0, true, false, false},
+    {"unfiltered_all_store_flag", kEnumFlagUntrustedStoreMft, true, false, true},
+};
+constexpr int kVariantCount = static_cast<int>(sizeof kVariants / sizeof kVariants[0]);
+
+struct EnumQuery {
+  const char* label;
+  UINT32 flags;
+};
+
+std::vector<EnumQuery> QueriesOf(const EnumVariant& v) {
+  const UINT32 base = v.extra_flags | (v.sort ? static_cast<UINT32>(MFT_ENUM_FLAG_SORTANDFILTER) : 0u);
+  std::vector<EnumQuery> q;
+  if (v.all) {
+    q.push_back({"all", static_cast<UINT32>(MFT_ENUM_FLAG_ALL) | base});
+  } else {
+    q.push_back({"hardware", static_cast<UINT32>(MFT_ENUM_FLAG_HARDWARE) | base});
+    q.push_back({"async", static_cast<UINT32>(MFT_ENUM_FLAG_ASYNCMFT) | base});
+    q.push_back({"sync", static_cast<UINT32>(MFT_ENUM_FLAG_SYNCMFT) | base});
+  }
+  return q;
+}
+
+// One enumeration variant. counts: per query (the number MFTEnumEx returned, -1 when the call
+// failed); errors: the HRESULT of a failed query.
+std::vector<MftInfo> EnumMfts(const GUID& category, const GUID& subtype, bool subtype_is_output,
+                              int variant, std::map<std::string, int>* counts,
+                              std::map<std::string, std::string>* errors) {
+  const std::vector<EnumQuery> queries = QueriesOf(kVariants[variant]);
   std::vector<MftInfo> list;
   std::map<std::string, size_t> by_clsid;
   MFT_REGISTER_TYPE_INFO ti{MFMediaType_Video, subtype};
-  for (const Q& q : queries) {
+  for (const EnumQuery& q : queries) {
     IMFActivate** acts = nullptr;
     UINT32 n = 0;
     HRESULT hr = MFTEnumEx(category, q.flags, subtype_is_output ? nullptr : &ti,
                            subtype_is_output ? &ti : nullptr, &acts, &n);
     if (counts) (*counts)[q.label] = SUCCEEDED(hr) ? static_cast<int>(n) : -1;
-    if (FAILED(hr)) continue;
+    if (FAILED(hr)) {
+      if (errors) (*errors)[q.label] = HrStr(hr);
+      continue;
+    }
     for (UINT32 i = 0; i < n; ++i) {
       // The activation objects are only read here and released; every test
       // enumerates again and gets an activation object of its own.
@@ -432,6 +492,7 @@ std::vector<MftInfo> EnumMfts(const GUID& category, const GUID& subtype,
         mi.category = category;
         mi.subtype = subtype;
         mi.subtype_is_output = subtype_is_output;
+        mi.variant = variant;
         WCHAR* w = nullptr;
         UINT32 len = 0;
         if (SUCCEEDED(act->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &w, &len))) {
@@ -468,19 +529,19 @@ std::vector<MftInfo> EnumMfts(const GUID& category, const GUID& subtype,
 }
 
 // A new activation object for the MFT, from a new enumeration, in the same query
-// order as EnumMfts (so that a hardware MFT keeps the hardware binding of its
-// first query). Never reuses an activation object of an earlier attempt.
+// order and with the same flags as the EnumMfts variant that returned it (so that a
+// hardware MFT keeps the hardware binding of its first query, and an MFT that only the
+// store flag returns is found again through that flag). Never reuses an activation
+// object of an earlier attempt.
 ComPtr<IMFActivate> FreshActivate(const MftInfo& mi, HRESULT* hr_out) {
-  const UINT32 flag_sets[] = {MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_ASYNCMFT,
-                              MFT_ENUM_FLAG_SYNCMFT};
+  const std::vector<EnumQuery> queries = QueriesOf(kVariants[mi.variant]);
   MFT_REGISTER_TYPE_INFO ti{MFMediaType_Video, mi.subtype};
   HRESULT last = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
   ComPtr<IMFActivate> found;
-  for (UINT32 f : flag_sets) {
+  for (const EnumQuery& q : queries) {
     IMFActivate** acts = nullptr;
     UINT32 n = 0;
-    HRESULT hr = MFTEnumEx(mi.category, f | MFT_ENUM_FLAG_SORTANDFILTER,
-                           mi.subtype_is_output ? nullptr : &ti,
+    HRESULT hr = MFTEnumEx(mi.category, q.flags, mi.subtype_is_output ? nullptr : &ti,
                            mi.subtype_is_output ? &ti : nullptr, &acts, &n);
     if (FAILED(hr)) {
       last = hr;
@@ -502,6 +563,59 @@ ComPtr<IMFActivate> FreshActivate(const MftInfo& mi, HRESULT* hr_out) {
   return found;
 }
 
+// What one enumeration variant returned.
+struct VariantResult {
+  std::string label;
+  std::map<std::string, int> counts;
+  std::map<std::string, std::string> errors;
+  std::vector<MftInfo> mfts;
+};
+
+// All the variants for one category and codec. `extras` are the MFTs that a variant other than
+// the default one returned and the default one did not, each once, with the class it is in:
+//   store_flag_only    returned only by variants that carry MFT_ENUM_FLAG_UNTRUSTED_STOREMFT
+//   needs_other_flags  returned by a variant without the store flag (field-of-use, transcode-only,
+//                      local or filtered out by default), not by the default one
+struct MftEnumeration {
+  std::vector<VariantResult> variants;
+  std::vector<MftInfo> extras;
+};
+
+MftEnumeration EnumAllVariants(const GUID& category, const GUID& subtype, bool subtype_is_output) {
+  MftEnumeration e;
+  std::map<std::string, std::vector<int>> seen;  // clsid -> variants that returned it
+  for (int vi = 0; vi < kVariantCount; ++vi) {
+    VariantResult vr;
+    vr.label = kVariants[vi].label;
+    vr.mfts = EnumMfts(category, subtype, subtype_is_output, vi, &vr.counts, &vr.errors);
+    for (const MftInfo& m : vr.mfts) seen[m.clsid].push_back(vi);
+    e.variants.push_back(std::move(vr));
+  }
+  auto labels_of = [&](const std::string& clsid) {
+    std::vector<std::string> out;
+    for (int vi : seen[clsid]) out.push_back(kVariants[vi].label);
+    return out;
+  };
+  for (VariantResult& vr : e.variants) {
+    for (MftInfo& m : vr.mfts) m.seen_in = labels_of(m.clsid);
+  }
+  for (int vi = 1; vi < kVariantCount; ++vi) {
+    for (const MftInfo& m : e.variants[static_cast<size_t>(vi)].mfts) {
+      const std::vector<int>& in = seen[m.clsid];
+      if (std::find(in.begin(), in.end(), 0) != in.end()) continue;  // the default one has it
+      bool queued = false;
+      for (const MftInfo& x : e.extras) queued = queued || x.clsid == m.clsid;
+      if (queued) continue;
+      MftInfo x = m;
+      bool without_store_flag = false;
+      for (int v : in) without_store_flag = without_store_flag || !kVariants[v].store;
+      x.mft_class = without_store_flag ? "needs_other_flags" : "store_flag_only";
+      e.extras.push_back(std::move(x));
+    }
+  }
+  return e;
+}
+
 // ---------------------------------------------------------------- results
 
 enum class Outcome { kNotAttempted, kOk, kFailed };
@@ -520,9 +634,11 @@ struct StepRec {
 };
 
 struct TestResult {
-  std::string role;       // "encode" | "decode"
-  std::string kind;       // "full" | "configure_only"
+  std::string role;       // "encode" | "decode" | "d3d11va_capability"
+  std::string kind;       // "full" | "configure_only" | "capability"
   std::string mft;
+  std::string clsid;
+  std::string mft_class = "default";  // see MftEnumeration: default | store_flag_only | needs_other_flags
   bool hardware = false;
   int width = 0;
   int height = 0;
@@ -547,6 +663,7 @@ struct TestResult {
   unsigned adapter_vendor = 0;
   bool adapter_software = false;
   bool adapter_same_vendor = false;
+  bool activation_refused = false;  // ActivateObject failed (the MFT was enumerated, but not created)
   int d3d11_aware = -1;        // MF_SA_D3D11_AWARE of the MFT: 1, 0, or -1 unknown
   int output_textures = 0;     // decode: frames delivered as D3D11 textures
   bool gpu_path = false;       // decode ok, D3D11 textures out, real (non-software) adapter
@@ -1035,6 +1152,12 @@ bool PrepareMft(const MftInfo& mi, bool use_d3d, int adapter_ordinal, bool is_de
   HRESULT hr = act->ActivateObject(IID_PPV_ARGS(&s->mft));
   if (!r->Check("activate", hr)) {
     r->hint = HybridHint(mi, use_d3d ? &s->d3d : nullptr);
+    r->activation_refused = true;
+    if (hr == E_ACCESSDENIED) {
+      r->notes.push_back(
+          "ActivateObject was refused with E_ACCESSDENIED: the MFT was enumerated but this process "
+          "may not load it");
+    }
     return false;
   }
   s->act = act;
@@ -1241,6 +1364,8 @@ Attempt<EncodeOut> DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
   r.role = "encode";
   r.kind = "full";
   r.mft = mi.name;
+  r.clsid = mi.clsid;
+  r.mft_class = mi.mft_class;
   r.hardware = mi.hardware;
   r.width = w;
   r.height = h;
@@ -1357,6 +1482,8 @@ Attempt<TestResult> DoDecode(const MftInfo& mi, int w, int h, const std::vector<
   r.role = "decode";
   r.kind = stream ? "full" : "configure_only";
   r.mft = mi.name;
+  r.clsid = mi.clsid;
+  r.mft_class = mi.mft_class;
   r.hardware = mi.hardware;
   r.width = w;
   r.height = h;
@@ -1366,6 +1493,310 @@ Attempt<TestResult> DoDecode(const MftInfo& mi, int w, int h, const std::vector<
   a.cleanup = [s](TestResult* td) { s->Teardown(td); };
   return a;
 }
+
+// ---------------------------------------------------------------- D3D11VA capabilities
+
+// The decoder profiles of ID3D11VideoDevice. The GUIDs are written out here and not taken from
+// d3d11.h: the SDK declares them as extern GUIDs (they would need dxguid.lib) and the newer
+// ones only exist in newer SDKs. CI compares every value with the d3d11.h of the Windows SDK of
+// the runner (hevc-probe.yml, "The decoder profile GUIDs agree with the Windows SDK").
+struct VaProfileDef {
+  const char* name;  // the D3D11_DECODER_PROFILE_<name> constant of d3d11.h, without the prefix
+  GUID guid;
+  bool probed;       // gets the full check; the others are only named when the driver lists them
+  bool ten_bit;      // the output format is P010, otherwise NV12
+};
+
+const VaProfileDef kVaProfiles[] = {
+    {"H264_VLD_NOFGT", {0x1b81be68, 0xa0c7, 0x11d3, {0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5}}, true, false},
+    {"HEVC_VLD_MAIN", {0x5b11d51b, 0x2f4c, 0x4452, {0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0}}, true, false},
+    {"HEVC_VLD_MAIN10", {0x107af0e0, 0xef1a, 0x4d19, {0xab, 0xa8, 0x67, 0xa1, 0x63, 0x07, 0x3d, 0x13}}, true, true},
+    {"VP9_VLD_PROFILE0", {0x463707f8, 0xa1d0, 0x4585, {0x87, 0x6d, 0x83, 0xaa, 0x6d, 0x60, 0xb8, 0x9e}}, true, false},
+    {"VP9_VLD_10BIT_PROFILE2", {0xa4c749ef, 0x6ecf, 0x48aa, {0x84, 0x48, 0x50, 0xa7, 0xa1, 0x16, 0x5f, 0xf7}}, true, true},
+    {"AV1_VLD_PROFILE0", {0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}}, true, false},
+    {"HEVC_VLD_MONOCHROME", {0x0685b993, 0x3d8c, 0x43a0, {0x8b, 0x28, 0xd7, 0x4c, 0x2d, 0x68, 0x99, 0xa4}}, false, false},
+    {"HEVC_VLD_MONOCHROME10", {0x142a1d0f, 0x69dd, 0x4ec9, {0x85, 0x91, 0xb1, 0x2f, 0xfc, 0xb9, 0x1a, 0x29}}, false, true},
+    {"HEVC_VLD_MAIN12", {0x1a72925f, 0x0c2c, 0x4f15, {0x96, 0xfb, 0xb1, 0x7d, 0x14, 0x73, 0x60, 0x3f}}, false, true},
+    {"HEVC_VLD_MAIN10_422", {0x0bac4fe5, 0x1532, 0x4429, {0xa8, 0x54, 0xf8, 0x4d, 0xe0, 0x49, 0x53, 0xdb}}, false, true},
+    {"HEVC_VLD_MAIN12_422", {0x55bcac81, 0xf311, 0x4093, {0xa7, 0xd0, 0x1c, 0xbc, 0x0b, 0x84, 0x9b, 0xee}}, false, true},
+    {"HEVC_VLD_MAIN_444", {0x4008018f, 0xf537, 0x4b36, {0x98, 0xcf, 0x61, 0xaf, 0x8a, 0x2c, 0x1a, 0x33}}, false, false},
+    {"HEVC_VLD_MAIN10_EXT", {0x9cc55490, 0xe37c, 0x4932, {0x86, 0x84, 0x49, 0x20, 0xf9, 0xf6, 0x40, 0x9c}}, false, true},
+    {"HEVC_VLD_MAIN10_444", {0x0dabeffa, 0x4458, 0x4602, {0xbc, 0x03, 0x07, 0x95, 0x65, 0x9d, 0x61, 0x7c}}, false, true},
+    {"HEVC_VLD_MAIN12_444", {0x9798634d, 0xfe9d, 0x48e5, {0xb4, 0xda, 0xdb, 0xec, 0x45, 0xb3, 0xdf, 0x01}}, false, true},
+    {"HEVC_VLD_MAIN16", {0xa4fbdbb0, 0xa113, 0x482b, {0xa2, 0x32, 0x63, 0x5c, 0xc0, 0x69, 0x7f, 0x6d}}, false, true},
+    {"VP8_VLD", {0x90b899ea, 0x3a62, 0x4705, {0x88, 0xb3, 0x8d, 0xf0, 0x4b, 0x27, 0x44, 0xe7}}, false, false},
+    {"AV1_VLD_PROFILE1", {0x6936ff0f, 0x45b1, 0x4163, {0x9c, 0xc1, 0x64, 0x6e, 0xf6, 0x94, 0x61, 0x08}}, false, false},
+    {"AV1_VLD_PROFILE2", {0x0c5f2aa1, 0xe541, 0x4089, {0xbb, 0x7b, 0x98, 0x11, 0x0a, 0x19, 0xd7, 0xc8}}, false, false},
+    {"AV1_VLD_12BIT_PROFILE2", {0x17127009, 0xa00f, 0x4ce1, {0x99, 0x4e, 0xbf, 0x40, 0x81, 0xf6, 0xf3, 0xf0}}, false, true},
+    {"AV1_VLD_12BIT_PROFILE2_420", {0x2d80bed6, 0x9cac, 0x4835, {0x9e, 0x91, 0x32, 0x7b, 0xbc, 0x4f, 0x9e, 0xe8}}, false, true},
+};
+
+const VaProfileDef* FindVaProfile(const GUID& g) {
+  for (const VaProfileDef& d : kVaProfiles) {
+    if (d.guid == g) return &d;
+  }
+  return nullptr;
+}
+
+constexpr UINT kVaWidth1080 = 1920, kVaHeight1080 = 1080;
+constexpr UINT kVaWidth2160 = 3840, kVaHeight2160 = 2160;
+// A decoder object is made at 1920x1080 first and, when the driver refuses that, at the coded
+// height of a 1080p picture (1088); the report lists every try.
+constexpr UINT kVaHeight1088 = 1088;
+
+struct VaFormat {
+  bool asked = false;
+  HRESULT hr = S_OK;
+  bool supported = false;
+};
+
+struct VaConfig {
+  bool asked = false;
+  HRESULT hr = S_OK;
+  UINT count = 0;
+};
+
+struct VaTry {
+  std::string size;
+  std::string stage;  // get_config | create_decoder
+  HRESULT hr = S_OK;
+};
+
+// One capability check of one profile on one adapter.
+struct VaProfileCheck {
+  const VaProfileDef* def = nullptr;
+  bool listed = false;
+  VaFormat nv12, p010;
+  VaConfig cfg1080, cfg2160;
+  bool create_asked = false;
+  bool created = false;
+  std::vector<VaTry> tries;
+  Outcome outcome = Outcome::kNotAttempted;
+  std::string stage;   // failed: where it stopped
+  HRESULT hr = S_OK;   // failed: the HRESULT of that stage (E_FAIL when the answer was "no")
+  std::string reason;  // failed: in words
+};
+
+// The D3D11 video device of one adapter. `tr` carries the outcome of the adapter as a whole
+// (ok: the profile list was read; failed: the device or the video device could not be made;
+// not_attempted: software adapter that was not asked, or no video device), its steps and notes.
+struct VaAdapterResult {
+  TestResult tr;
+  AdapterInfo adapter;
+  std::string feature_level;
+  bool video_flag_dropped = false;
+  bool warp_stand_in = false;  // --ci on a machine that lists no adapter: the WARP rasterizer
+  UINT profile_count = 0;
+  std::vector<GUID> profiles;
+  std::vector<VaProfileCheck> checks;
+};
+
+const char* FeatureLevelStr(D3D_FEATURE_LEVEL l) {
+  switch (l) {
+    case D3D_FEATURE_LEVEL_11_1: return "11_1";
+    case D3D_FEATURE_LEVEL_11_0: return "11_0";
+    case D3D_FEATURE_LEVEL_10_1: return "10_1";
+    case D3D_FEATURE_LEVEL_10_0: return "10_0";
+    default: return "other";
+  }
+}
+
+// Asks the D3D11 video device what it can decode. Read-only: it reads the profile list, asks the
+// output formats and the configuration counts, and makes one decoder object per profile that
+// looks supported, releasing it at once. No frame is decoded.
+void CheckProfile(ID3D11VideoDevice* vd, const VaProfileDef& def, const std::vector<GUID>& listed,
+                  VaProfileCheck* c) {
+  c->def = &def;
+  c->listed = std::find(listed.begin(), listed.end(), def.guid) != listed.end();
+  if (!c->listed) {
+    c->outcome = Outcome::kFailed;
+    c->stage = "profile_not_listed";
+    c->hr = E_FAIL;
+    c->reason = "the driver does not list this profile (GetVideoDecoderProfile)";
+    return;
+  }
+  const DXGI_FORMAT native = def.ten_bit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+  auto ask_format = [&](DXGI_FORMAT f, VaFormat* out) {
+    out->asked = true;
+    BOOL ok = FALSE;
+    out->hr = vd->CheckVideoDecoderFormat(&def.guid, f, &ok);
+    out->supported = SUCCEEDED(out->hr) && ok;
+  };
+  ask_format(DXGI_FORMAT_NV12, &c->nv12);
+  ask_format(DXGI_FORMAT_P010, &c->p010);
+  auto ask_config = [&](UINT w, UINT h, VaConfig* out) {
+    out->asked = true;
+    D3D11_VIDEO_DECODER_DESC desc{};
+    desc.Guid = def.guid;
+    desc.SampleWidth = w;
+    desc.SampleHeight = h;
+    desc.OutputFormat = native;
+    out->hr = vd->GetVideoDecoderConfigCount(&desc, &out->count);
+    if (FAILED(out->hr)) out->count = 0;
+  };
+  ask_config(kVaWidth1080, kVaHeight1080, &c->cfg1080);
+  ask_config(kVaWidth2160, kVaHeight2160, &c->cfg2160);
+
+  const VaFormat& native_fmt = def.ten_bit ? c->p010 : c->nv12;
+  if (!native_fmt.supported) {
+    c->outcome = Outcome::kFailed;
+    c->stage = def.ten_bit ? "output_format_p010_not_supported" : "output_format_nv12_not_supported";
+    c->hr = FAILED(native_fmt.hr) ? native_fmt.hr : E_FAIL;
+    c->reason = std::string("the driver does not support the native output format ") +
+                (def.ten_bit ? "P010" : "NV12") + " for this profile (CheckVideoDecoderFormat)";
+    return;
+  }
+  if (FAILED(c->cfg1080.hr) || c->cfg1080.count == 0) {
+    c->outcome = Outcome::kFailed;
+    c->stage = "no_decoder_config_1080p";
+    c->hr = FAILED(c->cfg1080.hr) ? c->cfg1080.hr : E_FAIL;
+    c->reason = "no decoder configuration for 1920x1080 (GetVideoDecoderConfigCount)";
+    return;
+  }
+
+  // Confirm with a decoder object, released at once.
+  c->create_asked = true;
+  const UINT heights[] = {kVaHeight1080, kVaHeight1088};
+  for (UINT h : heights) {
+    D3D11_VIDEO_DECODER_DESC desc{};
+    desc.Guid = def.guid;
+    desc.SampleWidth = kVaWidth1080;
+    desc.SampleHeight = h;
+    desc.OutputFormat = native;
+    VaTry t;
+    t.size = std::to_string(kVaWidth1080) + "x" + std::to_string(h);
+    D3D11_VIDEO_DECODER_CONFIG cfg{};
+    t.stage = "get_config";
+    t.hr = vd->GetVideoDecoderConfig(&desc, 0, &cfg);
+    if (SUCCEEDED(t.hr)) {
+      t.stage = "create_decoder";
+      ComPtr<ID3D11VideoDecoder> dec;
+      t.hr = vd->CreateVideoDecoder(&desc, &cfg, &dec);
+      if (SUCCEEDED(t.hr) && dec) c->created = true;
+    }
+    c->tries.push_back(t);
+    if (c->created) break;
+  }
+  if (!c->created) {
+    c->outcome = Outcome::kFailed;
+    c->stage = c->tries.back().stage;
+    c->hr = c->tries.back().hr;
+    c->reason = "the decoder object could not be created (tried " + std::to_string(c->tries.size()) +
+                " size(s))";
+    return;
+  }
+  c->outcome = Outcome::kOk;
+}
+
+// One adapter (matched again by identity in a fresh DXGI enumeration), or the WARP rasterizer
+// when `warp_stand_in`. Software adapters never count towards a verdict (see VaVerdict); they are
+// only asked with --ci, to run the code path.
+Attempt<VaAdapterResult> DoVaAdapter(const AdapterInfo& want, bool warp_stand_in) {
+  Attempt<VaAdapterResult> a;
+  VaAdapterResult& v = a.result;
+  TestResult& r = v.tr;
+  r.role = "d3d11va_capability";
+  r.kind = "capability";
+  v.adapter = want;
+  v.warp_stand_in = warp_stand_in;
+  r.adapter_known = true;
+  r.adapter = want.description;
+  r.adapter_vendor = want.vendor_id;
+  r.adapter_software = want.software;
+
+  ComPtr<IDXGIAdapter1> adapter;
+  if (!warp_stand_in) {
+    for (AdapterEntry& e : EnumAdapters()) {
+      if (e.info.vendor_id == want.vendor_id && e.info.device_id == want.device_id &&
+          e.info.description == want.description) {
+        adapter = e.adapter;
+        break;
+      }
+    }
+    if (!adapter) {
+      r.Skip("adapter_gone",
+             "the adapter is not listed any more by a fresh DXGI enumeration (a hybrid GPU may have "
+             "changed its power state)");
+      return a;
+    }
+  }
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+                                      D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+  D3D_FEATURE_LEVEL got{};
+  ComPtr<ID3D11Device> dev;
+  ComPtr<ID3D11DeviceContext> ctx;
+  const D3D_DRIVER_TYPE dtype = warp_stand_in ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_UNKNOWN;
+  HRESULT hr = D3D11CreateDevice(adapter.Get(), dtype, nullptr,
+                                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels,
+                                 ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev, &got, &ctx);
+  if (FAILED(hr) && want.software) {
+    // A software adapter does not offer video support everywhere (the same fallback as the
+    // decode tests); a hardware adapter is never retried without it.
+    dev.Reset();
+    ctx.Reset();
+    hr = D3D11CreateDevice(adapter.Get(), dtype, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                           ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev, &got, &ctx);
+    if (SUCCEEDED(hr)) v.video_flag_dropped = true;
+  }
+  if (!r.Check("create_d3d_device", hr)) return a;
+  v.feature_level = FeatureLevelStr(got);
+
+  ComPtr<ID3D11VideoDevice> vd;
+  hr = dev.As(&vd);
+  r.Step("query_video_device", hr);
+  if (FAILED(hr)) {
+    if (want.software) {
+      r.Skip("no_video_device", "the D3D11 device of the software adapter has no ID3D11VideoDevice");
+      r.hr = hr;
+    } else {
+      r.Fail("query_video_device", hr);
+    }
+    return a;
+  }
+
+  v.profile_count = vd->GetVideoDecoderProfileCount();
+  for (UINT i = 0; i < v.profile_count; ++i) {
+    GUID g{};
+    HRESULT h = vd->GetVideoDecoderProfile(i, &g);
+    if (SUCCEEDED(h)) {
+      v.profiles.push_back(g);
+    } else {
+      r.notes.push_back("GetVideoDecoderProfile(" + std::to_string(i) + ") " + HrStr(h));
+    }
+  }
+  r.Step("list_profiles", S_OK);
+  for (const VaProfileDef& def : kVaProfiles) {
+    if (!def.probed) continue;
+    VaProfileCheck c;
+    CheckProfile(vd.Get(), def, v.profiles, &c);
+    v.checks.push_back(std::move(c));
+  }
+  r.outcome = Outcome::kOk;
+  if (ctx) {
+    ctx->ClearState();
+    ctx->Flush();
+  }
+  return a;
+}
+
+VaAdapterResult TimeoutVa(const AdapterInfo& want, bool warp_stand_in) {
+  VaAdapterResult v;
+  v.adapter = want;
+  v.warp_stand_in = warp_stand_in;
+  v.tr.role = "d3d11va_capability";
+  v.tr.kind = "capability";
+  v.tr.adapter_known = true;
+  v.tr.adapter = want.description;
+  v.tr.adapter_vendor = want.vendor_id;
+  v.tr.adapter_software = want.software;
+  v.tr.outcome = Outcome::kFailed;
+  v.tr.stage = "timeout";
+  v.tr.hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+  v.tr.error = "no result within the watchdog time";
+  return v;
+}
+
+TestResult& Result(VaAdapterResult& v) { return v.tr; }
 
 // ---------------------------------------------------------------- watchdog
 
@@ -1496,6 +1927,75 @@ std::vector<std::string> FindPackages(const wchar_t* family) {
   return out;
 }
 
+std::string LowerAscii(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+// A package registered for the current user whose name contains the word that was asked for.
+struct PackageHit {
+  std::string name;
+  std::string version;
+  std::string architecture;
+  std::string family;
+  bool in_known_family_list = false;
+};
+
+// Package full names registered for the current user that contain `needle_lower`, from the per-user
+// package repository in the registry. This is NOT a documented API: it is read-only and best
+// effort, observed on a Windows 10 machine (one sub key per registered package, named by the
+// package full name), and the report says whether it could be read. It exists because the
+// documented call used for the known families (GetPackagesByPackageFamily) needs the family name
+// in advance, so a variant of the extension with a name nobody listed yet can only be found by
+// name. Returns false when the repository could not be read completely (`rc` says why).
+bool ScanPackageNames(const std::string& needle_lower, const std::vector<std::string>& known_families,
+                      std::vector<PackageHit>* out, LONG* rc) {
+  *rc = ERROR_SUCCESS;
+  HKEY key = nullptr;
+  LONG r = RegOpenKeyExW(HKEY_CURRENT_USER,
+                         L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\"
+                         L"AppModel\\Repository\\Packages",
+                         0, KEY_ENUMERATE_SUB_KEYS, &key);
+  if (r != ERROR_SUCCESS) {
+    *rc = r;
+    return false;
+  }
+  bool complete = true;
+  for (DWORD i = 0;; ++i) {
+    wchar_t name[512];
+    DWORD n = ARRAYSIZE(name);
+    const LONG e = RegEnumKeyExW(key, i, name, &n, nullptr, nullptr, nullptr, nullptr);
+    if (e == ERROR_NO_MORE_ITEMS) break;
+    if (e == ERROR_MORE_DATA) continue;  // longer than any package full name
+    if (e != ERROR_SUCCESS) {
+      *rc = e;
+      complete = false;
+      break;
+    }
+    const std::string full = Utf8(name, static_cast<int>(n));
+    if (LowerAscii(full).find(needle_lower) == std::string::npos) continue;
+    // Name_Version_Architecture_ResourceId_PublisherId
+    std::vector<std::string> parts;
+    for (size_t pos = 0;;) {
+      const size_t u = full.find('_', pos);
+      parts.push_back(full.substr(pos, u == std::string::npos ? std::string::npos : u - pos));
+      if (u == std::string::npos) break;
+      pos = u + 1;
+    }
+    PackageHit h;
+    h.name = parts[0];
+    if (parts.size() > 1) h.version = parts[1];
+    if (parts.size() > 2) h.architecture = parts[2];
+    h.family = (parts.size() > 4 && !parts[4].empty()) ? h.name + "_" + parts[4] : h.name;
+    for (const std::string& k : known_families) {
+      if (LowerAscii(k) == LowerAscii(h.family)) h.in_known_family_list = true;
+    }
+    out->push_back(std::move(h));
+  }
+  RegCloseKey(key);
+  return complete;
+}
+
 // ---------------------------------------------------------------- JSON output
 
 void WriteMft(Json& j, const MftInfo& m) {
@@ -1507,6 +2007,11 @@ void WriteMft(Json& j, const MftInfo& m) {
   j.KvB("sync", m.sync);
   j.KvS("vendor_id_string", m.vendor);
   j.KvS("flags", Hex32(m.flags));
+  j.KvS("mft_class", m.mft_class);
+  j.Key("returned_by");
+  j.BeginArray();
+  for (const std::string& v : m.seen_in) j.Str(v);
+  j.EndArray();
   j.EndObject();
 }
 
@@ -1515,6 +2020,8 @@ void WriteTest(Json& j, const TestResult& t) {
   j.KvS("role", t.role);
   j.KvS("kind", t.kind);
   j.KvS("mft", t.mft);
+  if (!t.clsid.empty()) j.KvS("clsid", t.clsid);
+  j.KvS("mft_class", t.mft_class);
   j.KvB("hardware", t.hardware);
   j.KvS("resolution", std::to_string(t.width) + "x" + std::to_string(t.height));
   j.KvS("memory", t.memory);
@@ -1528,6 +2035,7 @@ void WriteTest(Json& j, const TestResult& t) {
     j.KvS("failed_stage", t.stage);
     j.KvS("hresult", HrStr(t.hr));
     if (!t.error.empty()) j.KvS("error", t.error);
+    if (t.activation_refused) j.KvB("activation_refused", true);
   }
   if (t.adapter_known) {
     j.Key("adapter");
@@ -1593,6 +2101,8 @@ EncodeOut TimeoutEnc(const MftInfo& mi, int w, int h, bool d3d) {
   o.r.role = "encode";
   o.r.kind = "full";
   o.r.mft = mi.name;
+  o.r.clsid = mi.clsid;
+  o.r.mft_class = mi.mft_class;
   o.r.hardware = mi.hardware;
   o.r.width = w;
   o.r.height = h;
@@ -1610,6 +2120,8 @@ TestResult TimeoutDec(const MftInfo& mi, int w, int h, bool d3d, bool full) {
   r.role = "decode";
   r.kind = full ? "full" : "configure_only";
   r.mft = mi.name;
+  r.clsid = mi.clsid;
+  r.mft_class = mi.mft_class;
   r.hardware = mi.hardware;
   r.width = w;
   r.height = h;
@@ -1629,6 +2141,8 @@ TestResult NotAttemptedTest(const char* role, const MftInfo& mi, int w, int h, c
   r.role = role;
   r.kind = kind;
   r.mft = mi.name;
+  r.clsid = mi.clsid;
+  r.mft_class = mi.mft_class;
   r.hardware = mi.hardware;
   r.width = w;
   r.height = h;
@@ -1816,6 +2330,301 @@ Verdict Combine(const std::vector<Verdict>& vs) {
   return {"not_attempted", std::string()};
 }
 
+// ---------------------------------------------------------------- enumeration and D3D11VA reports
+
+// What every enumeration variant returned, for one category (decoders or encoders).
+void WriteEnumeration(Json& j, const MftEnumeration& e) {
+  j.BeginObject();
+  j.Key("variants");
+  j.BeginArray();
+  for (size_t vi = 0; vi < e.variants.size(); ++vi) {
+    const VariantResult& vr = e.variants[vi];
+    const EnumVariant& ev = kVariants[vi];
+    j.BeginObject();
+    j.KvS("label", vr.label);
+    j.KvB("store_flag", ev.store);
+    j.KvB("sort_and_filter", ev.sort);
+    j.KvB("all_flags", ev.all);
+    j.Key("queries");
+    j.BeginObject();
+    for (const EnumQuery& q : QueriesOf(ev)) {
+      j.Key(q.label);
+      j.BeginObject();
+      j.KvS("flags", Hex32(q.flags));
+      auto c = vr.counts.find(q.label);
+      j.KvI("count", c == vr.counts.end() ? -1 : c->second);
+      auto er = vr.errors.find(q.label);
+      if (er != vr.errors.end()) j.KvS("hresult", er->second);
+      j.EndObject();
+    }
+    j.EndObject();
+    j.KvI("unique_mfts", static_cast<long long>(vr.mfts.size()));
+    j.Key("mfts");
+    j.BeginArray();
+    for (const MftInfo& m : vr.mfts) WriteMft(j, m);
+    j.EndArray();
+    j.EndObject();
+  }
+  j.EndArray();
+  // MFTs that only a variant other than the default one returned, and default MFTs that the
+  // variant with the store flag did not return (in case the flag restricts instead of adds).
+  j.Key("only_outside_the_default_enumeration");
+  j.BeginArray();
+  for (const MftInfo& m : e.extras) WriteMft(j, m);
+  j.EndArray();
+  j.Key("default_mfts_missing_with_store_flag");
+  j.BeginArray();
+  if (e.variants.size() > 1) {
+    for (const MftInfo& m : e.variants[0].mfts) {
+      bool found = false;
+      for (const MftInfo& x : e.variants[1].mfts) found = found || x.clsid == m.clsid;
+      if (!found) WriteMft(j, m);
+    }
+  }
+  j.EndArray();
+  j.EndObject();
+}
+
+const VaProfileCheck* FindCheck(const VaAdapterResult& v, const char* profile) {
+  for (const VaProfileCheck& c : v.checks) {
+    if (std::string(c.def->name) == profile) return &c;
+  }
+  return nullptr;
+}
+
+void WriteVaFormat(Json& j, const char* key, const VaFormat& f) {
+  j.Key(key);
+  j.BeginObject();
+  if (f.asked) {
+    j.KvB("supported", f.supported);
+    j.KvS("hresult", HrStr(f.hr));
+  } else {
+    j.Key("supported");
+    j.Null();
+    j.KvS("reason", "not asked: the profile is not listed");
+  }
+  j.EndObject();
+}
+
+void WriteVaConfig(Json& j, const char* key, const VaConfig& c, const char* format) {
+  j.Key(key);
+  j.BeginObject();
+  j.KvS("output_format", format);
+  if (c.asked) {
+    j.KvI("count", c.count);
+    j.KvS("hresult", HrStr(c.hr));
+  } else {
+    j.Key("count");
+    j.Null();
+    j.KvS("reason", "not asked: the profile is not listed");
+  }
+  j.EndObject();
+}
+
+void WriteVaCheck(Json& j, const VaProfileCheck& c) {
+  const char* native = c.def->ten_bit ? "P010" : "NV12";
+  j.BeginObject();
+  j.KvS("profile", c.def->name);
+  j.KvS("guid", GuidStr(c.def->guid));
+  j.KvB("listed", c.listed);
+  j.KvS("status", OutcomeStr(c.outcome));
+  if (c.outcome == Outcome::kFailed) {
+    j.KvS("failed_stage", c.stage);
+    j.KvS("hresult", HrStr(c.hr));
+    j.KvS("reason", c.reason);
+  }
+  j.KvS("native_output_format", native);
+  j.Key("output_formats");
+  j.BeginObject();
+  WriteVaFormat(j, "NV12", c.nv12);
+  WriteVaFormat(j, "P010", c.p010);
+  j.EndObject();
+  j.Key("decoder_config_count");
+  j.BeginObject();
+  WriteVaConfig(j, "1920x1080", c.cfg1080, native);
+  WriteVaConfig(j, "3840x2160", c.cfg2160, native);
+  j.EndObject();
+  j.Key("decoder_object");
+  j.BeginObject();
+  if (c.create_asked) {
+    j.KvS("status", c.created ? "ok" : "failed");
+    j.Key("tries");
+    j.BeginArray();
+    for (const VaTry& t : c.tries) {
+      j.BeginObject();
+      j.KvS("size", t.size);
+      j.KvS("stage", t.stage);
+      j.KvS("hresult", HrStr(t.hr));
+      j.EndObject();
+    }
+    j.EndArray();
+  } else {
+    j.KvS("status", "not_attempted");
+    j.KvS("reason", c.listed ? "the output format or the 1080p configuration check did not pass"
+                             : "the profile is not listed");
+  }
+  j.EndObject();
+  j.EndObject();
+}
+
+void WriteVaAdapter(Json& j, const VaAdapterResult& v) {
+  j.BeginObject();
+  j.Key("adapter");
+  j.BeginObject();
+  j.KvS("description", v.adapter.description);
+  j.KvS("vendor_id", Hex32(v.adapter.vendor_id));
+  j.KvS("device_id", Hex32(v.adapter.device_id));
+  j.KvB("software_adapter", v.adapter.software);
+  j.KvS("driver_version", v.adapter.driver_version);
+  j.KvB("warp_stand_in", v.warp_stand_in);
+  j.EndObject();
+  j.KvS("status", OutcomeStr(v.tr.outcome));
+  if (v.tr.outcome == Outcome::kNotAttempted) {
+    j.KvS("reason_code", v.tr.reason_code);
+    j.KvS("reason", v.tr.reason);
+  } else if (v.tr.outcome == Outcome::kFailed) {
+    j.KvS("failed_stage", v.tr.stage);
+    j.KvS("hresult", HrStr(v.tr.hr));
+    if (!v.tr.error.empty()) j.KvS("error", v.tr.error);
+  }
+  if (!v.feature_level.empty()) j.KvS("feature_level", v.feature_level);
+  j.KvB("video_support_flag_dropped", v.video_flag_dropped);
+  if (v.tr.outcome == Outcome::kOk) {
+    j.KvI("profile_count", v.profile_count);
+    j.Key("profiles");
+    j.BeginArray();
+    for (const GUID& g : v.profiles) {
+      const VaProfileDef* d = FindVaProfile(g);
+      j.BeginObject();
+      j.KvS("guid", GuidStr(g));
+      j.Key("name");
+      if (d) {
+        j.Str(d->name);
+      } else {
+        j.Null();
+      }
+      j.EndObject();
+    }
+    j.EndArray();
+    j.Key("checked");
+    j.BeginArray();
+    for (const VaProfileCheck& c : v.checks) WriteVaCheck(j, c);
+    j.EndArray();
+  }
+  if (!v.tr.steps.empty()) {
+    j.Key("steps");
+    j.BeginArray();
+    for (const StepRec& s : v.tr.steps) {
+      j.BeginObject();
+      j.KvS("stage", s.stage);
+      j.KvS("hresult", HrStr(s.hr));
+      j.EndObject();
+    }
+    j.EndArray();
+  }
+  if (!v.tr.notes.empty()) {
+    j.Key("notes");
+    j.BeginArray();
+    for (const std::string& n : v.tr.notes) j.Str(n);
+    j.EndArray();
+  }
+  j.EndObject();
+}
+
+// Folds the D3D11VA checks of the adapters into one value for `profile`: ok when a non-software
+// adapter passed every check for it (listed, native output format, a 1080p decoder configuration,
+// a decoder object made and released); failed when a non-software adapter was asked and none
+// passed; not_attempted when none was asked. A software adapter never counts.
+Verdict VaVerdict(const std::vector<VaAdapterResult>& va, const char* profile) {
+  int ok = 0;
+  std::vector<std::string> failed, na;
+  for (const VaAdapterResult& v : va) {
+    if (v.adapter.software) continue;
+    const std::string who = v.adapter.description;
+    if (v.tr.outcome == Outcome::kFailed) {
+      failed.push_back(who + ": " + v.tr.stage + " " + HrStr(v.tr.hr));
+    } else if (v.tr.outcome == Outcome::kNotAttempted) {
+      na.push_back(who + ": " + v.tr.reason);
+    } else if (const VaProfileCheck* c = FindCheck(v, profile)) {
+      if (c->outcome == Outcome::kOk) {
+        ++ok;
+      } else {
+        failed.push_back(who + ": " + c->reason + " [" + c->stage + "]");
+      }
+    } else {
+      na.push_back(who + ": the profile was not checked");
+    }
+  }
+  auto join = [](const std::vector<std::string>& v) {
+    std::string s;
+    for (const std::string& x : v) s += (s.empty() ? "" : "; ") + x;
+    return s;
+  };
+  if (ok) return {"ok", std::string()};
+  if (!failed.empty()) return {"failed", join(failed)};
+  if (!na.empty()) return {"not_attempted", join(na)};
+  return {"not_attempted",
+          "no non-software DXGI adapter was asked (a software adapter is only asked with --ci and "
+          "never counts)"};
+}
+
+// One value per adapter for `profile`, in the order of the adapter list: which adapter said what.
+void WriteVaByAdapter(Json& j, const std::vector<VaAdapterResult>& va, const char* profile) {
+  j.BeginArray();
+  for (const VaAdapterResult& v : va) {
+    j.BeginObject();
+    j.KvS("adapter", v.adapter.description);
+    j.KvS("vendor_id", Hex32(v.adapter.vendor_id));
+    j.KvB("software_adapter", v.adapter.software);
+    std::string status = OutcomeStr(v.tr.outcome);
+    std::string why;
+    if (v.tr.outcome == Outcome::kFailed) {
+      why = v.tr.stage + " " + HrStr(v.tr.hr);
+    } else if (v.tr.outcome == Outcome::kNotAttempted) {
+      why = v.tr.reason;
+    } else if (const VaProfileCheck* c = FindCheck(v, profile)) {
+      status = OutcomeStr(c->outcome);
+      if (c->outcome != Outcome::kOk) why = c->reason + " [" + c->stage + "]";
+    } else {
+      status = "not_attempted";
+      why = "the profile was not checked";
+    }
+    j.KvS("status", status);
+    if (!why.empty()) j.KvS("reason", why);
+    j.EndObject();
+  }
+  j.EndArray();
+}
+
+// ActivateObject of the MFTs of one class (see MftEnumeration): ok when one was created, failed
+// when every one that was reached was refused, not_attempted when none was returned.
+Verdict ActivationVerdict(const std::vector<TestResult>& tests, const std::string& mft_class,
+                          const std::string& none_reason) {
+  int ok = 0, refused = 0;
+  std::string why;
+  for (const TestResult& t : tests) {
+    if (t.role != "decode" || t.mft_class != mft_class) continue;
+    bool reached = false;
+    HRESULT ah = S_OK;
+    for (const StepRec& st : t.steps) {
+      if (st.stage == "activate") {
+        reached = true;
+        ah = st.hr;
+      }
+    }
+    if (!reached) continue;
+    if (SUCCEEDED(ah)) {
+      ++ok;
+    } else {
+      ++refused;
+      why = t.mft + ": ActivateObject was refused, " + HrStr(ah);
+    }
+  }
+  if (ok) return {"ok", std::string()};
+  if (refused) return {"failed", why};
+  return {"not_attempted", none_reason};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- main
@@ -1915,11 +2724,22 @@ int main(int argc, char** argv) {
   if (mf_dll) mf_hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
   const bool mf_ok = SUCCEEDED(mf_hr);
 
+  // Every enumeration variant (see kVariants) for the encoders and the decoders of the codec.
+  // `encoders` and `decoders` are what the default enumeration returns, as in every earlier
+  // version of the probe; what only another variant returns is in the *_enum.extras lists.
+  MftEnumeration enc_enum, dec_enum;
   std::vector<MftInfo> encoders, decoders;
   std::map<std::string, int> enc_counts, dec_counts;
+  std::map<std::string, std::string> enc_errors, dec_errors;
   if (mf_ok) {
-    encoders = EnumMfts(MFT_CATEGORY_VIDEO_ENCODER, g_subtype, true, &enc_counts);
-    decoders = EnumMfts(MFT_CATEGORY_VIDEO_DECODER, g_subtype, false, &dec_counts);
+    enc_enum = EnumAllVariants(MFT_CATEGORY_VIDEO_ENCODER, g_subtype, true);
+    dec_enum = EnumAllVariants(MFT_CATEGORY_VIDEO_DECODER, g_subtype, false);
+    encoders = enc_enum.variants[0].mfts;
+    decoders = dec_enum.variants[0].mfts;
+    enc_counts = enc_enum.variants[0].counts;
+    dec_counts = dec_enum.variants[0].counts;
+    enc_errors = enc_enum.variants[0].errors;
+    dec_errors = dec_enum.variants[0].errors;
   }
   auto hw_first = [](std::vector<MftInfo>& v) {
     std::stable_partition(v.begin(), v.end(), [](const MftInfo& m) { return m.hardware; });
@@ -1927,15 +2747,31 @@ int main(int argc, char** argv) {
   hw_first(encoders);
   hw_first(decoders);
 
-  // The two package families of the HEVC Video Extensions, as registered for the
-  // current user. Whether the package is provisioned in the system image needs
-  // elevation and is left to hw-inventory.ps1.
+  // The package families of the HEVC Video Extensions, as registered for the current user (the
+  // list is the same as in hwlab-common.ps1; CI compares the family names of the two). Whether
+  // the package is provisioned in the system image needs elevation and is left to
+  // hw-inventory.ps1. Any other registered package with HEVC in its name is listed separately,
+  // so that a new variant is never missed again.
   const wchar_t* const kExtFamilies[] = {L"Microsoft.HEVCVideoExtension_8wekyb3d8bbwe",
-                                         L"Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe"};
+                                         L"Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe",
+                                         L"Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe"};
   std::vector<std::string> ext_packages;
+  std::vector<std::string> known_families;
   for (const wchar_t* fam : kExtFamilies) {
+    known_families.push_back(Utf8(fam));
     for (std::string& n : FindPackages(fam)) ext_packages.push_back(std::move(n));
   }
+  std::vector<PackageHit> hevc_named;
+  LONG hevc_named_rc = ERROR_SUCCESS;
+  const bool hevc_named_complete = ScanPackageNames("hevc", known_families, &hevc_named, &hevc_named_rc);
+  int hevc_named_unlisted = 0;
+  std::string hevc_named_unlisted_names;
+  for (const PackageHit& h : hevc_named) {
+    if (h.in_known_family_list) continue;
+    ++hevc_named_unlisted;
+    hevc_named_unlisted_names += (hevc_named_unlisted_names.empty() ? "" : ", ") + h.family;
+  }
+
 
   std::vector<TestResult> tests;
   struct Res {
@@ -2034,12 +2870,13 @@ int main(int argc, char** argv) {
 
   // ---- decode tests: every decoder (up to six, hardware first), each resolution
   // on the stream of its own resolution.
+  // Then up to three decoders that only a non-default enumeration returns (the ones that need
+  // MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, or are excluded from the default enumeration for another
+  // reason), tested the same way and marked with their mft_class.
   std::set<std::string> failed_720_modes;
   for (int ri = 0; ri < 2; ++ri) {
     if (!res[ri].enabled) continue;
-    int dec_tried = 0;
-    for (const MftInfo& mi : decoders) {
-      if (dec_tried++ >= 6) break;
+    auto decode_one = [&](const MftInfo& mi) {
       if (res[ri].stream.frames) {
         DecodeAttempts(mi, res[ri].w, res[ri].h, &res[ri].stream, &tests,
                        ri == 1 ? &failed_720_modes : nullptr, ri == 0 ? &failed_720_modes : nullptr);
@@ -2052,7 +2889,47 @@ int main(int argc, char** argv) {
                                          "no 1080p bitstream to decode: " + res[ri].no_stream_reason);
         tests.push_back(na);
       }
+    };
+    int dec_tried = 0;
+    for (const MftInfo& mi : decoders) {
+      if (dec_tried++ >= 6) break;
+      decode_one(mi);
     }
+    int extra_tried = 0;
+    for (const MftInfo& mi : dec_enum.extras) {
+      if (extra_tried++ >= 3) break;
+      decode_one(mi);
+    }
+  }
+
+  // ---- D3D11VA capability of every adapter, after every MFT test so that the MFT results are not
+  // disturbed by it. It does not need Media Foundation, so it runs whether MFStartup worked or
+  // not. Software adapters are only asked with --ci (to run the code path) and never count
+  // towards a verdict.
+  std::vector<VaAdapterResult> va;
+  if (g_adapters.empty() && g_allow_sw_adapter) {
+    AdapterInfo w;
+    w.description = "WARP software rasterizer";
+    w.vendor_id = 0x1414;
+    w.software = true;
+    Progress("d3d11va", w.description, "");
+    va.push_back(WithWatchdog<VaAdapterResult>([=] { return DoVaAdapter(w, true); }, TimeoutVa(w, true)));
+  }
+  for (const AdapterInfo& ai : g_adapters) {
+    if (ai.software && !g_allow_sw_adapter) {
+      VaAdapterResult v;
+      v.adapter = ai;
+      v.tr.role = "d3d11va_capability";
+      v.tr.kind = "capability";
+      v.tr.Skip("software_adapter",
+                "a software adapter says nothing about GPU decode; it is only asked with "
+                "--allow-software-adapter or --ci");
+      va.push_back(std::move(v));
+      continue;
+    }
+    Progress("d3d11va", ai.description, "");
+    va.push_back(WithWatchdog<VaAdapterResult>([=] { return DoVaAdapter(ai, false); }, TimeoutVa(ai, false)));
+    Sleep(kSettleMs);
   }
 
   // ---- summary values
@@ -2074,10 +2951,27 @@ int main(int argc, char** argv) {
   const std::string not_selected_1080 = "1080p was not selected (--resolutions)";
   const std::string no_enc = "no " + codec_upper + " encoder MFT is registered";
   const std::string no_hw_enc = "no hardware " + codec_upper + " encoder MFT is registered";
-  std::string no_dec = "no " + codec_upper + " decoder MFT is registered";
-  if (g_is_hevc && ext_packages.empty()) {
-    no_dec += " (the HEVC Video Extensions are not registered for the current user)";
+  // Why there is no decoder, in words that match what was measured: the enumerations that were
+  // run are named, and what is known about the packages is said as it is (a registered package
+  // does not mean that its decoder is enumerated, and a missing registration is only said when
+  // no package with HEVC in its name was found either).
+  std::string no_dec = "MFTEnumEx returns no " + codec_upper + " decoder MFT to this process (default enumeration, with "
+                       "MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered)";
+  if (g_is_hevc) {
+    if (!ext_packages.empty()) {
+      no_dec += "; the HEVC Video Extensions package is registered for the current user (" +
+                std::to_string(ext_packages.size()) + " package(s)), so registration is not what is missing";
+    } else if (hevc_named_unlisted > 0) {
+      no_dec += "; no package of the known families is registered for the current user, but a package with HEVC in its "
+                "name is: " + hevc_named_unlisted_names + " (not in the family list of this probe)";
+    } else if (!hevc_named_complete) {
+      no_dec += "; no package of the known families is registered for the current user (the name scan could not be read "
+                "completely)";
+    } else {
+      no_dec += "; no package of the known families and no package with HEVC in its name is registered for the current user";
+    }
   }
+  const bool any_dec_mft = !decoders.empty() || !dec_enum.extras.empty();
   auto enc_is = [](int w) {
     return [w](const TestResult& t) { return t.role == "encode" && t.width == w; };
   };
@@ -2104,10 +2998,10 @@ int main(int argc, char** argv) {
   const std::string r_enc_1080 = res[1].enabled ? res[1].no_stream_reason : not_selected_1080;
   const std::string r_dec_720 =
       !res[0].enabled ? not_selected_720
-                      : (decoders.empty() ? no_dec : "no 720p bitstream: " + res[0].no_stream_reason);
+                      : (!any_dec_mft ? no_dec : "no 720p bitstream: " + res[0].no_stream_reason);
   const std::string r_dec_1080 =
       !res[1].enabled ? not_selected_1080
-                      : (decoders.empty() ? no_dec : "no 1080p bitstream: " + res[1].no_stream_reason);
+                      : (!any_dec_mft ? no_dec : "no 1080p bitstream: " + res[1].no_stream_reason);
   const std::string no_hw_dec = "no hardware decoder MFT is registered";
   const std::string r_hwmft_720 = res[0].enabled ? no_hw_dec : not_selected_720;
   const std::string r_hwmft_1080 = res[1].enabled ? no_hw_dec : not_selected_1080;
@@ -2128,8 +3022,33 @@ int main(int argc, char** argv) {
                               "a bitstream was available, so the decoders were tested with it instead");
 
   const bool have_stream_720 = res[0].stream.frames != nullptr;
-  const bool receive_possible =
-      v_dec_720.status == "ok" || (!have_stream_720 && v_cfg.status == "ok");
+  // Derived from the *_status values above (they are the truth). Tri-state like them: ok, failed,
+  // or not_attempted when nothing was asked.
+  const Verdict v_receive =
+      have_stream_720 ? v_dec_720 : Combine({v_dec_720, v_cfg});
+
+  // MFTs that only a non-default enumeration returns, per class (see MftEnumeration).
+  auto cls_dec_is = [](const std::string& cls, int w) {
+    return [cls, w](const TestResult& t) {
+      return t.role == "decode" && t.kind == "full" && t.width == w && t.mft_class == cls;
+    };
+  };
+  struct ClassVerdicts {
+    Verdict dec720, dec1080, activation;
+  };
+  auto judge_class = [&](const std::string& cls, const std::string& none_what) {
+    ClassVerdicts cv;
+    const std::string none = "no " + codec_upper + " decoder MFT is returned " + none_what;
+    cv.dec720 = Judge(tests, cls_dec_is(cls, 1280), res[0].enabled ? none : not_selected_720);
+    cv.dec1080 = Judge(tests, cls_dec_is(cls, 1920), res[1].enabled ? none : not_selected_1080);
+    cv.activation = ActivationVerdict(tests, cls, none);
+    return cv;
+  };
+  const ClassVerdicts store_cv = judge_class("store_flag_only", "only with MFT_ENUM_FLAG_UNTRUSTED_STOREMFT");
+  const ClassVerdicts other_cv = judge_class("needs_other_flags",
+                                             "only by an enumeration with other flags than the default one");
+  const Verdict v_va_primary = VaVerdict(va, g_is_hevc ? "HEVC_VLD_MAIN" : "H264_VLD_NOFGT");
+  const Verdict v_va_main10 = VaVerdict(va, "HEVC_VLD_MAIN10");
   std::string receive_basis = "none";
   if (v_dxva_720.status == "ok") {
     receive_basis = "d3d11_gpu_decode";
@@ -2147,13 +3066,18 @@ int main(int argc, char** argv) {
       crashed_or_timed_out = true;
     }
   }
+  for (const VaAdapterResult& v : va) {
+    if (v.tr.outcome == Outcome::kFailed && (v.tr.stage == "crash" || v.tr.stage == "timeout")) {
+      crashed_or_timed_out = true;
+    }
+  }
 
   Json j;
   j.BeginObject();
   j.Key("tool");
   j.BeginObject();
   j.KvS("name", "hevc-probe");
-  j.KvI("report_version", 2);
+  j.KvI("report_version", 3);
   j.KvS("codec", g_codec_name);
   j.KvS("git_sha", PROBE_GIT_SHA);
   j.KvS("test_content", "synthetic NV12, 60 frames, 30 fps, 1280x720 and 1920x1080");
@@ -2209,7 +3133,32 @@ int main(int argc, char** argv) {
   j.BeginArray();
   for (const std::string& n : ext_packages) j.Str(n);
   j.EndArray();
-  j.KvS("provisioned_system_image", "unknown (needs elevation, see hw-inventory.ps1)");
+  // Any registered package with HEVC in its name, known family or not. Read from the per-user
+  // package repository (registry), which is not a documented API: `readable` says whether it worked.
+  j.Key("hevc_named_packages_current_user");
+  j.BeginObject();
+  j.KvS("source", "per-user package repository (registry, undocumented, best effort)");
+  j.KvB("readable", hevc_named_complete);
+  if (!hevc_named_complete) j.KvS("error_code", Hex32(static_cast<unsigned long>(hevc_named_rc)));
+  j.KvI("not_in_family_list_count", hevc_named_unlisted);
+  j.Key("packages");
+  j.BeginArray();
+  for (const PackageHit& h : hevc_named) {
+    j.BeginObject();
+    j.KvS("name", h.name);
+    j.KvS("version", h.version);
+    j.KvS("architecture", h.architecture);
+    j.KvS("family", h.family);
+    j.KvB("in_known_family_list", h.in_known_family_list);
+    j.EndObject();
+  }
+  j.EndArray();
+  j.EndObject();
+  // Not read by the probe: it needs elevation. null means "could not be read", never "no", as in
+  // hwlab-common.ps1 (hw-inventory.ps1 reports the value).
+  j.Key("provisioned_system_image");
+  j.Null();
+  j.KvS("provisioned_system_image_note", "not read by the probe (needs elevation); see hw-inventory.ps1");
   j.KvB("software_decoder_mft_present", sw_dec_present);
   j.EndObject();
 
@@ -2222,12 +3171,74 @@ int main(int argc, char** argv) {
     j.BeginObject();
     for (const auto& kv : counts) j.KvI(kv.first.c_str(), kv.second);
     j.EndObject();
+    const std::map<std::string, std::string>& errs = pass == 0 ? enc_errors : dec_errors;
+    if (!errs.empty()) {
+      j.Key("enumeration_errors");
+      j.BeginObject();
+      for (const auto& kv : errs) j.KvS(kv.first.c_str(), kv.second);
+      j.EndObject();
+    }
     j.Key("mfts");
     j.BeginArray();
     for (const MftInfo& m : list) WriteMft(j, m);
     j.EndArray();
     j.EndObject();
   }
+
+  // The MFTs that MFTEnumEx returns with and without MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and
+  // unfiltered, side by side. The "decoders" and "encoders" objects above are the default
+  // enumeration only.
+  j.Key("store_mft_enumeration");
+  j.BeginObject();
+  j.Key("flag");
+  j.BeginObject();
+  j.KvS("name", "MFT_ENUM_FLAG_UNTRUSTED_STOREMFT");
+  j.KvS("value", Hex32(kEnumFlagUntrustedStoreMft));
+  j.KvS("documentation",
+        "per docs: the constant is listed in _MFT_ENUM_FLAG and has no description on Microsoft Learn "
+        "(read 2026-10-04); what it does is measured here, not assumed");
+  j.EndObject();
+  j.Key("decoders");
+  WriteEnumeration(j, dec_enum);
+  j.Key("encoders");
+  WriteEnumeration(j, enc_enum);
+  j.EndObject();
+
+  // What the D3D11 video device of each adapter offers, without any MFT. Read-only: profile
+  // list, output formats, decoder configuration counts, and one decoder object per supported
+  // profile, released at once.
+  j.Key("d3d11va");
+  j.BeginObject();
+  j.KvS("basis",
+        "ID3D11VideoDevice: GetVideoDecoderProfileCount/GetVideoDecoderProfile, CheckVideoDecoderFormat "
+        "(NV12, P010), GetVideoDecoderConfigCount at 1920x1080 and 3840x2160, and CreateVideoDecoder "
+        "(object released at once); no frame is decoded");
+  j.KvS("primary_profile", g_is_hevc ? "HEVC_VLD_MAIN" : "H264_VLD_NOFGT");
+  j.Key("profiles_checked");
+  j.BeginArray();
+  for (const VaProfileDef& d : kVaProfiles) {
+    if (!d.probed) continue;
+    j.BeginObject();
+    j.KvS("profile", d.name);
+    j.KvS("guid", GuidStr(d.guid));
+    j.KvS("native_output_format", d.ten_bit ? "P010" : "NV12");
+    j.EndObject();
+  }
+  j.EndArray();
+  j.Key("profile_names_known");
+  j.BeginArray();
+  for (const VaProfileDef& d : kVaProfiles) {
+    j.BeginObject();
+    j.KvS("profile", d.name);
+    j.KvS("guid", GuidStr(d.guid));
+    j.EndObject();
+  }
+  j.EndArray();
+  j.Key("adapters");
+  j.BeginArray();
+  for (const VaAdapterResult& v : va) WriteVaAdapter(j, v);
+  j.EndArray();
+  j.EndObject();
 
   j.Key("tests");
   j.BeginArray();
@@ -2242,6 +3253,23 @@ int main(int argc, char** argv) {
   auto kv = [&](const char* suffix, const Verdict& v) {
     j.KvS((pre + suffix).c_str(), v.status);
     if (v.status != "ok" && !v.reason.empty()) reasons.emplace_back(pre + suffix, v.reason);
+  };
+  auto ki = [&](const char* suffix, long long v) { j.KvI((pre + suffix).c_str(), v); };
+  // Number of distinct MFTs a variant returned; -1 when there was no enumeration (no Media Foundation)
+  // or the variant could not run at all (every query failed).
+  auto variant_count = [](const MftEnumeration& e, size_t vi) -> long long {
+    if (vi >= e.variants.size()) return -1;
+    const VariantResult& vr = e.variants[vi];
+    bool any_ok = false;
+    for (const auto& c : vr.counts) any_ok = any_ok || c.second >= 0;
+    return any_ok ? static_cast<long long>(vr.mfts.size()) : -1;
+  };
+  auto names_of = [&](const MftEnumeration& e, const std::string& cls) {
+    j.BeginArray();
+    for (const MftInfo& m : e.extras) {
+      if (m.mft_class == cls) j.Str(m.name + " (" + m.clsid + ")");
+    }
+    j.EndArray();
   };
   kb("hardware_encoder_present", hw_enc_present);
   kb("software_encoder_present", sw_enc_present);
@@ -2279,10 +3307,42 @@ int main(int argc, char** argv) {
   kv("hardware_mft_decode_1080p_status", v_hwmft_1080);
   kv("hardware_accelerated_decode_status", v_hw_accel);
   kv("decoder_configure_only_status", v_cfg);
-  j.KvB("video_send_possible", v_hw_enc_720.status == "ok");
-  j.KvB("video_send_1080p_possible", v_hw_enc_1080.status == "ok");
-  j.KvB("video_receive_possible", receive_possible);
+  // Derived values, tri-state like the *_status values they come from (which are the truth): ok,
+  // failed, or not_attempted. A value that was not asked is never false.
+  j.KvS("video_send_possible", v_hw_enc_720.status);
+  j.KvS("video_send_1080p_possible", v_hw_enc_1080.status);
+  j.KvS("video_receive_possible", v_receive.status);
   j.KvS("video_receive_basis", receive_basis);
+  // MFTEnumEx with and without MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered: how many decoders
+  // each returned (distinct MFTs), and which ones only a non-default enumeration returns.
+  ki("decoder_mft_count_default", variant_count(dec_enum, 0));
+  ki("decoder_mft_count_with_store_flag", variant_count(dec_enum, 1));
+  ki("decoder_mft_count_unfiltered", variant_count(dec_enum, 2));
+  ki("decoder_mft_count_unfiltered_with_store_flag", variant_count(dec_enum, 3));
+  ki("encoder_mft_count_default", variant_count(enc_enum, 0));
+  ki("encoder_mft_count_with_store_flag", variant_count(enc_enum, 1));
+  j.Key((pre + "store_mft_decoders").c_str());
+  names_of(dec_enum, "store_flag_only");
+  j.Key((pre + "store_mft_encoders").c_str());
+  names_of(enc_enum, "store_flag_only");
+  kv("store_mft_activation_status", store_cv.activation);
+  kv("store_mft_decode_720p_status", store_cv.dec720);
+  kv("store_mft_decode_1080p_status", store_cv.dec1080);
+  j.Key((pre + "other_flags_mft_decoders").c_str());
+  names_of(dec_enum, "needs_other_flags");
+  kv("other_flags_mft_activation_status", other_cv.activation);
+  kv("other_flags_mft_decode_720p_status", other_cv.dec720);
+  kv("other_flags_mft_decode_1080p_status", other_cv.dec1080);
+  // Can the GPU decode the codec through D3D11VA directly, without an MFT: ok when a
+  // non-software adapter passed every check for the profile (see d3d11va).
+  kv("d3d11va_decode_supported", v_va_primary);
+  j.Key((pre + "d3d11va_decode_by_adapter").c_str());
+  WriteVaByAdapter(j, va, g_is_hevc ? "HEVC_VLD_MAIN" : "H264_VLD_NOFGT");
+  if (g_is_hevc) {
+    kv("d3d11va_main10_decode_supported", v_va_main10);
+    j.Key((pre + "d3d11va_main10_decode_by_adapter").c_str());
+    WriteVaByAdapter(j, va, "HEVC_VLD_MAIN10");
+  }
   j.Key("reasons");
   j.BeginObject();
   for (const auto& rs : reasons) j.KvS(rs.first.c_str(), rs.second);

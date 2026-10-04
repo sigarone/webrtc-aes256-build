@@ -25,9 +25,20 @@ installare le HEVC Video Extensions: la sonda deve vedere la macchina com'e'.
 
 Il repository si usa solo in lettura: aggiorna con `git pull --ff-only`, non fare
 commit ne' push, non configurare remote nuovi. Non collegarti a server di produzione
-e non aprire connessioni verso host che non siano github.com (compresi gli host di
-download di GitHub, `*.githubusercontent.com`, verso cui github.com reindirizza i file
-delle release) e il registro di winget.
+e non aprire connessioni verso host che non siano github.com, i due host di GitHub
+elencati qui sotto e il registro di winget. Nessun altro sottodominio di
+githubusercontent.com e' ammesso, e non esiste un'eccezione a caratteri jolly:
+
+- Host di download delle release: `release-assets.githubusercontent.com`. E' l'host verso
+  cui github.com reindirizza i file delle release che gli script scaricano (osservato il
+  2026-10-04 con una richiesta HEAD a un file della release pinnata). La CI
+  (`hwlab-engine-build.yml`) controlla a ogni esecuzione che sia ancora l'host effettivo.
+- Host dei file raw: `raw.githubusercontent.com`. Solo al primo avvio, per leggere
+  README.md, CLAUDE.md e setup-hwlab.ps1 dal ramo main prima che il repository sia stato
+  clonato (vedi PROMPT-PRIMO-AVVIO.md).
+
+Se uno script o un download reindirizza a un host che non e' in questo elenco (GitHub puo'
+cambiarlo), fermati e dillo al proprietario: non allargare l'elenco da solo.
 
 Unica eccezione: `commondatastorage.googleapis.com`, e solo per il pacchetto clang di
 Chromium che `engine/cmake/fetch_webrtc.cmake` scarica per la build del motore tramite

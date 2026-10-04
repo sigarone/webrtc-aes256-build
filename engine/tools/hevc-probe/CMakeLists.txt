@@ -30,5 +30,6 @@ if(MSVC)
   # so that a DLL planted next to the downloaded exe is never picked up.
 endif()
 
+# advapi32: RegOpenKeyEx and RegEnumKeyEx, for the read-only scan of the registered package names.
 target_link_libraries(hevc-probe PRIVATE
-  mfplat mfuuid strmiids d3d11 dxgi ole32 delayimp)
+  mfplat mfuuid strmiids d3d11 dxgi ole32 advapi32 delayimp)
