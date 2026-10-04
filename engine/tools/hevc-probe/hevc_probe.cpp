@@ -2625,6 +2625,275 @@ Verdict ActivationVerdict(const std::vector<TestResult>& tests, const std::strin
   return {"not_attempted", none_reason};
 }
 
+// ---------------------------------------------------------------- self-test of the D3D11VA logic
+
+// The hosted runner has no GPU, so CheckProfile and VaVerdict would never meet a D3D11 video
+// device there, and what they decide (what "ok" means, which stage a failure is blamed on, that a
+// software adapter never counts) would be untested until the lab runs it. --selftest-d3d11va-logic
+// runs both against a scripted mock of ID3D11VideoDevice and prints what they decided, for CI to
+// compare with the expected answers. It touches no driver and no D3D11 device.
+std::atomic<int> g_mock_decoders_alive{0};
+
+class MockDecoder : public ID3D11VideoDecoder {
+ public:
+  MockDecoder() { ++g_mock_decoders_alive; }
+  ~MockDecoder() { --g_mock_decoders_alive; }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+    if (!out) return E_POINTER;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11DeviceChild) ||
+        riid == __uuidof(ID3D11VideoDecoder)) {
+      *out = static_cast<ID3D11VideoDecoder*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *out = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG n = --refs_;
+    if (n == 0) delete this;
+    return n;
+  }
+  void STDMETHODCALLTYPE GetDevice(ID3D11Device** d) override {
+    if (d) *d = nullptr;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE GetCreationParameters(D3D11_VIDEO_DECODER_DESC*,
+                                                  D3D11_VIDEO_DECODER_CONFIG*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE GetDriverHandle(HANDLE*) override { return E_NOTIMPL; }
+
+ private:
+  std::atomic<ULONG> refs_{1};
+};
+
+struct MockProfile {
+  GUID guid;
+  bool nv12;
+  bool p010;
+  UINT cfg1080;
+  UINT cfg2160;
+  HRESULT config_hr;    // GetVideoDecoderConfig
+  HRESULT create_1080;  // CreateVideoDecoder at 1920x1080
+  HRESULT create_1088;  // CreateVideoDecoder at 1920x1088
+};
+
+class MockVideoDevice : public ID3D11VideoDevice {
+ public:
+  std::vector<MockProfile> profiles;
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+    if (!out) return E_POINTER;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11VideoDevice)) {
+      *out = static_cast<ID3D11VideoDevice*>(this);
+      return S_OK;
+    }
+    *out = nullptr;
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+  HRESULT STDMETHODCALLTYPE CreateVideoDecoder(const D3D11_VIDEO_DECODER_DESC* d,
+                                               const D3D11_VIDEO_DECODER_CONFIG*,
+                                               ID3D11VideoDecoder** out) override {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    const MockProfile* p = d ? Find(d->Guid) : nullptr;
+    if (!p) return E_INVALIDARG;
+    const HRESULT hr = d->SampleHeight == 1088 ? p->create_1088 : p->create_1080;
+    if (SUCCEEDED(hr)) *out = new MockDecoder();
+    return hr;
+  }
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessor(ID3D11VideoProcessorEnumerator*, UINT,
+                                                 ID3D11VideoProcessor**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateAuthenticatedChannel(D3D11_AUTHENTICATED_CHANNEL_TYPE,
+                                                       ID3D11AuthenticatedChannel**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateCryptoSession(const GUID*, const GUID*, const GUID*,
+                                                ID3D11CryptoSession**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateVideoDecoderOutputView(ID3D11Resource*,
+                                                         const D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC*,
+                                                         ID3D11VideoDecoderOutputView**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorInputView(ID3D11Resource*, ID3D11VideoProcessorEnumerator*,
+                                                          const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC*,
+                                                          ID3D11VideoProcessorInputView**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorOutputView(ID3D11Resource*, ID3D11VideoProcessorEnumerator*,
+                                                           const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC*,
+                                                           ID3D11VideoProcessorOutputView**) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CreateVideoProcessorEnumerator(const D3D11_VIDEO_PROCESSOR_CONTENT_DESC*,
+                                                           ID3D11VideoProcessorEnumerator**) override {
+    return E_NOTIMPL;
+  }
+  UINT STDMETHODCALLTYPE GetVideoDecoderProfileCount(void) override {
+    return static_cast<UINT>(profiles.size());
+  }
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderProfile(UINT index, GUID* g) override {
+    if (!g || index >= profiles.size()) return E_INVALIDARG;
+    *g = profiles[index].guid;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE CheckVideoDecoderFormat(const GUID* g, DXGI_FORMAT f, BOOL* ok) override {
+    if (!g || !ok) return E_POINTER;
+    const MockProfile* p = Find(*g);
+    if (!p) return E_INVALIDARG;  // per docs: a profile the driver does not support
+    *ok = (f == DXGI_FORMAT_NV12 && p->nv12) || (f == DXGI_FORMAT_P010 && p->p010);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderConfigCount(const D3D11_VIDEO_DECODER_DESC* d, UINT* n) override {
+    if (!d || !n) return E_POINTER;
+    const MockProfile* p = Find(d->Guid);
+    if (!p) return E_INVALIDARG;
+    *n = d->SampleWidth >= 3840 ? p->cfg2160 : p->cfg1080;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetVideoDecoderConfig(const D3D11_VIDEO_DECODER_DESC* d, UINT,
+                                                  D3D11_VIDEO_DECODER_CONFIG* c) override {
+    if (!d || !c) return E_POINTER;
+    const MockProfile* p = Find(d->Guid);
+    if (!p) return E_INVALIDARG;
+    return p->config_hr;
+  }
+  HRESULT STDMETHODCALLTYPE GetContentProtectionCaps(const GUID*, const GUID*,
+                                                     D3D11_VIDEO_CONTENT_PROTECTION_CAPS*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE CheckCryptoKeyExchange(const GUID*, const GUID*, UINT, GUID*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+
+ private:
+  const MockProfile* Find(const GUID& g) const {
+    for (const MockProfile& p : profiles) {
+      if (p.guid == g) return &p;
+    }
+    return nullptr;
+  }
+};
+
+GUID VaGuid(const char* name) {
+  for (const VaProfileDef& d : kVaProfiles) {
+    if (std::string(d.name) == name) return d.guid;
+  }
+  return GUID{};
+}
+
+// Runs CheckProfile and VaVerdict on the scripted mock and returns the JSON of what they decided.
+std::string VaLogicSelfTest() {
+  MockVideoDevice dev;
+  dev.profiles = {
+      // all good, decoder object at 1920x1080
+      {VaGuid("H264_VLD_NOFGT"), true, false, 1, 1, S_OK, S_OK, S_OK},
+      // the driver refuses a 1920x1080 decoder object and takes 1920x1088: still ok, two tries
+      {VaGuid("HEVC_VLD_MAIN"), true, false, 3, 2, S_OK, E_INVALIDARG, S_OK},
+      // listed, but not with P010, the native format of a 10 bit profile
+      {VaGuid("HEVC_VLD_MAIN10"), true, false, 2, 1, S_OK, S_OK, S_OK},
+      // listed and NV12, but no decoder configuration at 1920x1080
+      {VaGuid("VP9_VLD_PROFILE0"), true, false, 0, 0, S_OK, S_OK, S_OK},
+      // every check passes but the decoder object cannot be made
+      {VaGuid("AV1_VLD_PROFILE0"), true, false, 1, 1, S_OK, E_OUTOFMEMORY, E_OUTOFMEMORY},
+      // (VP9_VLD_10BIT_PROFILE2 is not listed at all)
+  };
+  std::vector<GUID> listed;
+  const UINT n = dev.GetVideoDecoderProfileCount();
+  for (UINT i = 0; i < n; ++i) {
+    GUID g{};
+    if (SUCCEEDED(dev.GetVideoDecoderProfile(i, &g))) listed.push_back(g);
+  }
+  std::vector<VaProfileCheck> checks;
+  for (const VaProfileDef& def : kVaProfiles) {
+    if (!def.probed) continue;
+    VaProfileCheck c;
+    CheckProfile(&dev, def, listed, &c);
+    checks.push_back(std::move(c));
+  }
+
+  auto adapter = [&](const char* name, unsigned vendor, bool software, Outcome outcome) {
+    VaAdapterResult v;
+    v.adapter.description = name;
+    v.adapter.vendor_id = vendor;
+    v.adapter.software = software;
+    v.tr.outcome = outcome;
+    if (outcome == Outcome::kOk) {
+      v.checks = checks;
+    } else if (outcome == Outcome::kFailed) {
+      v.tr.stage = "create_d3d_device";
+      v.tr.hr = DXGI_ERROR_UNSUPPORTED;
+    } else {
+      v.tr.reason_code = "no_video_device";
+      v.tr.reason = "the adapter has no video device";
+    }
+    return v;
+  };
+  const VaAdapterResult hw_ok = adapter("hardware A", 0x8086, false, Outcome::kOk);
+  const VaAdapterResult hw_failed = adapter("hardware B", 0x10DE, false, Outcome::kFailed);
+  const VaAdapterResult hw_none = adapter("hardware C", 0x1002, false, Outcome::kNotAttempted);
+  const VaAdapterResult sw_ok = adapter("software D", 0x1414, true, Outcome::kOk);
+
+  Json j;
+  j.BeginObject();
+  j.Key("tool");
+  j.BeginObject();
+  j.KvS("name", "hevc-probe");
+  j.KvS("mode", "selftest_d3d11va_logic");
+  j.EndObject();
+  j.KvI("mock_profile_count", n);
+  j.Key("checked");
+  j.BeginArray();
+  for (const VaProfileCheck& c : checks) WriteVaCheck(j, c);
+  j.EndArray();
+  j.KvI("mock_decoder_objects_left", g_mock_decoders_alive.load());
+
+  struct Case {
+    const char* name;
+    std::vector<VaAdapterResult> adapters;
+    const char* profile;
+  };
+  const Case cases[] = {
+      {"a_hardware_ok_and_hardware_failed", {hw_ok, hw_failed}, "HEVC_VLD_MAIN"},
+      {"b_hardware_failed_and_software_ok", {hw_failed, sw_ok}, "HEVC_VLD_MAIN"},
+      {"c_software_ok_only", {sw_ok}, "HEVC_VLD_MAIN"},
+      {"d_no_adapter", {}, "HEVC_VLD_MAIN"},
+      {"e_hardware_without_video_device", {hw_none}, "HEVC_VLD_MAIN"},
+      {"f_hardware_ok_but_the_profile_failed", {hw_ok}, "AV1_VLD_PROFILE0"},
+      {"g_hardware_ok_h264", {hw_ok, sw_ok}, "H264_VLD_NOFGT"},
+      {"h_hardware_ok_but_the_profile_not_listed", {hw_ok}, "VP9_VLD_10BIT_PROFILE2"},
+  };
+  j.Key("verdict_cases");
+  j.BeginArray();
+  for (const Case& c : cases) {
+    const Verdict v = VaVerdict(c.adapters, c.profile);
+    j.BeginObject();
+    j.KvS("case", c.name);
+    j.KvS("profile", c.profile);
+    j.KvS("status", v.status);
+    j.KvS("reason", v.reason);
+    j.Key("by_adapter");
+    WriteVaByAdapter(j, c.adapters, c.profile);
+    j.EndObject();
+  }
+  j.EndArray();
+  j.EndObject();
+  return j.Text() + "\n";
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- main
@@ -2632,6 +2901,7 @@ Verdict ActivationVerdict(const std::vector<TestResult>& tests, const std::strin
 int main(int argc, char** argv) {
   bool pause = false;
   bool ci = false;
+  bool selftest_va_logic = false;
   bool want[2] = {true, true};  // 720p, 1080p
   std::wstring out_name = L"hevc-probe-report.json";
   for (int i = 1; i < argc; ++i) {
@@ -2643,6 +2913,8 @@ int main(int argc, char** argv) {
       g_allow_sw_adapter = true;
     } else if (a == "--allow-software-adapter") {
       g_allow_sw_adapter = true;
+    } else if (a == "--selftest-d3d11va-logic") {
+      selftest_va_logic = true;
     } else if (a == "--resolutions" && i + 1 < argc) {
       std::string v = argv[++i];
       want[0] = want[1] = false;
@@ -2683,6 +2955,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr,
                    "hevc-probe [--out <file name>] [--pause] [--codec hevc|h264]\n"
                    "           [--resolutions 720,1080] [--allow-software-adapter] [--ci]\n"
+                   "           [--selftest-d3d11va-logic]\n"
                    "Writes a JSON report to stdout and to a file next to the exe.\n"
                    "--resolutions   run only the listed resolutions (default both); 1080 alone\n"
                    "                shows whether a 1080p failure depends on the 720p run before it\n"
@@ -2691,7 +2964,10 @@ int main(int argc, char** argv) {
                    "                about hardware)\n"
                    "--ci            --allow-software-adapter, and exit code 4 when an attempt\n"
                    "                crashed or timed out (the default exit code is 0 whenever the\n"
-                   "                report was written, a machine without a GPU included)\n");
+                   "                report was written, a machine without a GPU included)\n"
+                   "--selftest-d3d11va-logic  run the D3D11VA decision logic against a scripted\n"
+                   "                mock of ID3D11VideoDevice and print what it decided (CI; no\n"
+                   "                driver is touched, no report file is written)\n");
       return 0;
     }
   }
@@ -2710,6 +2986,13 @@ int main(int argc, char** argv) {
   }).detach();
 
   _setmode(_fileno(stdout), _O_BINARY);  // the file and stdout carry identical bytes
+  if (selftest_va_logic) {
+    const std::string text = VaLogicSelfTest();
+    std::fwrite(text.data(), 1, text.size(), stdout);
+    std::fflush(stdout);
+    g_run_finished = true;
+    ExitProcess(0);
+  }
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   std::fprintf(stderr, "[hevc-probe] start (%s)\n", g_codec_name);
 

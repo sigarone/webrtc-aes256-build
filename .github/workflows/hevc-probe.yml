@@ -136,7 +136,7 @@ jobs:
           if (-not $ext.provisioned_system_image_note) { throw 'provisioned_system_image_note is missing' }
           $named = $ext.hevc_named_packages_current_user
           if ($null -eq $named -or $named.readable -isnot [bool] -or -not $named.source) { throw 'hevc_named_packages_current_user is incomplete' }
-          if (-not $named.PSObject.Properties['packages'] -or $named.not_in_family_list_count -isnot [int]) { throw 'hevc_named_packages_current_user has no package list or count' }
+          if (-not $named.PSObject.Properties['packages'] -or ($named.not_in_family_list_count -isnot [int] -and $named.not_in_family_list_count -isnot [long])) { throw 'hevc_named_packages_current_user has no package list or count' }
           # Why there is no decoder is said as measured: the enumerations are named, and a missing
           # registration is not claimed while a package is registered.
           $why = [string]$s.reasons.hevc_decode_720p_status
@@ -198,11 +198,12 @@ jobs:
             if ($s.$k -eq 'ok' -and @($rep.adapters | Where-Object { -not $_.software_adapter }).Count -eq 0) { throw "$k is ok on a machine with no non-software adapter" }
             if ($s.$k -ne 'ok' -and -not $s.reasons.$k) { throw "$k carries no reason" }
           }
-          foreach ($k in 'hevc_d3d11va_decode_by_adapter', 'hevc_d3d11va_main10_decode_by_adapter') {
-            foreach ($a in @($s.$k)) {
-              if ($a.status -notin @('ok', 'failed', 'not_attempted')) { throw "bad status in $k" }
-              if ($a.status -eq 'ok' -and $a.software_adapter) { throw "a software adapter is reported ok in $k" }
+          foreach ($pair in @(@('hevc_d3d11va_decode_supported', 'hevc_d3d11va_decode_by_adapter'), @('hevc_d3d11va_main10_decode_supported', 'hevc_d3d11va_main10_decode_by_adapter'))) {
+            foreach ($a in @($s.($pair[1]))) {
+              if ($a.status -notin @('ok', 'failed', 'not_attempted')) { throw "bad status in $($pair[1])" }
             }
+            # ok needs a non-software adapter that said ok: a software adapter's own answer is listed but never counts.
+            if ($s.($pair[0]) -eq 'ok' -and -not (@($s.($pair[1])) | Where-Object { $_.status -eq 'ok' -and -not $_.software_adapter })) { throw "$($pair[0]) is ok without a non-software adapter that said ok" }
           }
 
       # The decoder profile GUIDs of the probe are written out in its source (the SDK declares them as
@@ -232,6 +233,64 @@ jobs:
           foreach ($need in 'H264_VLD_NOFGT', 'HEVC_VLD_MAIN', 'HEVC_VLD_MAIN10', 'VP9_VLD_PROFILE0', 'VP9_VLD_10BIT_PROFILE2', 'AV1_VLD_PROFILE0') {
             if ($compared -notcontains $need) { throw "the GUID of $need was not compared with the SDK (the SDK on the runner is too old, or the name is wrong)" }
           }
+
+      # The hosted runner has no GPU and no video device, so the decision logic of the D3D11VA checks
+      # (what "ok" means for a profile, which stage a failure is blamed on, that a software adapter
+      # never counts) would otherwise first run on the lab PC. The probe runs it against a scripted
+      # mock of ID3D11VideoDevice (--selftest-d3d11va-logic); the answers are compared here.
+      - name: The D3D11VA decision logic, against a scripted video device
+        shell: pwsh
+        run: |
+          build/Release/hevc-probe.exe --selftest-d3d11va-logic | Out-File -Encoding utf8 va-logic.json
+          if ($LASTEXITCODE -ne 0) { throw "the self-test exited with $LASTEXITCODE" }
+          $r = Get-Content va-logic.json -Raw | ConvertFrom-Json
+          $r.checked | ForEach-Object { Write-Host ("{0}: {1} {2} {3}" -f $_.profile, $_.status, $_.failed_stage, $_.hresult) }
+          $r.verdict_cases | ForEach-Object { Write-Host ("{0}: {1} {2}" -f $_.case, $_.status, $_.reason) }
+          function Check($name) { $c = @($r.checked | Where-Object { $_.profile -eq $name }); if ($c.Count -ne 1) { throw "no check for $name" }; return $c[0] }
+          if ($r.mock_profile_count -ne 5) { throw 'the mock lists five profiles' }
+          if (@($r.checked).Count -ne 6) { throw 'the six profiles are checked' }
+          if ($r.mock_decoder_objects_left -ne 0) { throw "a decoder object was not released: $($r.mock_decoder_objects_left) left" }
+          $c = Check 'H264_VLD_NOFGT'
+          if ($c.status -ne 'ok' -or -not $c.listed -or $c.decoder_object.status -ne 'ok' -or @($c.decoder_object.tries).Count -ne 1 -or $c.decoder_object.tries[0].size -ne '1920x1080') { throw 'H264_VLD_NOFGT should be ok at the first try' }
+          if ($c.decoder_config_count.'1920x1080'.count -ne 1 -or $c.decoder_config_count.'3840x2160'.count -ne 1) { throw 'H264 config counts' }
+          $c = Check 'HEVC_VLD_MAIN'
+          if ($c.status -ne 'ok') { throw 'HEVC_VLD_MAIN should be ok (the second size works)' }
+          $t = @($c.decoder_object.tries)
+          if ($t.Count -ne 2 -or $t[0].size -ne '1920x1080' -or $t[0].stage -ne 'create_decoder' -or $t[0].hresult -ne '0x80070057' -or $t[1].size -ne '1920x1088' -or $t[1].hresult -ne '0x00000000') { throw 'HEVC_VLD_MAIN: the two tries are not reported as scripted' }
+          if ($c.decoder_config_count.'1920x1080'.count -ne 3 -or $c.decoder_config_count.'3840x2160'.count -ne 2) { throw 'HEVC_VLD_MAIN config counts' }
+          if (-not $c.output_formats.NV12.supported -or $c.output_formats.P010.supported) { throw 'HEVC_VLD_MAIN output formats' }
+          $c = Check 'HEVC_VLD_MAIN10'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'output_format_p010_not_supported' -or -not $c.listed -or $c.decoder_object.status -ne 'not_attempted') { throw 'HEVC_VLD_MAIN10 should fail on its native P010 format and not make a decoder object' }
+          $c = Check 'VP9_VLD_PROFILE0'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'no_decoder_config_1080p' -or $c.decoder_object.status -ne 'not_attempted') { throw 'VP9_VLD_PROFILE0 should fail on the missing 1080p configuration' }
+          $c = Check 'VP9_VLD_10BIT_PROFILE2'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'profile_not_listed' -or $c.listed) { throw 'VP9_VLD_10BIT_PROFILE2 is not listed' }
+          if ($null -ne $c.output_formats.NV12.supported -or $null -ne $c.decoder_config_count.'1920x1080'.count) { throw 'an unlisted profile must not be asked anything else (the answers are null)' }
+          $c = Check 'AV1_VLD_PROFILE0'
+          if ($c.status -ne 'failed' -or $c.failed_stage -ne 'create_decoder' -or $c.hresult -ne '0x8007000E' -or @($c.decoder_object.tries).Count -ne 2) { throw 'AV1_VLD_PROFILE0 should fail at the decoder object after two tries' }
+          # Verdicts: a software adapter never counts; a failed hardware adapter is a failure; nothing asked is not_attempted.
+          function Verdict($case) { $v = @($r.verdict_cases | Where-Object { $_.case -eq $case }); if ($v.Count -ne 1) { throw "no verdict case $case" }; return $v[0] }
+          $v = Verdict 'a_hardware_ok_and_hardware_failed'
+          if ($v.status -ne 'ok' -or $v.reason) { throw 'a: one working hardware adapter makes it ok' }
+          $by = @($v.by_adapter)
+          if ($by.Count -ne 2 -or $by[0].status -ne 'ok' -or $by[1].status -ne 'failed' -or $by[1].reason -notmatch 'create_d3d_device 0x887A0004') { throw 'a: by_adapter does not say which adapter said what' }
+          $v = Verdict 'b_hardware_failed_and_software_ok'
+          if ($v.status -ne 'failed' -or $v.reason -notmatch 'hardware B: create_d3d_device 0x887A0004') { throw "b: a software adapter must not rescue a failed hardware adapter: $($v.status) $($v.reason)" }
+          $by = @($v.by_adapter)
+          if (-not ($by | Where-Object { $_.software_adapter -and $_.status -eq 'ok' })) { throw 'b: the software adapter own answer is listed (and flagged), not hidden' }
+          $v = Verdict 'c_software_ok_only'
+          if ($v.status -ne 'not_attempted' -or $v.reason -notmatch 'never counts') { throw "c: a software adapter alone must not count: $($v.status)" }
+          $v = Verdict 'd_no_adapter'
+          if ($v.status -ne 'not_attempted' -or -not $v.reason) { throw 'd: no adapter is not_attempted with a reason' }
+          $v = Verdict 'e_hardware_without_video_device'
+          if ($v.status -ne 'not_attempted' -or $v.reason -notmatch 'hardware C: the adapter has no video device') { throw 'e: an adapter without a video device is not_attempted, not failed' }
+          $v = Verdict 'f_hardware_ok_but_the_profile_failed'
+          if ($v.status -ne 'failed' -or $v.reason -notmatch 'create_decoder') { throw 'f: a failed profile makes the verdict failed' }
+          $v = Verdict 'g_hardware_ok_h264'
+          if ($v.status -ne 'ok') { throw 'g: H.264 on a working hardware adapter is ok' }
+          $v = Verdict 'h_hardware_ok_but_the_profile_not_listed'
+          if ($v.status -ne 'failed' -or $v.reason -notmatch 'profile_not_listed') { throw 'h: an unlisted profile is a failure of that profile' }
+          Write-Host 'D3D11VA decision logic ok'
 
       - name: Self-test of the encode and decode machinery (same pipeline, H.264, D3D11 on the software adapter)
         shell: pwsh
