@@ -557,6 +557,57 @@ jobs:
           if ($s.installed -ne $s.registered_current_user) { throw 'installed must equal registered_current_user' }
           if ($null -ne $s.provisioned_system_image -and $s.provisioned_system_image -isnot [bool]) { throw 'provisioned_system_image is true, false or null' }
 
+      # The hosted runner has no HEVC package, so the shape step above sees an empty list. Here the
+      # same function runs against a fake Get-AppxPackage (a function shadows the cmdlet): the
+      # FirstParty family counts as installed, and a package with a name nobody listed (the bug that
+      # started this: a registered variant reported as "not installed") is listed and flagged.
+      - name: Get-HevcExtensionStatus on fake packages (known family, unknown variant, unreadable)
+        shell: powershell
+        run: |
+          . (Join-Path (Resolve-Path engine/tools/hwlab) 'hwlab-common.ps1')
+          $script:fake = @()
+          $script:fakeThrows = $false
+          function Get-AppxPackage {
+            [CmdletBinding()]
+            param([string]$Name, [switch]$AllUsers)
+            if ($script:fakeThrows) { throw 'fake failure' }
+            $script:fake | Where-Object { $_.Name -like $Name }
+          }
+          function Pkg($name, $ver, $family) { [pscustomobject]@{ Name = $name; Version = [version]$ver; PackageFamilyName = $family; Status = 'Ok' } }
+          $first = Pkg 'Microsoft.HEVCVideoExtensionFirstParty' '2.4.111.0' 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe'
+          $vendor = Pkg 'Vendor.HEVCPlayer' '1.2.3.4' 'Vendor.HEVCPlayer_abc123'
+          $other = Pkg 'Microsoft.VP9VideoExtensions' '1.2.20.0' 'Microsoft.VP9VideoExtensions_8wekyb3d8bbwe'
+
+          # 1. the package of the lab PC, an unknown variant and an unrelated codec package
+          $script:fake = @($first, $vendor, $other)
+          $r = Get-HevcExtensionStatus
+          if ($r.registered_current_user -ne $true -or $r.installed -ne $true) { throw 'the FirstParty family must count as registered for the current user' }
+          if (@($r.registered_current_user_packages) -notcontains 'Microsoft.HEVCVideoExtensionFirstParty 2.4.111.0') { throw 'the FirstParty package is not listed with its version' }
+          $n = @($r.hevc_named_packages_current_user)
+          if ($n.Count -ne 2) { throw "the *HEVC* list must hold the FirstParty and the unknown variant, not the VP9 package: $($n.Count)" }
+          $f = @($n | Where-Object { $_.name -eq 'Microsoft.HEVCVideoExtensionFirstParty' })[0]
+          $v = @($n | Where-Object { $_.name -eq 'Vendor.HEVCPlayer' })[0]
+          if (-not $f.in_known_family_list -or $f.version -ne '2.4.111.0' -or $f.family -ne 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe' -or $f.status -ne 'Ok') { throw 'the FirstParty entry is wrong' }
+          if ($v.in_known_family_list) { throw 'an unknown variant must not be flagged as a known family' }
+          if ($r.hevc_named_packages_not_in_family_list -ne 1) { throw "not_in_family_list is $($r.hevc_named_packages_not_in_family_list), expected 1" }
+
+          # 2. only a variant nobody listed: not registered (known families), but it is seen
+          $script:fake = @($vendor)
+          $r = Get-HevcExtensionStatus
+          if ($r.registered_current_user -ne $false) { throw 'a package outside the family list is not a registration of a known family' }
+          if (@($r.hevc_named_packages_current_user).Count -ne 1 -or $r.hevc_named_packages_not_in_family_list -ne 1) { throw 'the unknown variant must be listed and counted' }
+
+          # 3. nothing registered
+          $script:fake = @()
+          $r = Get-HevcExtensionStatus
+          if ($r.registered_current_user -ne $false -or @($r.hevc_named_packages_current_user).Count -ne 0 -or $r.hevc_named_packages_not_in_family_list -ne 0) { throw 'nothing registered must read as false, an empty list and 0' }
+
+          # 4. Get-AppxPackage fails: unknown, never false
+          $script:fakeThrows = $true
+          $r = Get-HevcExtensionStatus
+          if ($null -ne $r.registered_current_user -or $null -ne $r.hevc_named_packages_current_user -or $null -ne $r.hevc_named_packages_not_in_family_list) { throw 'an unreadable package list must be null, never false' }
+          Write-Host 'fake package scenarios ok'
+
       # The manifest reading of hw-inventory.ps1 is pure: run it on fixture manifests (an HEVC decoder
       # and encoder with a duplicate, an encoder only, a decoder for another codec, no codec extension).
       - name: Get-MediaCodecsFromManifest reads the codecs a package declares (fixture manifests)
