@@ -43,10 +43,15 @@ view. These rules hold for the kit and for the session that runs it.
   winget (the five packages listed below), the `git clone` and `git pull` of this
   repository, and, only when the owner has agreed, the engine build download of
   `engine-local-build.ps1 -AllowDownload`: the pinned libwebrtc release from github.com
-  (served from GitHub's own download hosts) and the Chromium clang package from
-  `commondatastorage.googleapis.com`, every file checked against a sha256 pinned in the
+  (which redirects to `release-assets.githubusercontent.com`) and the Chromium clang package
+  from `commondatastorage.googleapis.com`, every file checked against a sha256 pinned in the
   repository. That script prints the hosts and URLs first and refuses to download without
-  `-AllowDownload`, so the lab session can show them to the owner.
+  `-AllowDownload`, so the lab session can show them to the owner. The hosts the lab session
+  may contact are listed exactly in `CLAUDE.md`, never with a wildcard: `github.com`,
+  `release-assets.githubusercontent.com` (the redirect target of the release files, checked
+  by CI against a real release asset on every run of `hwlab-engine-build.yml`; if GitHub ever
+  changes it, CI fails and the list is updated in a reviewed commit) and
+  `raw.githubusercontent.com` (first start only, to read the guides before the clone exists).
 
 ## Steps
 
@@ -154,7 +159,9 @@ contains:
   recognized as audio).
 - Cameras by friendly name.
 - The HEVC Video Extensions, with one definition shared with `setup-hwlab.ps1` (see
-  "The HEVC Video Extensions" below).
+  "The HEVC Video Extensions" below): the three facts, every registered package with HEVC in
+  its name (known family or not), and, per package, the media codecs it declares in its
+  manifest (`hevc_package_media_codecs`: category, and whether it takes or produces HEVC).
 
 It does not read or write serial numbers, the machine name, the user name, MAC
 addresses, IP addresses or paths that contain the user name.
@@ -174,6 +181,20 @@ Results are `ok`, `failed` or `not_attempted` (the reason is in `summary.reasons
 attempt that was not made, such as the 1080p decode when no 1080p bitstream exists, is
 `not_attempted`, never `failed`. The fields, and what `dxva_decode_*` and
 `hardware_accelerated_decode_status` mean, are in `engine/tools/hevc-probe/README.md`.
+Besides the encode and decode tests the probe answers two questions about HEVC decoding
+that the encode and decode tests could not:
+
+- Is a decoder that is installed as a Store package returned to the probe at all? The
+  summary has the number of decoder MFTs that `MFTEnumEx` returns by default, with
+  `MFT_ENUM_FLAG_UNTRUSTED_STOREMFT`, and unfiltered (`hevc_decoder_mft_count_*`), the MFTs
+  that only the store flag returns (`hevc_store_mft_decoders`), and whether one of them can
+  be activated and decodes (`hevc_store_mft_activation_status`,
+  `hevc_store_mft_decode_720p_status`, `..._1080p_status`). A refused activation is reported
+  as such (`activation_refused`), not as a missing decoder.
+- Can each GPU decode HEVC through D3D11 video decoding directly, without any MFT?
+  `hevc_d3d11va_decode_supported` (and `..._by_adapter`, one entry per adapter, so the Intel
+  and the NVIDIA adapter of a hybrid laptop are told apart; `hevc_d3d11va_main10_...` for
+  10 bit) and the `d3d11va` section with the profiles each driver lists.
 When a codec's 1080p hardware encode is not `ok` although its 720p one was, the script
 runs the probe once more for 1080p alone (`--resolutions 1080`) in a fresh process,
 saves it as `hevc-probe-<codec>-1080only-<stamp>.json` and writes
@@ -242,10 +263,12 @@ the clone first), `-Clean` (delete the build folder first).
 
 ## The HEVC Video Extensions
 
-The two package families are `Microsoft.HEVCVideoExtension_8wekyb3d8bbwe` and
-`Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe`. The packages are registered per user, so
-three different facts exist, and the scripts and the probe report them under their own
-names:
+The three package families are `Microsoft.HEVCVideoExtension_8wekyb3d8bbwe`,
+`Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe` and
+`Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe` (the one the lab PC has). The list is in
+`hwlab-common.ps1` and `setup-hwlab.ps1` (word for word, compared by CI) and in the probe (its
+list is compared with the scripts' by CI). The packages are registered per user, so three
+different facts exist, and the scripts and the probe report them under their own names:
 
 | Field | Meaning |
 | --- | --- |
@@ -253,6 +276,17 @@ names:
 | `provisioned_system_image` | part of the system image and installed for users when they first sign in (`Get-AppxProvisionedPackage -Online`). Needs elevation; `null` means unknown |
 | `registered_any_user` | registered for some account (`Get-AppxPackage -AllUsers`). Needs elevation; `null` means unknown. Registered for another account does not help the current user |
 
+`null` always means "could not be read", never "no", in the scripts and in the probe (the probe
+does not read `provisioned_system_image` and reports `null` with a note).
+
+Whatever the family list says, every package registered for the current user whose name matches
+`*HEVC*` is listed too (`hevc_named_packages_current_user`, with `in_known_family_list` and
+`hevc_named_packages_not_in_family_list`), so that a new variant is seen the day it appears and
+is not reported as "not installed" because nobody has added its name yet.
+`hw-inventory.ps1` also reads each such package's manifest and reports the media codecs it
+declares (`hevc_package_media_codecs`). That matters because Media Foundation can only return a
+Store codec that its package declares; "registered" and "declares a video decoder for HEVC" are
+different facts.
 `setup-hwlab.ps1`, `hw-inventory.ps1` and the probe agree on this. An earlier elevated
 `-AllUsers` query reported "installed" for a machine on which the probe, running as the
 current user, saw nothing: the two had asked different questions.
