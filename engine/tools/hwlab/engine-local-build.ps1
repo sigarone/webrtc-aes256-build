@@ -230,7 +230,8 @@ function Get-ClangPackage($Pins, [string]$FlagsFile) {
   return [pscustomobject]@{ Url = $url; Sha256 = $sum }
 }
 
-function Show-Plan($Pins, $Clang, [bool]$Cached) {
+# State: 'needs_allow' (nothing is downloaded yet), 'cached' (nothing has to be) or 'approved' (-AllowDownload given).
+function Show-Plan($Pins, $Clang, [string]$State) {
   Write-Host ''
   Write-Host 'engine-local-build: download plan'
   Write-Host ''
@@ -261,8 +262,10 @@ function Show-Plan($Pins, $Clang, [bool]$Cached) {
     Write-Host '    github.com and print the exact url before anything else is downloaded.'
   }
   Write-Host ''
-  if ($Cached) {
+  if ($State -eq 'cached') {
     Write-Host '  A complete, verified download is already in the fetch folder: nothing has to be downloaded.'
+  } elseif ($State -eq 'approved') {
+    Write-Host '  -AllowDownload was given: the download starts now.'
   } else {
     Write-Host '  Nothing is downloaded until the script is run with -AllowDownload.'
   }
@@ -384,13 +387,13 @@ Update-SessionPath
 $cached = Test-FetchComplete
 
 if ($PlanOnly) {
-  Show-Plan $pins $clangPkg $cached
+  Show-Plan $pins $clangPkg $(if ($cached) { 'cached' } else { 'needs_allow' })
   Write-Host 'PLAN ONLY: nothing was downloaded (exit code 10).'
   exit 10
 }
 
 if (-not $PreflightOnly -and -not $cached -and -not $AllowDownload) {
-  Show-Plan $pins $clangPkg $false
+  Show-Plan $pins $clangPkg 'needs_allow'
   Write-Host 'STOPPED: nothing was downloaded. Show the hosts above to the owner and, when they agree,' -ForegroundColor Yellow
   Write-Host '         run the script again with -AllowDownload (exit code 10).' -ForegroundColor Yellow
   exit 10
@@ -509,7 +512,7 @@ try {
     $fetchSkipped = $true
     Write-Log 'the fetch folder already holds a complete, verified download: nothing is downloaded' 'OK'
   } else {
-    Show-Plan $pins $clangPkg $false
+    Show-Plan $pins $clangPkg 'approved'
     Write-Log ('downloading (-AllowDownload given): hosts github.com and {0}' -f $ClangHost)
     $null = Run-Step 'fetch' $cmakeExe @(('-DQMEDIA_FETCH_DIR=' + (ConvertTo-Slash $FetchDir)), '-P', (ConvertTo-Slash $fetchScript)) $FetchTimeoutMinutes 2
   }

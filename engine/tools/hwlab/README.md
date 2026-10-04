@@ -231,6 +231,10 @@ is started in the background and its log is followed, not waited for:
     $log = Get-ChildItem C:\hwlab\reports\engine-build-*.log | Sort-Object LastWriteTime | Select-Object -Last 1
     Get-Content $log.FullName -Wait -Tail 40
 
+CI runs this script end to end on a hosted runner (`.github/workflows/hwlab-engine-build.yml`:
+download, verify, build, call test, report, and a second run that reuses the verified
+download), so a change to it is tested before the lab PC ever runs it.
+
 Exit codes: 0 built and tested, 1 toolchain or repository problem, 2 download failed,
 3 configure failed, 4 build failed, 5 call test failed, 10 plan printed and nothing
 downloaded. Options: `-PreflightOnly` (toolchain check only), `-Update` (fast-forward
