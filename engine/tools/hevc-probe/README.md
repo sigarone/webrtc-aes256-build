@@ -45,7 +45,10 @@ the D3D manager and stopping the stream), releases every COM object and the devi
 manager, flushes the device, and pauses 300 ms before the next attempt starts. The report
 carries what the teardown found: `mft_refs_left_after_release` is the reference count the
 MFT had left after the last release (0 is clean; more means something still holds the
-instance), and a hung earlier attempt is noted on the attempts after it.
+instance), and a hung earlier attempt is noted on the attempts after it. The result of an
+attempt is taken before its teardown runs and the teardown is waited for separately (10
+seconds), so a call that blocks in the teardown costs the step trace of that attempt, not
+the result of an attempt that worked.
 
 Why. In version 1 of the probe, a 1080p encode failed in
 `ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER)` with `E_FAIL` seconds after a 720p encode

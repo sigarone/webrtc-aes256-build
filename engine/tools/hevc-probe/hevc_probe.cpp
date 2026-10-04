@@ -67,6 +67,11 @@ constexpr DWORD kTestTimeoutMs = 45000;
 // hardware session asynchronously has finished before the next attempt starts.
 constexpr DWORD kSettleMs = 300;
 constexpr UINT32 kH265Main420x8 = 1;  // eAVEncH265VProfile_Main_420_8
+// How long the teardown of one attempt may take after its result was published. A
+// call that hangs there (an MFT that blocks in a shutdown message) must not turn an
+// attempt that worked into a timeout, so the result is taken first and the teardown is
+// waited for separately.
+constexpr DWORD kTeardownWaitMs = 10000;
 // Upper bound for the whole run. The per-test watchdog does not cover the
 // start-up enumeration (DXGI and MFTEnumEx load vendor user-mode drivers), so a
 // stuck driver there would otherwise leave the process hanging forever.
@@ -1221,8 +1226,17 @@ void RunEncode(const MftInfo& mi, int w, int h, bool use_d3d, EncodeOut& out, Se
   }
 }
 
-EncodeOut DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
-  EncodeOut out;
+// What one attempt hands back: its result, and the teardown that still has to run. The
+// watchdog publishes the result first and runs the teardown afterwards (see WithWatchdog).
+template <typename R>
+struct Attempt {
+  R result;
+  std::function<void(TestResult*)> cleanup;
+};
+
+Attempt<EncodeOut> DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
+  Attempt<EncodeOut> a;
+  EncodeOut& out = a.result;
   TestResult& r = out.r;
   r.role = "encode";
   r.kind = "full";
@@ -1230,10 +1244,10 @@ EncodeOut DoEncode(const MftInfo& mi, int w, int h, bool use_d3d) {
   r.hardware = mi.hardware;
   r.width = w;
   r.height = h;
-  Session s;
-  RunEncode(mi, w, h, use_d3d, out, s);
-  s.Teardown(&r);
-  return out;
+  std::shared_ptr<Session> s = std::make_shared<Session>();
+  RunEncode(mi, w, h, use_d3d, out, *s);
+  a.cleanup = [s](TestResult* td) { s->Teardown(td); };
+  return a;
 }
 
 // ---------------------------------------------------------------- decode
@@ -1335,10 +1349,11 @@ void RunDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>* str
   }
 }
 
-TestResult DoDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>* stream,
-                    const std::vector<uint8_t>* seq_header, bool use_d3d, int adapter_ordinal,
-                    const std::string& stream_source) {
-  TestResult r;
+Attempt<TestResult> DoDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>* stream,
+                             const std::vector<uint8_t>* seq_header, bool use_d3d,
+                             int adapter_ordinal, const std::string& stream_source) {
+  Attempt<TestResult> a;
+  TestResult& r = a.result;
   r.role = "decode";
   r.kind = stream ? "full" : "configure_only";
   r.mft = mi.name;
@@ -1346,10 +1361,10 @@ TestResult DoDecode(const MftInfo& mi, int w, int h, const std::vector<EncFrame>
   r.width = w;
   r.height = h;
   r.stream_source = stream_source;
-  Session s;
-  RunDecode(mi, w, h, stream, seq_header, use_d3d, adapter_ordinal, r, s);
-  s.Teardown(&r);
-  return r;
+  std::shared_ptr<Session> s = std::make_shared<Session>();
+  RunDecode(mi, w, h, stream, seq_header, use_d3d, adapter_ordinal, r, *s);
+  a.cleanup = [s](TestResult* td) { s->Teardown(td); };
+  return a;
 }
 
 // ---------------------------------------------------------------- watchdog
@@ -1364,30 +1379,63 @@ void MarkCrash(TestResult& r, unsigned long code) {
   r.error = "structured exception " + Hex32(code);
 }
 
-// Runs `f` on its own MTA thread with a watchdog. A hung or crashing driver
-// must not take the probe down: the result then says "timeout" or "crash".
+// What the teardown of one attempt found, filled on the attempt's thread and read by
+// the caller once `done` is set.
+struct TeardownShared {
+  std::atomic<bool> done{false};
+  TestResult info;
+};
+
+// Runs `f` (which returns an Attempt<R>) on its own MTA thread with a watchdog. A hung
+// or crashing driver must not take the probe down: the result then says "timeout" or
+// "crash". The result is published as soon as `f` returns; the teardown (Attempt::cleanup)
+// runs after that, and the caller waits for it for at most kTeardownWaitMs, so a call that
+// hangs in the teardown costs the step trace, not the result of an attempt that worked.
 template <typename R, typename F>
 R WithWatchdog(F f, R timeout_value) {
   auto prom = std::make_shared<std::promise<R>>();
+  auto td = std::make_shared<TeardownShared>();
   std::future<R> fut = prom->get_future();
-  std::thread([prom, f, timeout_value]() mutable {
+  std::thread([prom, td, f, timeout_value]() mutable {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    R res{};
+    Attempt<R> a;
     SehInfo info;
-    std::function<void()> body = [&] { res = f(); };
+    std::function<void()> body = [&] { a = f(); };
     if (!SafeInvoke(body, &info)) {
       // Start from the timeout value so that the entry still names the MFT,
       // the resolution and the D3D mode that crashed.
-      res = timeout_value;
-      MarkCrash(Result(res), info.code);
+      a.result = timeout_value;
+      MarkCrash(Result(a.result), info.code);
+      a.cleanup = nullptr;
     }
-    prom->set_value(std::move(res));
+    prom->set_value(std::move(a.result));
+    if (a.cleanup) {
+      SehInfo info2;
+      std::function<void()> post = [&] { a.cleanup(&td->info); };
+      if (!SafeInvoke(post, &info2)) {
+        td->info.notes.push_back("structured exception " + Hex32(info2.code) + " during the teardown");
+      }
+    }
+    td->done = true;
   }).detach();
   if (fut.wait_for(std::chrono::milliseconds(kTestTimeoutMs)) != std::future_status::ready) {
     ++g_hung_attempts;
     return timeout_value;
   }
-  return fut.get();
+  R res = fut.get();
+  for (DWORD waited = 0; waited < kTeardownWaitMs && !td->done.load(); waited += 10) Sleep(10);
+  TestResult& tr = Result(res);
+  if (td->done.load()) {
+    for (const StepRec& st : td->info.steps) tr.steps.push_back(st);
+    for (const std::string& n : td->info.notes) tr.notes.push_back(n);
+    if (td->info.residual_refs >= 0) tr.residual_refs = td->info.residual_refs;
+  } else {
+    ++g_hung_attempts;
+    tr.notes.push_back("the teardown of this attempt did not finish within " +
+                       std::to_string(kTeardownWaitMs / 1000) +
+                       " s (a call blocks after the attempt); its step trace is missing");
+  }
+  return res;
 }
 
 }  // namespace
