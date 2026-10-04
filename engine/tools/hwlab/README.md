@@ -261,6 +261,36 @@ Exit codes: 0 built and tested, 1 toolchain or repository problem, 2 download fa
 downloaded. Options: `-PreflightOnly` (toolchain check only), `-Update` (fast-forward
 the clone first), `-Clean` (delete the build folder first).
 
+### audio-bench.ps1
+
+The first real-audio bench of the engine. Two engine processes (the hardware bench build,
+`qaudion-media-hw`: the real sound card like the production engine, plus a loopback flag) call each
+other with the strict transport and the frame keys of `qmedia_call_test`. The first captures from a
+real microphone, the second plays to real speakers or Bluetooth earbuds. The offer is `sendonly`, so
+the capturing process opens no speakers and the playing process opens no microphone.
+
+    .udio-bench.ps1 -Build                       # build into <WorkDir>uild-audiobench (no download)
+    .udio-bench.ps1 -List                        # list the capture and render devices, opens nothing
+    .udio-bench.ps1 -SelfCheck                   # list + session/certificate round trip, opens nothing
+    .udio-bench.ps1 -Dry                         # the whole call with file devices, no hardware
+    .udio-bench.ps1 -Real -Seconds 10            # the real test, system default devices
+    .udio-bench.ps1 -Real -Capture 'Headset' -Render 'Headphones' -Seconds 15
+
+Only `-Real` records and plays; run it when someone is at the machine to speak, and start it in the
+background (it prints one line per second). The report is `<ReportDir>udio-bench-<stamp>.json`:
+capture and playout levels in dBFS (per second, average, peak, fraction of active seconds), concealed
+samples as the measure of glitches (the engine statistics do not expose sound card underruns), a
+latency estimate (round trip plus jitter buffer; device and Bluetooth buffers are not included), the
+DTLS 1.3 / AES-256 SRTP / fingerprint verdict, the endpoint format of each device and an overall
+verdict (`pass`, `transport-ok-no-signal`, `fail`). A Bluetooth endpoint that only offers the
+hands-free profile (16 kHz mono) is written to `observations` as a platform limit. Device names are
+scrubbed like in the inventory report.
+
+The code is outside the production executable: `qaudion-media-hw` (compile definition
+`QMEDIA_HW_BENCH`) and `qmedia_audio_bench` are separate targets, and the engine CI job checks that
+`qaudion-media.exe` contains none of their strings and still exits with code 2 for `--ci-*` and
+`--hw-allow-loopback`.
+
 ## The HEVC Video Extensions
 
 The three package families are `Microsoft.HEVCVideoExtension_8wekyb3d8bbwe`,

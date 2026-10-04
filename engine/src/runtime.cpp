@@ -220,9 +220,9 @@ bool Runtime::Init(const Options& opts) {
       /*audio_mixer=*/nullptr, apm_);
   if (!factory_) return false;
 
-#if defined(QMEDIA_CI_BUILD)
-  // CI only: the test runner has no other network path between its two engine processes. This
-  // code is not compiled into the production executable.
+#if defined(QMEDIA_CI_BUILD) || defined(QMEDIA_HW_BENCH)
+  // CI and the hardware bench only: the two engine processes of a test have no other network path
+  // than loopback. This code is not compiled into the production executable.
   if (opts.allow_loopback) {
     webrtc::PeerConnectionFactoryInterface::Options o;
     o.network_ignore_mask = 0;
@@ -250,6 +250,9 @@ Runtime::~Runtime() {
 std::vector<AudioDeviceEntry> Runtime::ListAudioDevices(bool input) {
   std::vector<AudioDeviceEntry> out;
   worker_->BlockingCall([&] {
+    // The module answers "no devices" until it is initialised, which the first call needs. Init
+    // enumerates the endpoints; it opens no stream.
+    if (!adm_->Initialized()) adm_->Init();
     const int16_t n = input ? adm_->RecordingDevices() : adm_->PlayoutDevices();
     // The Windows implementation lists the default device first and the default communications
     // device second, then every endpoint.
@@ -287,6 +290,7 @@ std::vector<AudioDeviceEntry> Runtime::ListAudioDevices(bool input) {
 Status Runtime::SelectAudioDevice(bool input, const std::string& id) {
   Status result = Status::Ok();
   worker_->BlockingCall([&] {
+    if (!adm_->Initialized()) adm_->Init();
     int32_t index = -1;
     bool by_type = false;
     webrtc::AudioDeviceModule::WindowsDeviceType type = webrtc::AudioDeviceModule::kDefaultCommunicationDevice;

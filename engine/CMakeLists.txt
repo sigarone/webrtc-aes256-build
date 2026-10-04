@@ -78,11 +78,20 @@ if(QMEDIA_BUILD_ENGINE)
     target_link_libraries(qmedia_runtime_ci PUBLIC qmedia_ipc)
     target_compile_definitions(qmedia_runtime_ci PUBLIC QMEDIA_CI_BUILD=1)
 
+    # The hardware bench engine (tools/hwlab/audio-bench.ps1): the real sound card like the
+    # production executable, plus --hw-allow-loopback so two processes on one machine can call
+    # each other. A separate target; the production executable has neither the flag nor the code.
+    add_library(qmedia_runtime_hw STATIC src/runtime.cpp)
+    target_link_libraries(qmedia_runtime_hw PUBLIC qmedia_ipc)
+    target_compile_definitions(qmedia_runtime_hw PUBLIC QMEDIA_HW_BENCH=1)
+
     add_executable(qaudion-media src/main.cpp)
     target_link_libraries(qaudion-media PRIVATE qmedia_engine_core qmedia_runtime qmedia_pipe)
+    add_executable(qaudion-media-hw src/main.cpp)
+    target_link_libraries(qaudion-media-hw PRIVATE qmedia_engine_core qmedia_runtime_hw qmedia_pipe)
     add_executable(qaudion-media-ci src/main.cpp)
     target_link_libraries(qaudion-media-ci PRIVATE qmedia_engine_core qmedia_runtime_ci qmedia_pipe)
-    foreach(t qaudion-media qaudion-media-ci)
+    foreach(t qaudion-media qaudion-media-ci qaudion-media-hw)
       target_link_options(${t} PRIVATE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA)
       qmedia_link_webrtc(${t})
     endforeach()
@@ -95,6 +104,16 @@ if(QMEDIA_BUILD_ENGINE)
     add_dependencies(qmedia_call_test qaudion-media-ci)
     target_compile_definitions(qmedia_call_test PRIVATE
       QMEDIA_ENGINE_CI_EXE="$<TARGET_FILE:qaudion-media-ci>")
+
+    # The real-audio bench driver: two hardware engines, a call over the real microphone and
+    # speakers (or, with --dry, the CI engine with file devices), a JSON report. Not a ctest.
+    add_executable(qmedia_audio_bench tests/audio_bench.cpp)
+    target_link_libraries(qmedia_audio_bench PRIVATE qmedia_pipe qmedia_ipc ole32 oleaut32)
+    qmedia_link_webrtc(qmedia_audio_bench)
+    add_dependencies(qmedia_audio_bench qaudion-media-ci qaudion-media-hw)
+    target_compile_definitions(qmedia_audio_bench PRIVATE
+      QMEDIA_ENGINE_CI_EXE="$<TARGET_FILE:qaudion-media-ci>"
+      QMEDIA_ENGINE_HW_EXE="$<TARGET_FILE:qaudion-media-hw>")
   else()
     add_executable(qaudion-media src/main.cpp)
     target_link_libraries(qaudion-media PRIVATE qmedia_ipc qmedia_pipe)
