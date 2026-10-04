@@ -17,7 +17,8 @@ name: engine-ipc
 #                                a test driver runs two engine processes through a full audio call
 #
 # The path filter keeps this workflow out of the way of the library builds. The hevc-probe tool
-# under engine/tools/hevc-probe has its own workflow and is not part of this CMake project.
+# under engine/tools/hevc-probe and the hardware lab kit under engine/tools/hwlab have their own
+# workflow (hevc-probe.yml) and are not part of this CMake project.
 
 on:
   push:
@@ -25,11 +26,13 @@ on:
     paths:
       - 'engine/**'
       - '!engine/tools/hevc-probe/**'
+      - '!engine/tools/hwlab/**'
       - '.github/workflows/engine.yml'
   pull_request:
     paths:
       - 'engine/**'
       - '!engine/tools/hevc-probe/**'
+      - '!engine/tools/hwlab/**'
       - '.github/workflows/engine.yml'
   workflow_dispatch:
     inputs:
