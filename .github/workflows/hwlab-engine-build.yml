@@ -1,0 +1,107 @@
+name: hwlab-engine-build
+
+# Runs engine/tools/hwlab/engine-local-build.ps1 end to end on a hosted runner, the way the
+# lab PC runs it: vswhere finds Visual Studio, the pinned libwebrtc release and the Chromium
+# clang package are downloaded and sha256-verified, the engine is configured and built with
+# Ninja, qmedia_call_test.exe runs, and the JSON report and the log are written. The lab PC
+# cannot be used to find out whether the script works before it is merged, and the engine-webrtc
+# job of engine.yml builds the engine by hand, not through this script.
+#
+# The attestation of webrtc.lib is verified by engine.yml (gh attestation verify). Here it is
+# skipped on purpose, exactly as on the lab PC, and the report has to say so.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'engine/tools/hwlab/engine-local-build.ps1'
+      - 'engine/tools/hwlab/hwlab-common.ps1'
+      - '.github/workflows/hwlab-engine-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'engine/tools/hwlab/engine-local-build.ps1'
+      - 'engine/tools/hwlab/hwlab-common.ps1'
+      - '.github/workflows/hwlab-engine-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hwlab-engine-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-local-build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: engine-local-build.ps1 -AllowDownload (download, verify, configure, build, call test)
+        shell: powershell
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'lab'
+          $reports = Join-Path $work 'reports'
+          powershell -NoProfile -ExecutionPolicy Bypass -File engine/tools/hwlab/engine-local-build.ps1 -RepoDir $PWD.Path -WorkDir $work -ReportDir $reports -AllowDownload
+          $code = $LASTEXITCODE
+          Get-ChildItem $reports | Format-Table Name, Length
+          if ($code -ne 0) { throw "engine-local-build.ps1 exited with $code" }
+
+      - name: The report says what happened, and carries no names of this machine
+        shell: pwsh
+        run: |
+          $reports = Join-Path $env:RUNNER_TEMP 'lab/reports'
+          $jf = Get-ChildItem $reports -Filter 'engine-build-*.json' | Select-Object -First 1
+          $lf = Get-ChildItem $reports -Filter 'engine-build-*.log' | Select-Object -First 1
+          if (-not $jf -or -not $lf) { throw 'the report or the log is missing' }
+          $txt = Get-Content -Raw $jf.FullName
+          $r = $txt | ConvertFrom-Json
+          $r | ConvertTo-Json -Depth 6 | Write-Host
+          if (-not $r.ok) { throw 'the report says the build failed' }
+          if ($r.exit_code -ne 0) { throw 'the report has a non-zero exit code' }
+          if ($r.repository.commit -ne $env:GITHUB_SHA) { throw "the report names commit $($r.repository.commit), expected $env:GITHUB_SHA" }
+          $names = @($r.steps | ForEach-Object { $_.name })
+          foreach ($need in 'fetch', 'verify_pins', 'configure', 'build', 'call_test') {
+            if ($names -notcontains $need) { throw "step $need is missing from the report" }
+          }
+          foreach ($st in @($r.steps)) { if (-not $st.ok) { throw "step $($st.name) is not ok" } }
+          if (-not $r.test.ran -or -not $r.test.ok) { throw 'the call test did not run and pass' }
+          if (-not $r.pins_verified.all_files_sha256) { throw 'the pins are not reported as verified' }
+          if ($r.attestation.verified -or -not $r.attestation.skipped -or -not $r.attestation.reason) { throw 'the report must say that the attestation check was skipped, and why' }
+          if (-not $r.toolchain.visual_studio.version -or -not $r.toolchain.cmake -or -not $r.toolchain.ninja -or -not $r.toolchain.clang_cl) { throw 'the toolchain versions are incomplete' }
+          if (-not $r.download.clang_package_url) { throw 'the clang package url is not reported' }
+          $log = Get-Content -Raw $lf.FullName
+          foreach ($s in @($env:COMPUTERNAME, $env:USERNAME, $env:USERPROFILE, $env:RUNNER_NAME)) {
+            if ($s -and $s.Length -ge 4) {
+              if ($txt.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw 'the report contains a machine or user specific text' }
+              if ($log.IndexOf($s, [StringComparison]::OrdinalIgnoreCase) -ge 0) { throw 'the log contains a machine or user specific text' }
+            }
+          }
+          Write-Host ('report ok, log {0} bytes' -f $log.Length)
+
+      - name: A second run needs no download (the verified fetch folder is reused)
+        shell: powershell
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'lab'
+          $reports = Join-Path $work 'reports2'
+          powershell -NoProfile -ExecutionPolicy Bypass -File engine/tools/hwlab/engine-local-build.ps1 -RepoDir $PWD.Path -WorkDir $work -ReportDir $reports
+          if ($LASTEXITCODE -ne 0) { throw "the second run exited with $LASTEXITCODE (it should reuse the verified download without -AllowDownload)" }
+          $jf = Get-ChildItem $reports -Filter 'engine-build-*.json' | Select-Object -First 1
+          $r = Get-Content -Raw $jf.FullName | ConvertFrom-Json
+          if (-not $r.download.skipped_cache_complete) { throw 'the second run downloaded again' }
+          if (-not $r.ok) { throw 'the second run did not succeed' }
+
+      - name: Upload the report and the log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hwlab-engine-build-report
+          path: |
+            ${{ runner.temp }}/lab/reports/
+            ${{ runner.temp }}/lab/reports2/
+          retention-days: 14
+          if-no-files-found: ignore
