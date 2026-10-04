@@ -292,6 +292,51 @@ jobs:
           if ($v.status -ne 'failed' -or $v.reason -notmatch 'profile_not_listed') { throw 'h: an unlisted profile is a failure of that profile' }
           Write-Host 'D3D11VA decision logic ok'
 
+          # The classification of MFTs that only a non-default enumeration returns, on fabricated variants:
+          # default {A, E}, store flag {A, B}, unfiltered {A, C, E}, unfiltered with the store flag {A, B, C, D}.
+          $e = $r.enumeration_case
+          $vs = @($e.variants)
+          if ((($vs | ForEach-Object { $_.label }) -join ',') -ne 'default,store_flag,unfiltered_all,unfiltered_all_store_flag') { throw 'enumeration_case: the four variants in order' }
+          if ((($vs | ForEach-Object { $_.unique_mfts }) -join ',') -ne '2,2,3,4') { throw "enumeration_case: unique counts are $(($vs | ForEach-Object { $_.unique_mfts }) -join ',')" }
+          $x = @($e.only_outside_the_default_enumeration)
+          if ((($x | ForEach-Object { $_.name }) -join ',') -ne 'B,C,D') { throw "enumeration_case: extras are $(($x | ForEach-Object { $_.name }) -join ',')" }
+          if ((($x | ForEach-Object { $_.mft_class }) -join ',') -ne 'store_flag_only,needs_other_flags,store_flag_only') { throw "enumeration_case: classes are $(($x | ForEach-Object { $_.mft_class }) -join ',')" }
+          if (($x[0].returned_by -join ',') -ne 'store_flag,unfiltered_all_store_flag') { throw 'enumeration_case: B returned_by' }
+          if (($x[1].returned_by -join ',') -ne 'unfiltered_all,unfiltered_all_store_flag') { throw 'enumeration_case: C returned_by' }
+          if (($x[2].returned_by -join ',') -ne 'unfiltered_all_store_flag') { throw 'enumeration_case: D returned_by' }
+          $a = @($vs[0].mfts | Where-Object { $_.name -eq 'A' })[0]
+          if (@($a.returned_by).Count -ne 4 -or $a.mft_class -ne 'default') { throw 'enumeration_case: A is returned by all four and is a default MFT' }
+          $miss = @($e.default_mfts_missing_with_store_flag)
+          if ($miss.Count -ne 1 -or $miss[0].name -ne 'E') { throw 'enumeration_case: E is the default MFT that the store flag variant did not return' }
+          # ActivateObject outcomes: refused is a failure with the HRESULT, one created is ok, the other classes do not count.
+          function Act($case) { $v = @($r.activation_cases | Where-Object { $_.case -eq $case }); if ($v.Count -ne 1) { throw "no activation case $case" }; return $v[0] }
+          $v = Act 'a_refused'
+          if ($v.status -ne 'failed' -or $v.reason -notmatch '0x80070005') { throw 'activation a: a refused activation is a failure that names the HRESULT' }
+          $v = Act 'b_refused_and_created'
+          if ($v.status -ne 'ok') { throw 'activation b: one activation that worked makes it ok' }
+          foreach ($c in 'c_only_default_ones', 'd_never_reached_activate', 'e_other_class_refused') {
+            $v = Act $c
+            if ($v.status -ne 'not_attempted' -or $v.reason -ne 'none was returned') { throw "activation $c must be not_attempted: $($v.status)" }
+          }
+          # Package full names.
+          $pk = @($r.package_name_cases)
+          if ($pk.Count -ne 5) { throw 'package_name_cases' }
+          if ($pk[0].name -ne 'Microsoft.HEVCVideoExtensionFirstParty' -or $pk[0].version -ne '2.4.111.0' -or $pk[0].architecture -ne 'x64' -or $pk[0].family -ne 'Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe' -or -not $pk[0].in_known_family_list) { throw 'package name 0: the FirstParty package is a known family' }
+          if (-not $pk[1].in_known_family_list) { throw 'package name 1: the family comparison ignores case' }
+          if ($pk[2].family -ne 'Vendor.HEVCPlayer_abc123' -or $pk[2].in_known_family_list) { throw 'package name 2: an unknown variant is not in the family list' }
+          if ($pk[3].family -ne 'Odd.Package_abc123' -or $pk[3].architecture -ne 'neutral') { throw 'package name 3: a resource id does not move the publisher id' }
+          if ($pk[4].name -ne 'NoUnderscores' -or $pk[4].family -ne 'NoUnderscores' -or $pk[4].version -ne '') { throw 'package name 4: a name without parts' }
+          # The reason text says what was measured.
+          $rc = @($r.no_decoder_reason_cases)
+          foreach ($c in $rc) { if ($c.reason -notmatch '^MFTEnumEx returns no (HEVC|H\.264) decoder MFT to this process \(default enumeration, with MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered\)') { throw "reason $($c.case) does not name the enumerations: $($c.reason)" } }
+          function Reason($case) { return [string](@($rc | Where-Object { $_.case -eq $case })[0].reason) }
+          if ((Reason 'a_registered') -notmatch 'registration is not what is missing' -or (Reason 'a_registered') -match 'no package') { throw 'reason a: a registered package must not be reported as missing' }
+          if ((Reason 'b_unlisted_variant') -notmatch 'Vendor\.HEVCPlayer_abc123 \(not in the family list') { throw 'reason b: an unlisted variant is named' }
+          if ((Reason 'c_scan_incomplete') -notmatch 'could not be read completely') { throw 'reason c: an incomplete scan is said' }
+          if ((Reason 'd_nothing_registered') -notmatch 'no package of the known families and no package with HEVC in its name') { throw 'reason d: nothing registered' }
+          if ((Reason 'e_h264') -match 'registered for the current user') { throw 'reason e: the H.264 reason must not talk about HEVC packages' }
+          Write-Host 'enumeration classes, activation outcomes, package names and reason texts ok'
+
       - name: Self-test of the encode and decode machinery (same pipeline, H.264, D3D11 on the software adapter)
         shell: pwsh
         run: |

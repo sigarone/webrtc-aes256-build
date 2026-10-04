@@ -581,26 +581,27 @@ struct MftEnumeration {
   std::vector<MftInfo> extras;
 };
 
-MftEnumeration EnumAllVariants(const GUID& category, const GUID& subtype, bool subtype_is_output) {
+// The part of the enumeration that needs no Media Foundation: which variants returned which MFT,
+// and the MFTs that only a variant other than the default one returned, in the order they were
+// found, each once, with its class. CI runs it on fabricated variants (--selftest-d3d11va-logic).
+MftEnumeration BuildEnumeration(std::vector<VariantResult> variants) {
   MftEnumeration e;
+  e.variants = std::move(variants);
   std::map<std::string, std::vector<int>> seen;  // clsid -> variants that returned it
-  for (int vi = 0; vi < kVariantCount; ++vi) {
-    VariantResult vr;
-    vr.label = kVariants[vi].label;
-    vr.mfts = EnumMfts(category, subtype, subtype_is_output, vi, &vr.counts, &vr.errors);
-    for (const MftInfo& m : vr.mfts) seen[m.clsid].push_back(vi);
-    e.variants.push_back(std::move(vr));
+  for (size_t vi = 0; vi < e.variants.size(); ++vi) {
+    for (MftInfo& m : e.variants[vi].mfts) {
+      m.variant = static_cast<int>(vi);
+      seen[m.clsid].push_back(static_cast<int>(vi));
+    }
   }
-  auto labels_of = [&](const std::string& clsid) {
-    std::vector<std::string> out;
-    for (int vi : seen[clsid]) out.push_back(kVariants[vi].label);
-    return out;
-  };
   for (VariantResult& vr : e.variants) {
-    for (MftInfo& m : vr.mfts) m.seen_in = labels_of(m.clsid);
+    for (MftInfo& m : vr.mfts) {
+      m.seen_in.clear();
+      for (int vi : seen[m.clsid]) m.seen_in.push_back(kVariants[vi].label);
+    }
   }
-  for (int vi = 1; vi < kVariantCount; ++vi) {
-    for (const MftInfo& m : e.variants[static_cast<size_t>(vi)].mfts) {
+  for (size_t vi = 1; vi < e.variants.size(); ++vi) {
+    for (const MftInfo& m : e.variants[vi].mfts) {
       const std::vector<int>& in = seen[m.clsid];
       if (std::find(in.begin(), in.end(), 0) != in.end()) continue;  // the default one has it
       bool queued = false;
@@ -614,6 +615,17 @@ MftEnumeration EnumAllVariants(const GUID& category, const GUID& subtype, bool s
     }
   }
   return e;
+}
+
+MftEnumeration EnumAllVariants(const GUID& category, const GUID& subtype, bool subtype_is_output) {
+  std::vector<VariantResult> variants;
+  for (int vi = 0; vi < kVariantCount; ++vi) {
+    VariantResult vr;
+    vr.label = kVariants[vi].label;
+    vr.mfts = EnumMfts(category, subtype, subtype_is_output, vi, &vr.counts, &vr.errors);
+    variants.push_back(std::move(vr));
+  }
+  return BuildEnumeration(std::move(variants));
 }
 
 // ---------------------------------------------------------------- results
@@ -1941,6 +1953,27 @@ struct PackageHit {
   bool in_known_family_list = false;
 };
 
+// A package full name, Name_Version_Architecture_ResourceId_PublisherId, split into its parts. The
+// family name is Name_PublisherId. Pure: CI runs it on fixture names (--selftest-d3d11va-logic).
+PackageHit ParsePackageFullName(const std::string& full, const std::vector<std::string>& known_families) {
+  std::vector<std::string> parts;
+  for (size_t pos = 0;;) {
+    const size_t u = full.find('_', pos);
+    parts.push_back(full.substr(pos, u == std::string::npos ? std::string::npos : u - pos));
+    if (u == std::string::npos) break;
+    pos = u + 1;
+  }
+  PackageHit h;
+  h.name = parts[0];
+  if (parts.size() > 1) h.version = parts[1];
+  if (parts.size() > 2) h.architecture = parts[2];
+  h.family = (parts.size() > 4 && !parts[4].empty()) ? h.name + "_" + parts[4] : h.name;
+  for (const std::string& k : known_families) {
+    if (LowerAscii(k) == LowerAscii(h.family)) h.in_known_family_list = true;
+  }
+  return h;
+}
+
 // Package full names registered for the current user that contain `needle_lower`, from the per-user
 // package repository in the registry. This is NOT a documented API: it is read-only and best
 // effort, observed on a Windows 10 machine (one sub key per registered package, named by the
@@ -1974,23 +2007,7 @@ bool ScanPackageNames(const std::string& needle_lower, const std::vector<std::st
     }
     const std::string full = Utf8(name, static_cast<int>(n));
     if (LowerAscii(full).find(needle_lower) == std::string::npos) continue;
-    // Name_Version_Architecture_ResourceId_PublisherId
-    std::vector<std::string> parts;
-    for (size_t pos = 0;;) {
-      const size_t u = full.find('_', pos);
-      parts.push_back(full.substr(pos, u == std::string::npos ? std::string::npos : u - pos));
-      if (u == std::string::npos) break;
-      pos = u + 1;
-    }
-    PackageHit h;
-    h.name = parts[0];
-    if (parts.size() > 1) h.version = parts[1];
-    if (parts.size() > 2) h.architecture = parts[2];
-    h.family = (parts.size() > 4 && !parts[4].empty()) ? h.name + "_" + parts[4] : h.name;
-    for (const std::string& k : known_families) {
-      if (LowerAscii(k) == LowerAscii(h.family)) h.in_known_family_list = true;
-    }
-    out->push_back(std::move(h));
+    out->push_back(ParsePackageFullName(full, known_families));
   }
   RegCloseKey(key);
   return complete;
@@ -2328,6 +2345,32 @@ Verdict Combine(const std::vector<Verdict>& vs) {
     if (!v.reason.empty()) return v;
   }
   return {"not_attempted", std::string()};
+}
+
+// Why there is no decoder MFT, in words that match what was measured: the enumerations that were
+// run are named, and what is known about the packages is said as it is. A registered package does
+// not mean that its decoder is enumerated, and a missing registration is only claimed when no
+// package with HEVC in its name was found either. Pure: CI runs it on fixture inputs.
+std::string NoDecoderReason(const std::string& codec_upper, bool is_hevc, size_t ext_packages, int unlisted_count,
+                            const std::string& unlisted_names, bool name_scan_complete) {
+  std::string r = "MFTEnumEx returns no " + codec_upper +
+                  " decoder MFT to this process (default enumeration, with "
+                  "MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered)";
+  if (!is_hevc) return r;
+  if (ext_packages > 0) {
+    r += "; the HEVC Video Extensions package is registered for the current user (" + std::to_string(ext_packages) +
+         " package(s)), so registration is not what is missing";
+  } else if (unlisted_count > 0) {
+    r += "; no package of the known families is registered for the current user, but a package with HEVC in its "
+         "name is: " +
+         unlisted_names + " (not in the family list of this probe)";
+  } else if (!name_scan_complete) {
+    r += "; no package of the known families is registered for the current user (the name scan could not be read "
+         "completely)";
+  } else {
+    r += "; no package of the known families and no package with HEVC in its name is registered for the current user";
+  }
+  return r;
 }
 
 // ---------------------------------------------------------------- enumeration and D3D11VA reports
@@ -2861,6 +2904,119 @@ std::string VaLogicSelfTest() {
   j.EndArray();
   j.KvI("mock_decoder_objects_left", g_mock_decoders_alive.load());
 
+  // The classification of the MFTs that only a non-default enumeration returns, on fabricated
+  // variants: default {A, E}, store flag {A, B}, unfiltered {A, C, E}, unfiltered with the store flag
+  // {A, B, C, D}.
+  auto mft = [](const char* name, const char* clsid) {
+    MftInfo m;
+    m.name = name;
+    m.clsid = clsid;
+    return m;
+  };
+  const MftInfo mA = mft("A", "A0000000-0000-0000-0000-000000000000");
+  const MftInfo mB = mft("B", "B0000000-0000-0000-0000-000000000000");
+  const MftInfo mC = mft("C", "C0000000-0000-0000-0000-000000000000");
+  const MftInfo mD = mft("D", "D0000000-0000-0000-0000-000000000000");
+  const MftInfo mE = mft("E", "E0000000-0000-0000-0000-000000000000");
+  const std::vector<std::vector<MftInfo>> fabricated = {{mA, mE}, {mA, mB}, {mA, mC, mE}, {mA, mB, mC, mD}};
+  std::vector<VariantResult> variants;
+  for (size_t i = 0; i < fabricated.size(); ++i) {
+    VariantResult vr;
+    vr.label = kVariants[i].label;
+    vr.mfts = fabricated[i];
+    for (const EnumQuery& q : QueriesOf(kVariants[i])) vr.counts[q.label] = static_cast<int>(vr.mfts.size());
+    variants.push_back(std::move(vr));
+  }
+  const MftEnumeration fab = BuildEnumeration(std::move(variants));
+  j.Key("enumeration_case");
+  WriteEnumeration(j, fab);
+
+  // ActivateObject outcomes per class.
+  auto decode_test = [](const char* cls, std::vector<HRESULT> activations) {
+    TestResult t;
+    t.role = "decode";
+    t.mft_class = cls;
+    t.mft = "X";
+    for (HRESULT h : activations) t.Step("activate", h);
+    return t;
+  };
+  TestResult not_reached = decode_test("store_flag_only", {});
+  not_reached.Step("create_d3d_device", E_FAIL);
+  const std::string none = "none was returned";
+  struct ActCase {
+    const char* name;
+    std::vector<TestResult> tests;
+  };
+  const ActCase act_cases[] = {
+      {"a_refused", {decode_test("store_flag_only", {E_ACCESSDENIED})}},
+      {"b_refused_and_created", {decode_test("store_flag_only", {E_ACCESSDENIED}), decode_test("store_flag_only", {S_OK})}},
+      {"c_only_default_ones", {decode_test("default", {E_ACCESSDENIED}), decode_test("default", {S_OK})}},
+      {"d_never_reached_activate", {not_reached}},
+      {"e_other_class_refused", {decode_test("needs_other_flags", {E_ACCESSDENIED})}},
+  };
+  j.Key("activation_cases");
+  j.BeginArray();
+  for (const ActCase& c : act_cases) {
+    const Verdict v = ActivationVerdict(c.tests, "store_flag_only", none);
+    j.BeginObject();
+    j.KvS("case", c.name);
+    j.KvS("status", v.status);
+    j.KvS("reason", v.reason);
+    j.EndObject();
+  }
+  j.EndArray();
+
+  // Package full names: split into parts, the family derived, the known families recognised.
+  const std::vector<std::string> families = {"Microsoft.HEVCVideoExtensionFirstParty_8wekyb3d8bbwe",
+                                             "Microsoft.HEVCVideoExtension_8wekyb3d8bbwe"};
+  const char* const package_names[] = {
+      "Microsoft.HEVCVideoExtensionFirstParty_2.4.111.0_x64__8wekyb3d8bbwe",
+      "microsoft.hevcvideoextension_2.0.60091.0_x64__8WEKYB3D8BBWE",
+      "Vendor.HEVCPlayer_1.2.3.4_x64__abc123",
+      "Odd.Package_1.0.0.0_neutral_split.scale-100_abc123",
+      "NoUnderscores",
+  };
+  j.Key("package_name_cases");
+  j.BeginArray();
+  for (const char* full : package_names) {
+    const PackageHit h = ParsePackageFullName(full, families);
+    j.BeginObject();
+    j.KvS("full_name", full);
+    j.KvS("name", h.name);
+    j.KvS("version", h.version);
+    j.KvS("architecture", h.architecture);
+    j.KvS("family", h.family);
+    j.KvB("in_known_family_list", h.in_known_family_list);
+    j.EndObject();
+  }
+  j.EndArray();
+
+  // The reason text when there is no decoder.
+  j.Key("no_decoder_reason_cases");
+  j.BeginArray();
+  struct ReasonCase {
+    const char* name;
+    bool hevc;
+    size_t registered;
+    int unlisted;
+    bool complete;
+  };
+  const ReasonCase reason_cases[] = {
+      {"a_registered", true, 1, 0, true},
+      {"b_unlisted_variant", true, 0, 1, true},
+      {"c_scan_incomplete", true, 0, 0, false},
+      {"d_nothing_registered", true, 0, 0, true},
+      {"e_h264", false, 0, 0, true},
+  };
+  for (const ReasonCase& c : reason_cases) {
+    j.BeginObject();
+    j.KvS("case", c.name);
+    j.KvS("reason", NoDecoderReason(c.hevc ? "HEVC" : "H.264", c.hevc, c.registered, c.unlisted,
+                                    c.unlisted ? "Vendor.HEVCPlayer_abc123" : "", c.complete));
+    j.EndObject();
+  }
+  j.EndArray();
+
   struct Case {
     const char* name;
     std::vector<VaAdapterResult> adapters;
@@ -3234,26 +3390,9 @@ int main(int argc, char** argv) {
   const std::string not_selected_1080 = "1080p was not selected (--resolutions)";
   const std::string no_enc = "no " + codec_upper + " encoder MFT is registered";
   const std::string no_hw_enc = "no hardware " + codec_upper + " encoder MFT is registered";
-  // Why there is no decoder, in words that match what was measured: the enumerations that were
-  // run are named, and what is known about the packages is said as it is (a registered package
-  // does not mean that its decoder is enumerated, and a missing registration is only said when
-  // no package with HEVC in its name was found either).
-  std::string no_dec = "MFTEnumEx returns no " + codec_upper + " decoder MFT to this process (default enumeration, with "
-                       "MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, and unfiltered)";
-  if (g_is_hevc) {
-    if (!ext_packages.empty()) {
-      no_dec += "; the HEVC Video Extensions package is registered for the current user (" +
-                std::to_string(ext_packages.size()) + " package(s)), so registration is not what is missing";
-    } else if (hevc_named_unlisted > 0) {
-      no_dec += "; no package of the known families is registered for the current user, but a package with HEVC in its "
-                "name is: " + hevc_named_unlisted_names + " (not in the family list of this probe)";
-    } else if (!hevc_named_complete) {
-      no_dec += "; no package of the known families is registered for the current user (the name scan could not be read "
-                "completely)";
-    } else {
-      no_dec += "; no package of the known families and no package with HEVC in its name is registered for the current user";
-    }
-  }
+  // Why there is no decoder, in words that match what was measured (see NoDecoderReason).
+  const std::string no_dec = NoDecoderReason(codec_upper, g_is_hevc, ext_packages.size(), hevc_named_unlisted,
+                                             hevc_named_unlisted_names, hevc_named_complete);
   const bool any_dec_mft = !decoders.empty() || !dec_enum.extras.empty();
   auto enc_is = [](int w) {
     return [w](const TestResult& t) { return t.role == "encode" && t.width == w; };
