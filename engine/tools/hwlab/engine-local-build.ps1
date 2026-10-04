@@ -240,7 +240,8 @@ function Show-Plan($Pins, $Clang, [string]$State) {
   Write-Host ''
   Write-Host '  Hosts the download step contacts:'
   Write-Host '    github.com                        the release files below. GitHub serves the bytes from its own'
-  Write-Host '                                      download hosts (githubusercontent.com) after a redirect.'
+  Write-Host '                                      download host release-assets.githubusercontent.com after a redirect'
+  Write-Host '                                      (the host CLAUDE.md of the lab lists; CI checks it on every run).'
   Write-Host ('    {0}  the Chromium clang package that build-flags.json of the release names' -f $ClangHost)
   Write-Host '                                      (the compiler of the engine build); this host is NOT on the lab''s'
   Write-Host '                                      usual list, so the owner has to agree to it.'

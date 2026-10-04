@@ -10,7 +10,9 @@
   id only), audio render and capture endpoints (friendly names, default flags), the
   Bluetooth radio and the paired audio devices, cameras, and the HEVC Video Extensions
   (registered for the current user - the value that counts -, provisioned in the system
-  image, registered for any user; the last two need elevation and are null without it).
+  image, registered for any user; the last two need elevation and are null without it;
+  every registered package with HEVC in its name, known or not; and the media codecs that
+  those packages declare in their manifest).
 
   Never read or written: serial numbers, machine name, user name, MAC or IP addresses,
   paths. Text that comes from the system (device friendly names) is scrubbed for the
@@ -422,6 +424,88 @@ function Get-HevcExtensionInfo {
   return (Get-HevcExtensionStatus)
 }
 
+# What the registered packages with HEVC in their name declare to Media Foundation. A registered
+# package does not have to declare a video decoder for HEVC, and Media Foundation only enumerates
+# what a package declares (a windows.mediaCodec extension in its manifest: MediaCodec elements with
+# a Category of videoDecoder or videoEncoder and the media subtypes they take or produce; per a
+# third-party article, not per Microsoft documentation, see engine/tools/hevc-probe/README.md).
+
+# Reads the MediaCodec declarations of one package manifest (an XmlDocument). Pure: CI runs it on
+# fixture manifests. Duplicates (a package lists the same codec once per architecture) are folded.
+function Get-MediaCodecsFromManifest($Manifest) {
+  $hevc = '43564548-0000-0010-8000-00aa00389b71'     # MFVideoFormat_HEVC
+  $hevcEs = '53564548-0000-0010-8000-00aa00389b71'   # MFVideoFormat_HEVC_ES
+  $nodes = @($Manifest.SelectNodes("//*[local-name()='Extension'][@Category='windows.mediaCodec']/*[local-name()='MediaCodec']"))
+  $seen = @{}
+  $codecs = @()
+  $dec = $false
+  $enc = $false
+  foreach ($n in $nodes) {
+    $attr = @{}
+    foreach ($a in $n.Attributes) { $attr[$a.LocalName] = [string]$a.Value }
+    $cat = [string]$attr['Category']
+    $key = ('{0}|{1}|{2}' -f $attr['DisplayName'], $cat, $attr['ActivatableClassId'])
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    $inHevc = $false
+    foreach ($t in @($n.SelectNodes(".//*[local-name()='InputType']"))) {
+      $sub = ([string]$t.GetAttribute('SubType')).Trim('{', '}').ToLowerInvariant()
+      if ($sub -eq $hevc -or $sub -eq $hevcEs) { $inHevc = $true }
+    }
+    $outHevc = $false
+    foreach ($t in @($n.SelectNodes(".//*[local-name()='OutputType']"))) {
+      $sub = ([string]$t.GetAttribute('SubType')).Trim('{', '}').ToLowerInvariant()
+      if ($sub -eq $hevc -or $sub -eq $hevcEs) { $outHevc = $true }
+    }
+    if ($cat -eq 'videoDecoder' -and $inHevc) { $dec = $true }
+    if ($cat -eq 'videoEncoder' -and $outHevc) { $enc = $true }
+    $codecs += [ordered]@{
+      display_name         = $attr['DisplayName']
+      category             = $cat
+      activatable_class_id = $attr['ActivatableClassId']
+      takes_hevc_input     = $inHevc
+      produces_hevc_output = $outHevc
+    }
+  }
+  return [ordered]@{
+    media_codecs                = @($codecs)
+    declares_hevc_video_decoder = $dec
+    declares_hevc_video_encoder = $enc
+  }
+}
+
+# The manifest of each registered package whose name matches the pattern, for the current user
+# (reading it needs no elevation on the machines tried so far). Only names, categories and
+# subtype flags are reported, no paths. $null in a field means "could not be read", never "no".
+function Get-HevcPackageMediaCodecs([string]$NamePattern = '*HEVC*') {
+  $out = @()
+  foreach ($p in @(Get-AppxPackage -Name $NamePattern -ErrorAction Stop)) {
+    $entry = [ordered]@{
+      name                         = [string]$p.Name
+      version                      = [string]$p.Version
+      family                       = [string]$p.PackageFamilyName
+      status                       = [string]$p.Status
+      manifest_read                = $false
+      error_type                   = $null
+      media_codecs                 = @()
+      declares_hevc_video_decoder  = $null
+      declares_hevc_video_encoder  = $null
+    }
+    try {
+      $xml = Get-AppxPackageManifest -Package $p.PackageFullName -ErrorAction Stop
+      $r = Get-MediaCodecsFromManifest $xml
+      $entry.manifest_read = $true
+      $entry.media_codecs = @($r.media_codecs)
+      $entry.declares_hevc_video_decoder = $r.declares_hevc_video_decoder
+      $entry.declares_hevc_video_encoder = $r.declares_hevc_video_encoder
+    } catch {
+      $entry.error_type = $_.Exception.GetType().Name
+    }
+    $out += $entry
+  }
+  return ,@($out)
+}
+
 # ---------------------------------------------------------------------------------
 # Assemble, check, write
 # ---------------------------------------------------------------------------------
@@ -436,6 +520,11 @@ $audio    = Invoke-Section 'audio'     { Get-AudioInfo }
 $bluetooth = Invoke-Section 'bluetooth' { Get-BluetoothInfo }
 $cameras  = Invoke-Section 'cameras'   { Get-CameraInfo }
 $hevcExt  = Invoke-Section 'hevc_ext'  { Get-HevcExtensionInfo }
+$hevcPkgCodecs = Invoke-Section 'hevc_pkg_codecs' { Get-HevcPackageMediaCodecs }
+
+# An empty list must stay an empty JSON array (a sub-expression would turn it into nothing).
+$hevcPkgOut = $null
+if ($null -ne $hevcPkgCodecs) { $hevcPkgOut = @($hevcPkgCodecs) }
 
 $report = [ordered]@{
   tool                  = [ordered]@{ name = 'hwlab-inventory'; report_version = 1 }
@@ -448,6 +537,7 @@ $report = [ordered]@{
   bluetooth             = $bluetooth
   cameras               = @($cameras)
   hevc_video_extensions = $hevcExt
+  hevc_package_media_codecs = $hevcPkgOut
   warnings              = @($script:Warnings)
 }
 
@@ -478,6 +568,12 @@ Write-Host ('  Cameras   : {0}' -f @($cameras).Count)
 if ($hevcExt)  {
   function Format-Tri($v) { if ($null -eq $v) { return 'unknown' } elseif ($v) { return 'yes' } else { return 'no' } }
   Write-Host ('  HEVC Video Extensions: registered for the current user {0}; provisioned in the system image {1}; registered for any user {2}' -f (Format-Tri $hevcExt.registered_current_user), (Format-Tri $hevcExt.provisioned_system_image), (Format-Tri $hevcExt.registered_any_user))
+  foreach ($np in @($hevcExt.hevc_named_packages_current_user)) {
+    if ($np) { Write-Host ('    package with HEVC in its name: {0} {1} (family {2}, known family {3})' -f $np.name, $np.version, $np.family, (Format-Tri $np.in_known_family_list)) }
+  }
+}
+foreach ($pc in @($hevcPkgCodecs)) {
+  if ($pc) { Write-Host ('  package {0}: manifest read {1}; declares an HEVC video decoder {2}, an HEVC video encoder {3}' -f $pc.name, $pc.manifest_read, $pc.declares_hevc_video_decoder, $pc.declares_hevc_video_encoder) }
 }
 foreach ($w in $script:Warnings) { Write-Host ('  warning   : {0}' -f $w) }
 Write-Host ('  report    : {0}' -f $outFile)

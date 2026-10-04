@@ -48,8 +48,11 @@ engine/tools/hwlab/. Segui questi passi nell'ordine, senza saltarne nessuno.
    RAM, GPU, endpoint audio, Bluetooth, camere, HEVC Video Extensions) e il riassunto
    della sonda per HEVC e per H.264, con una riga di verdetto su invio e ricezione
    video H.265 con la GPU (summary.video_send_possible, video_receive_possible e
-   video_receive_basis). Nella sonda un risultato not_attempted non e' un fallimento:
-   dai il motivo che trovi in summary.reasons. Delle HEVC Video Extensions riporta i
+   video_receive_basis; sono ok, failed o not_attempted come i campi *_status da cui
+   derivano), il numero di decoder HEVC che MFTEnumEx restituisce (hevc_decoder_mft_count_*,
+   hevc_store_mft_decoders) e il verdetto D3D11VA per scheda
+   (hevc_d3d11va_decode_supported e hevc_d3d11va_decode_by_adapter). Nella sonda un
+   risultato not_attempted non e' un fallimento: dai il motivo che trovi in summary.reasons. Delle HEVC Video Extensions riporta i
    tre fatti separati dell'inventario: registrate per l'utente corrente (e' il valore
    che conta), presenti nell'immagine di sistema, registrate per qualche utente (gli
    ultimi due sono null se non elevato). Prima di mostrarli controlla che non

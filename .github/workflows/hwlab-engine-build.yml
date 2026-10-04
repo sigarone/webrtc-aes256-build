@@ -9,6 +9,11 @@ name: hwlab-engine-build
 #
 # The attestation of webrtc.lib is verified by engine.yml (gh attestation verify). Here it is
 # skipped on purpose, exactly as on the lab PC, and the report has to say so.
+#
+# The job also runs when one of the files the script executes or reads changes: the two cmake
+# scripts it runs (fetch_webrtc.cmake, verify_pins.cmake), the pin file it reads
+# (webrtc-release.cmake), and CLAUDE.md of the lab, whose list of download hosts is checked below
+# against the host the release assets really redirect to.
 
 on:
   workflow_dispatch:
@@ -16,12 +21,20 @@ on:
     paths:
       - 'engine/tools/hwlab/engine-local-build.ps1'
       - 'engine/tools/hwlab/hwlab-common.ps1'
+      - 'engine/tools/hwlab/CLAUDE.md'
+      - 'engine/cmake/fetch_webrtc.cmake'
+      - 'engine/cmake/verify_pins.cmake'
+      - 'engine/cmake/webrtc-release.cmake'
       - '.github/workflows/hwlab-engine-build.yml'
   push:
     branches: [main]
     paths:
       - 'engine/tools/hwlab/engine-local-build.ps1'
       - 'engine/tools/hwlab/hwlab-common.ps1'
+      - 'engine/tools/hwlab/CLAUDE.md'
+      - 'engine/cmake/fetch_webrtc.cmake'
+      - 'engine/cmake/verify_pins.cmake'
+      - 'engine/cmake/webrtc-release.cmake'
       - '.github/workflows/hwlab-engine-build.yml'
 
 permissions:
@@ -40,6 +53,47 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # The lab session may only contact the hosts that CLAUDE.md names. The release assets are
+      # served from a host that github.com redirects to; the file must name exactly that host (no
+      # wildcard), and this step fails when GitHub changes it. Two HEAD/GET requests, redirects not
+      # followed: nothing is downloaded but build-flags.json, which the build downloads anyway.
+      - name: The release assets redirect to the one host that CLAUDE.md lists
+        shell: powershell
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          $cl = Get-Content -Raw -Encoding UTF8 engine/tools/hwlab/CLAUDE.md
+          if ($cl -match '\*\.githubusercontent\.com') { throw 'CLAUDE.md allows a wildcard host' }
+          $m = [regex]::Match($cl, 'Host di download delle release: `([A-Za-z0-9.-]+)`')
+          if (-not $m.Success) { throw 'CLAUDE.md does not name the release download host in the expected line' }
+          $listed = $m.Groups[1].Value
+          Write-Host "CLAUDE.md lists the release download host: $listed"
+          $pins = Get-Content -Raw engine/cmake/webrtc-release.cmake
+          $repo = [regex]::Match($pins, 'set\(QMEDIA_WEBRTC_REPO\s+"([^"]+)"\)').Groups[1].Value
+          $tag = [regex]::Match($pins, 'set\(QMEDIA_WEBRTC_TAG\s+"([^"]+)"\)').Groups[1].Value
+          if (-not $repo -or -not $tag) { throw 'could not read the pinned release' }
+          function Get-Hop([string]$Url, [string]$Method) {
+            $req = [System.Net.HttpWebRequest]::Create($Url)
+            $req.Method = $Method
+            $req.AllowAutoRedirect = $false
+            $req.UserAgent = 'hwlab-ci'
+            $req.Timeout = 60000
+            $resp = $req.GetResponse()
+            try {
+              return [pscustomobject]@{ Status = [int]$resp.StatusCode; Location = [string]$resp.Headers['Location'] }
+            } finally { $resp.Close() }
+          }
+          $url = "https://github.com/$repo/releases/download/$tag/build-flags.json"
+          $hop1 = Get-Hop $url 'HEAD'
+          Write-Host ("hop 1: status {0}, redirect host {1}" -f $hop1.Status, $(if ($hop1.Location) { ([uri]$hop1.Location).Host } else { '(none)' }))
+          if ($hop1.Status -lt 300 -or $hop1.Status -ge 400 -or -not $hop1.Location) { throw "the release asset url did not redirect (status $($hop1.Status))" }
+          $h1 = ([uri]$hop1.Location).Host
+          if ($h1 -ne $listed) { throw "the release asset redirects to $h1, CLAUDE.md lists $listed" }
+          # The second hop: a GET of the small json at the host it redirected to must serve the
+          # bytes itself (200), not redirect again to a third host.
+          $hop2 = Get-Hop $hop1.Location 'GET'
+          Write-Host ("hop 2: status {0}" -f $hop2.Status)
+          if ($hop2.Status -ne 200) { throw "the redirect target answered $($hop2.Status) instead of serving the file: a further redirect host would have to be listed" }
 
       - name: engine-local-build.ps1 -AllowDownload (download, verify, configure, build, call test)
         shell: powershell
