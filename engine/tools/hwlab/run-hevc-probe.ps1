@@ -21,7 +21,11 @@
 
   Does not fetch the repository unless -Update is given.
 
-  Exit code: 0 both reports written, 1 toolchain or repository problem, 2 configure or
+  When a codec's 1080p hardware encode is not ok although its 720p one was, the script
+  also runs the probe for 1080p alone (--resolutions 1080) in a fresh process and says
+  whether the failure depends on the 720p attempts before it.
+
+  Exit code: 0 the reports were written, 1 toolchain or repository problem, 2 configure or
   build failed, 3 a probe run produced no report.
 
 .PARAMETER RepoDir
@@ -243,32 +247,68 @@ if (-not (Test-Path -LiteralPath $ReportDir)) { $null = New-Item -ItemType Direc
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $exeDir = Split-Path -Path $exe -Parent
 $saved = @()
+$verdicts = @()
+
+# One probe run. The probe writes the same JSON to stdout and to a file next to the
+# exe; the file is used, stdout is discarded. Its progress lines go to stderr and stay
+# visible. Returns @{ Json; File; Code } and stops the script when no report was written.
+function Invoke-Probe([string]$Codec, [string[]]$ExtraArgs, [string]$Tag) {
+  $name = 'probe-' + $Codec + $Tag + '.json'
+  $inBuild = Join-Path $exeDir $name
+  if (Test-Path -LiteralPath $inBuild) { Remove-Item -LiteralPath $inBuild -Force }
+  $code = Invoke-Native $exe (@('--codec', $Codec, '--out', $name) + $ExtraArgs) -DiscardOutput
+  if (-not (Test-Path -LiteralPath $inBuild)) {
+    Fail ('the {0} probe run{1} wrote no report (exit code {2}); it may have crashed or hit its time limit' -f $Codec, $Tag, $code) 3
+  }
+  if ($code -ne 0) { Write-Host ('  note: the probe exited with code {0} but wrote a report' -f $code) -ForegroundColor Yellow }
+  $dest = Join-Path $ReportDir ('hevc-probe-{0}{1}-{2}.json' -f $Codec, $Tag, $stamp)
+  Copy-Item -LiteralPath $inBuild -Destination $dest -Force
+  $json = Get-Content -LiteralPath $dest -Raw -Encoding UTF8 | ConvertFrom-Json
+  return @{ Json = $json; File = $dest; Code = $code }
+}
+
+function Get-SummaryValue($Json, [string]$Codec, [string]$Name) {
+  $key = $Codec + '_' + $Name
+  $prop = $Json.summary.PSObject.Properties[$key]
+  if ($prop) { return [string]$prop.Value }
+  return $null
+}
 
 foreach ($codec in @('hevc', 'h264')) {
   Write-Step ('probe, codec {0}' -f $codec)
-  $name = 'probe-' + $codec + '.json'
-  $inBuild = Join-Path $exeDir $name
-  if (Test-Path -LiteralPath $inBuild) { Remove-Item -LiteralPath $inBuild -Force }
+  $run = Invoke-Probe $codec @() ''
+  $saved += $run.File
+  Write-Host ('  report: {0}' -f $run.File)
+  Write-Host '  summary (ok / failed / not_attempted; a not attempted result is not a failure):'
+  ($run.Json.summary | ConvertTo-Json -Depth 4) -split "`r?`n" | ForEach-Object { Write-Host ('    ' + $_) }
 
-  # The probe writes the same JSON to stdout and to a file next to the exe; the file
-  # is used, stdout is discarded. Its progress lines go to stderr and stay visible.
-  $code = Invoke-Native $exe @('--codec', $codec, '--out', $name) -DiscardOutput
-  if (-not (Test-Path -LiteralPath $inBuild)) {
-    Fail ('the {0} probe run wrote no report (exit code {1}); it may have crashed or hit its time limit' -f $codec, $code) 3
+  # A 1080p encode that fails after a 720p encode that worked may be caused by state
+  # left over from the 720p attempts in the same process, or may be independent of it.
+  # Run 1080p alone in a fresh process to tell the two apart.
+  $s720 = Get-SummaryValue $run.Json $codec 'hardware_encode_720p_status'
+  $s1080 = Get-SummaryValue $run.Json $codec 'hardware_encode_1080p_status'
+  if ($s720 -eq 'ok' -and $s1080 -ne 'ok') {
+    Write-Step ('probe, codec {0}: 1080p alone in a fresh process (the full run did not encode 1080p in hardware)' -f $codec)
+    $iso = Invoke-Probe $codec @('--resolutions', '1080') '-1080only'
+    $saved += $iso.File
+    $isoStatus = Get-SummaryValue $iso.Json $codec 'hardware_encode_1080p_status'
+    if ($isoStatus -eq 'ok') {
+      $text = 'ORDER-DEPENDENT: 1080p hardware encode works in a fresh process but not after the 720p attempts of the same process (state left over by an earlier attempt)'
+    } else {
+      $text = ('NOT order-dependent: 1080p hardware encode is {0} in a fresh process too (a resolution or driver limit, not leftover state)' -f $isoStatus)
+    }
+    Write-Host ('  verdict: ' + $text) -ForegroundColor Yellow
+    $verdicts += [ordered]@{ codec = $codec; full_run_1080p = $s1080; fresh_process_1080p = $isoStatus; verdict = $text }
   }
-  if ($code -ne 0) { Write-Host ('  note: the probe exited with code {0} but wrote a report' -f $code) -ForegroundColor Yellow }
+}
 
-  $dest = Join-Path $ReportDir ('hevc-probe-{0}-{1}.json' -f $codec, $stamp)
-  Copy-Item -LiteralPath $inBuild -Destination $dest -Force
-  $saved += $dest
-
-  $json = Get-Content -LiteralPath $dest -Raw -Encoding UTF8 | ConvertFrom-Json
-  Write-Host ('  report: {0}' -f $dest)
-  Write-Host '  summary:'
-  ($json.summary | ConvertTo-Json -Depth 4) -split "`r?`n" | ForEach-Object { Write-Host ('    ' + $_) }
+if ($verdicts.Count -gt 0) {
+  $vfile = Join-Path $ReportDir ('hevc-probe-1080-verdict-{0}.json' -f $stamp)
+  [System.IO.File]::WriteAllText($vfile, (($verdicts | ConvertTo-Json -Depth 4)), (New-Object System.Text.UTF8Encoding($false)))
+  $saved += $vfile
 }
 
 Write-Host ''
-Write-Host 'RESULT: both probe runs wrote a report' -ForegroundColor Green
+Write-Host 'RESULT: the probe runs wrote their reports' -ForegroundColor Green
 foreach ($s in $saved) { Write-Host ('  ' + $s) }
 exit 0

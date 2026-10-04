@@ -149,7 +149,7 @@ jobs:
             if ($null -eq $t.mft_refs_left_after_release) { throw "self-test: $($t.mft) has no residual reference count" }
           }
           # The D3D11 path ran with a manager, and its stages are reported one by one.
-          $d3d = @($rep.tests | Where-Object { $_.memory -eq 'd3d11' -and $_.role -eq 'decode' })
+          $d3d = @($rep.tests | Where-Object { $_.memory -eq 'd3d11' -and $_.role -eq 'decode' -and $_.status -ne 'not_attempted' })
           if ($d3d.Count -eq 0) { throw 'self-test: the D3D11 decode path was not exercised' }
           foreach ($t in $d3d) {
             $names = @($t.steps | ForEach-Object { $_.stage })

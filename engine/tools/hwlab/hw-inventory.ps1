@@ -8,8 +8,9 @@
 
   Reports: OS caption/version/build, CPU, RAM, GPUs (name, driver, memory, PNP vendor
   id only), audio render and capture endpoints (friendly names, default flags), the
-  Bluetooth radio and the paired audio devices, cameras, and whether the HEVC Video
-  Extensions are installed.
+  Bluetooth radio and the paired audio devices, cameras, and the HEVC Video Extensions
+  (registered for the current user - the value that counts -, provisioned in the system
+  image, registered for any user; the last two need elevation and are null without it).
 
   Never read or written: serial numbers, machine name, user name, MAC or IP addresses,
   paths. Text that comes from the system (device friendly names) is scrubbed for the
@@ -30,56 +31,11 @@ $ErrorActionPreference = 'Stop'
 $script:Warnings = New-Object System.Collections.Generic.List[string]
 
 # ---------------------------------------------------------------------------------
-# Scrubbing of text that comes from the system
+# Scrubbing of text that comes from the system (shared with the other hwlab scripts)
 # ---------------------------------------------------------------------------------
 
-$script:ScrubRules = New-Object System.Collections.Generic.List[object]
-
-function Add-ScrubLiteral([string]$Value, [string]$Replacement) {
-  if ([string]::IsNullOrWhiteSpace($Value)) { return }
-  $v = $Value.Trim()
-  if ($v.Length -lt 2) { return }
-  $pattern = '(?<![\p{L}\p{N}])' + [regex]::Escape($v) + '(?![\p{L}\p{N}])'
-  $script:ScrubRules.Add(@{
-      Literal     = $v
-      Regex       = (New-Object System.Text.RegularExpressions.Regex($pattern, 'IgnoreCase'))
-      Replacement = $Replacement
-    })
-}
-
-try {
-  Add-ScrubLiteral $env:USERNAME '<user>'
-  Add-ScrubLiteral $env:COMPUTERNAME '<machine>'
-  Add-ScrubLiteral $env:USERDOMAIN '<machine>'
-  if ($env:USERPROFILE) { Add-ScrubLiteral (Split-Path -Path $env:USERPROFILE -Leaf) '<user>' }
-  $safeUser = $env:USERNAME -replace "'", "''"
-  $acct = Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True AND Name='$safeUser'" -ErrorAction Stop
-  foreach ($a in @($acct)) {
-    if ($a -and $a.FullName) {
-      Add-ScrubLiteral $a.FullName '<user>'
-      foreach ($w in ($a.FullName -split '\s+')) { if ($w.Length -ge 3) { Add-ScrubLiteral $w '<user>' } }
-    }
-  }
-} catch {
-  # Best effort: the possessive and pattern rules below still apply.
-}
-
-$script:MacRegex = New-Object System.Text.RegularExpressions.Regex('(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])')
-$script:MacBareRegex = New-Object System.Text.RegularExpressions.Regex('(?i)(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])')
-$script:Ipv4Regex = New-Object System.Text.RegularExpressions.Regex('(?<![\d.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\d.])')
-$script:PossessiveRegex = New-Object System.Text.RegularExpressions.Regex('(?<![\p{L}\p{N}])[\p{L}][\p{L}\p{N}\-]{1,30}(?=(?:''|\u2019)s(?![\p{L}\p{N}]))')
-
-# Use for names that the system supplies (friendly names). Not for version strings,
-# which look like IPv4 addresses.
-function Protect-Text([string]$Text) {
-  if ([string]::IsNullOrEmpty($Text)) { return $Text }
-  $s = $Text
-  foreach ($r in $script:ScrubRules) { $s = $r.Regex.Replace($s, $r.Replacement) }
-  $s = $script:MacRegex.Replace($s, '<mac>')
-  $s = $script:Ipv4Regex.Replace($s, '<ip>')
-  $s = $script:PossessiveRegex.Replace($s, '<owner>')
-  return $s.Trim()
-}
+. (Join-Path $PSScriptRoot 'hwlab-common.ps1')
+Initialize-Scrubbing
 
 function Invoke-Section([string]$Name, [scriptblock]$Body) {
   try {
@@ -88,11 +44,6 @@ function Invoke-Section([string]$Name, [scriptblock]$Body) {
     $script:Warnings.Add("section '$Name' failed ($($_.Exception.GetType().Name))")
     return $null
   }
-}
-
-function Test-Elevated {
-  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-  return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 # ---------------------------------------------------------------------------------
@@ -463,22 +414,12 @@ function Get-CameraInfo {
   return ,@($names | Select-Object -Unique)
 }
 
+# One definition shared with setup-hwlab.ps1 (see hwlab-common.ps1): "installed" means
+# registered for the current user, which is what the application process sees. The
+# provisioned (system image) and registered-for-any-user facts need elevation and are
+# reported next to it under their own names; null means "could not be read".
 function Get-HevcExtensionInfo {
-  $elevated = Test-Elevated
-  if ($elevated) {
-    $pk = @(Get-AppxPackage -AllUsers -Name 'Microsoft.HEVCVideoExtension*' -ErrorAction Stop)
-  } else {
-    $pk = @(Get-AppxPackage -Name 'Microsoft.HEVCVideoExtension*' -ErrorAction Stop)
-  }
-  $list = @()
-  foreach ($p in ($pk | Sort-Object Name, Version -Unique)) {
-    $list += [ordered]@{ name = [string]$p.Name; version = [string]$p.Version }
-  }
-  return [ordered]@{
-    installed = ($list.Count -gt 0)
-    scope     = $(if ($elevated) { 'all_users' } else { 'current_user' })
-    packages  = $list
-  }
+  return (Get-HevcExtensionStatus)
 }
 
 # ---------------------------------------------------------------------------------
@@ -513,17 +454,9 @@ $report = [ordered]@{
 $json = $report | ConvertTo-Json -Depth 8
 
 # Last line of defence: nothing identifying may be in the text that is written.
-$leaks = 0
-foreach ($r in $script:ScrubRules) {
-  $before = $json
-  $json = $r.Regex.Replace($json, $r.Replacement)
-  if ($json -ne $before) { $leaks++ }
-}
-foreach ($rx in @($script:MacRegex, $script:MacBareRegex)) {
-  $before = $json
-  $json = $rx.Replace($json, '<mac>')
-  if ($json -ne $before) { $leaks++ }
-}
+$protected = Protect-Json $json
+$json = $protected.Text
+$leaks = $protected.Leaks
 if ($leaks -gt 0) {
   Write-Warning "identifying text was found in the report and replaced by placeholders ($leaks pattern(s)); read the report before sharing it."
 }
@@ -542,6 +475,9 @@ foreach ($g in @($gpus)) { Write-Host ('  GPU       : {0} (driver {1}, vendor id
 if ($audio)    { Write-Host ('  Audio     : {0} render, {1} capture endpoint(s), source {2}' -f @($audio.render).Count, @($audio.capture).Count, $audio.source) }
 if ($bluetooth) { Write-Host ('  Bluetooth : radio present {0}, enabled {1}, state {2}, paired audio devices {3}' -f $bluetooth.radio_present, $bluetooth.radio_device_enabled, $bluetooth.radio_state, @($bluetooth.paired_audio_devices).Count) }
 Write-Host ('  Cameras   : {0}' -f @($cameras).Count)
-if ($hevcExt)  { Write-Host ('  HEVC Video Extensions installed: {0}' -f $hevcExt.installed) }
+if ($hevcExt)  {
+  function Format-Tri($v) { if ($null -eq $v) { return 'unknown' } elseif ($v) { return 'yes' } else { return 'no' } }
+  Write-Host ('  HEVC Video Extensions: registered for the current user {0}; provisioned in the system image {1}; registered for any user {2}' -f (Format-Tri $hevcExt.registered_current_user), (Format-Tri $hevcExt.provisioned_system_image), (Format-Tri $hevcExt.registered_any_user))
+}
 foreach ($w in $script:Warnings) { Write-Host ('  warning   : {0}' -f $w) }
 Write-Host ('  report    : {0}' -f $outFile)

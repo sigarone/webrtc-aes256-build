@@ -40,8 +40,13 @@ view. These rules hold for the kit and for the session that runs it.
   name and possessive owner names (such as `<owner>'s`) but cannot know every name, so
   a person reads an inventory once before it is shared.
 - The scripts of this kit send no telemetry and download nothing except through
-  winget (the five packages listed below) and the `git clone` and `git pull` of this
-  repository.
+  winget (the five packages listed below), the `git clone` and `git pull` of this
+  repository, and, only when the owner has agreed, the engine build download of
+  `engine-local-build.ps1 -AllowDownload`: the pinned libwebrtc release from github.com
+  (served from GitHub's own download hosts) and the Chromium clang package from
+  `commondatastorage.googleapis.com`, every file checked against a sha256 pinned in the
+  repository. That script prints the hosts and URLs first and refuses to download without
+  `-AllowDownload`, so the lab session can show them to the owner.
 
 ## Steps
 
@@ -72,7 +77,9 @@ execution policy of the machine.
 
 Setup, the Visual Studio Build Tools download in particular, can take a long time.
 Anything that may run longer than a couple of minutes (setup, a build, the probe) is
-started in the background and followed through its log or JSON file.
+started in the background and followed through its log or JSON file. The local engine
+build (`engine-local-build.ps1`, below) is not part of the first start: it needs the
+owner's agreement to one more host.
 
 ## What is installed
 
@@ -93,8 +100,13 @@ a user who installs the application on a fresh Windows.
 
 ## Scripts
 
-All scripts are Windows PowerShell 5.1 compatible and keep their files under
-`C:\hwlab`.
+All scripts are Windows PowerShell 5.1 compatible, ASCII only, and keep their files
+under `C:\hwlab`. CI parses every one of them with Windows PowerShell 5.1
+(`hevc-probe.yml`, job `hwlab-scripts`). `hwlab-common.ps1` is not run by itself: the
+other scripts dot-source it (scrubbing of names, the HEVC Video Extensions definition,
+a logged process runner). `setup-hwlab.ps1` is downloaded and run on its own before the
+repository exists, so it carries a word-for-word copy of the extensions definition; CI
+compares the two copies.
 
 ### setup-hwlab.ps1
 
@@ -141,7 +153,8 @@ contains:
   friendly name (classic profiles A2DP, HFP and AVRCP; LE Audio devices are not
   recognized as audio).
 - Cameras by friendly name.
-- Whether the HEVC Video Extensions are installed.
+- The HEVC Video Extensions, with one definition shared with `setup-hwlab.ps1` (see
+  "The HEVC Video Extensions" below).
 
 It does not read or write serial numbers, the machine name, the user name, MAC
 addresses, IP addresses or paths that contain the user name.
@@ -157,9 +170,88 @@ Build Tools (Release, static CRT, as its `CMakeLists.txt` sets) into
 not, the machine lacks an HEVC path, not the probe. The probe has its own watchdogs
 and can take a few minutes on a machine with several encoders.
 
+Results are `ok`, `failed` or `not_attempted` (the reason is in `summary.reasons`). An
+attempt that was not made, such as the 1080p decode when no 1080p bitstream exists, is
+`not_attempted`, never `failed`. The fields, and what `dxva_decode_*` and
+`hardware_accelerated_decode_status` mean, are in `engine/tools/hevc-probe/README.md`.
+When a codec's 1080p hardware encode is not `ok` although its 720p one was, the script
+runs the probe once more for 1080p alone (`--resolutions 1080`) in a fresh process,
+saves it as `hevc-probe-<codec>-1080only-<stamp>.json` and writes
+`hevc-probe-1080-verdict-<stamp>.json`: it says whether 1080p works in a fresh process
+but not after the 720p attempts (leftover state), or fails in a fresh process too.
+
 The script fails with a clear message when CMake, the MSVC tools or the Windows SDK
 are missing. It does not fetch the repository; pass `-Update` to run a fast-forward
 pull first, and `-Clean` to rebuild from scratch.
+
+### engine-local-build.ps1
+
+Builds the media engine against the pinned libwebrtc release and runs its call test, the
+same steps as the `engine-webrtc` job of `.github/workflows/engine.yml`, on the lab PC.
+No administrator rights. The steps:
+
+1. Reads the pinned release (tag and sha256 of every file) from
+   `engine/cmake/webrtc-release.cmake` and prints the hosts and URLs the download will
+   contact. **Without `-AllowDownload` nothing is downloaded**: the script prints this
+   plan and exits with code 10. A complete, verified download already in the fetch
+   folder needs no download and no switch.
+2. Finds Visual Studio with `vswhere` (any edition, Build Tools included, no hard-coded
+   path), takes the build environment from its `vcvars64.bat`, finds `cmake` and `ninja`.
+3. `cmake -P engine/cmake/fetch_webrtc.cmake` into `C:\hwlab\work\webrtc-fetch`: the
+   release files and the Chromium clang package, each checked against its pinned sha256,
+   then `engine/cmake/verify_pins.cmake` once more.
+4. Configures (Ninja, the downloaded `toolchain.cmake`, `QMEDIA_WITH_WEBRTC=ON`,
+   `QMEDIA_BUILD_TESTS=ON`) and builds `qaudion-media`, `qaudion-media-ci` and
+   `qmedia_call_test` into `C:\hwlab\work\build-engine`.
+5. Runs `qmedia_call_test.exe`: two engine processes and one full call over loopback.
+   Windows Firewall may ask about `qaudion-media-ci.exe`; the test uses loopback only.
+6. Writes `C:\hwlab\reports\engine-build-<stamp>.json` (ok, the step timings, the test
+   result with its last output lines, the pins verified, the toolchain versions, the
+   repository commit) and `engine-build-<stamp>.log`. Names and addresses are scrubbed
+   with the same rules as the inventory.
+
+Attestation: CI verifies the build provenance of `webrtc.lib` with `gh attestation
+verify`. The lab has no `gh` and no token, by design, so locally that check is skipped,
+and the report says so (`attestation.skipped`, with the reason). What applies locally is
+the sha256 pin of every file, enforced by `fetch_webrtc.cmake` and again by
+`verify_pins.cmake` at configure time.
+
+How the lab session runs it. The download and the build take a long time, so the script
+is started in the background and its log is followed, not waited for:
+
+    # 1. The plan. Downloads nothing. -ResolveClangUrl fetches only build-flags.json from
+    #    github.com (sha256 checked) so that the exact clang url is printed too.
+    powershell -NoProfile -ExecutionPolicy Bypass -File engine-local-build.ps1 -PlanOnly -ResolveClangUrl
+
+    # 2. Show the owner the hosts of the plan, commondatastorage.googleapis.com in
+    #    particular. Only after the owner agrees in the current session:
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\hwlab\work\webrtc-aes256-build\engine\tools\hwlab\engine-local-build.ps1','-AllowDownload'
+
+    # 3. Follow the log, then read the JSON.
+    $log = Get-ChildItem C:\hwlab\reports\engine-build-*.log | Sort-Object LastWriteTime | Select-Object -Last 1
+    Get-Content $log.FullName -Wait -Tail 40
+
+Exit codes: 0 built and tested, 1 toolchain or repository problem, 2 download failed,
+3 configure failed, 4 build failed, 5 call test failed, 10 plan printed and nothing
+downloaded. Options: `-PreflightOnly` (toolchain check only), `-Update` (fast-forward
+the clone first), `-Clean` (delete the build folder first).
+
+## The HEVC Video Extensions
+
+The two package families are `Microsoft.HEVCVideoExtension_8wekyb3d8bbwe` and
+`Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe`. The packages are registered per user, so
+three different facts exist, and the scripts and the probe report them under their own
+names:
+
+| Field | Meaning |
+| --- | --- |
+| `registered_current_user` | registered for the current user. **This is the value the summaries use** (`installed`), because it is what an application process of this user sees |
+| `provisioned_system_image` | part of the system image and installed for users when they first sign in (`Get-AppxProvisionedPackage -Online`). Needs elevation; `null` means unknown |
+| `registered_any_user` | registered for some account (`Get-AppxPackage -AllUsers`). Needs elevation; `null` means unknown. Registered for another account does not help the current user |
+
+`setup-hwlab.ps1`, `hw-inventory.ps1` and the probe agree on this. An earlier elevated
+`-AllUsers` query reported "installed" for a machine on which the probe, running as the
+current user, saw nothing: the two had asked different questions.
 
 ## Reports
 

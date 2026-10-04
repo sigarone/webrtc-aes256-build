@@ -254,6 +254,7 @@ struct D3dDev {
   AdapterInfo adapter;
   bool vendor_matched = false;  // the adapter belongs to the vendor of the MFT
   bool video_device = false;    // the device exposes ID3D11VideoDevice
+  bool video_flag_dropped = false;  // software adapter only: made without VIDEO_SUPPORT
 };
 
 // Explicit adapter choice. ordinal >= 0: the n-th non-software adapter. Otherwise
@@ -309,6 +310,17 @@ bool MakeD3DDevice(unsigned vendor_id, int ordinal, D3dDev* out, HRESULT* hr_out
       pick->adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
       D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
       levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &out->dev, &got, &out->ctx);
+  if (FAILED(hr) && pick->info.software) {
+    // A software adapter (WARP) is only used to run the code path on a machine
+    // without a GPU, and it does not offer video support everywhere. A hardware
+    // adapter is never retried without it: video support is the point.
+    out->dev.Reset();
+    out->ctx.Reset();
+    hr = D3D11CreateDevice(pick->adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                           D3D11_SDK_VERSION, &out->dev, &got, &out->ctx);
+    if (SUCCEEDED(hr)) out->video_flag_dropped = true;
+  }
   *hr_out = hr;
   if (FAILED(hr)) return false;
   // MFTs call into the device from their own threads.
@@ -965,7 +977,13 @@ bool PrepareMft(const MftInfo& mi, bool use_d3d, int adapter_ordinal, bool is_de
     r->adapter_vendor = s->d3d.adapter.vendor_id;
     r->adapter_software = s->d3d.adapter.software;
     r->adapter_same_vendor = s->d3d.vendor_matched;
-    if (!s->d3d.video_device) r->notes.push_back("the D3D11 device has no ID3D11VideoDevice");
+    if (s->d3d.video_flag_dropped) {
+      r->notes.push_back(
+          "software adapter: the D3D11 device was made without D3D11_CREATE_DEVICE_VIDEO_SUPPORT "
+          "(not available there); this only runs the code path");
+    } else if (!s->d3d.video_device) {
+      r->notes.push_back("the D3D11 device has no ID3D11VideoDevice");
+    }
     UINT token = 0;
     HRESULT hr = MFCreateDXGIDeviceManager(&token, &s->mgr);
     if (!r->Check("create_dxgi_manager", hr)) return false;

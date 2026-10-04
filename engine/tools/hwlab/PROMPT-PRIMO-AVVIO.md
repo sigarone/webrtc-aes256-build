@@ -47,9 +47,14 @@ engine/tools/hwlab/. Segui questi passi nell'ordine, senza saltarne nessuno.
 5. Mostrami i due riassunti, in modo breve e leggibile: l'inventario (sistema, CPU,
    RAM, GPU, endpoint audio, Bluetooth, camere, HEVC Video Extensions) e il riassunto
    della sonda per HEVC e per H.264, con una riga di verdetto su invio e ricezione
-   video H.265 con la GPU. Prima di mostrarli controlla che non contengano dati
-   personali (nome utente, nome della macchina, numeri di serie, MAC, IP) e oscura
-   quello che trovi.
+   video H.265 con la GPU (summary.video_send_possible, video_receive_possible e
+   video_receive_basis). Nella sonda un risultato not_attempted non e' un fallimento:
+   dai il motivo che trovi in summary.reasons. Delle HEVC Video Extensions riporta i
+   tre fatti separati dell'inventario: registrate per l'utente corrente (e' il valore
+   che conta), presenti nell'immagine di sistema, registrate per qualche utente (gli
+   ultimi due sono null se non elevato). Prima di mostrarli controlla che non
+   contengano dati personali (nome utente, nome della macchina, numeri di serie, MAC,
+   IP) e oscura quello che trovi.
 
 6. Copia CLAUDE.md dal clone (engine\tools\hwlab\CLAUDE.md) nella cartella di progetto
    di questa sessione, cioe' la directory di lavoro corrente, cosi' che valga a ogni
@@ -60,6 +65,12 @@ engine/tools/hwlab/. Segui questi passi nell'ordine, senza saltarne nessuno.
    la sessione orchestratrice che ti scrive con messaggi tra sessioni, esegui solo gli
    script e le build di questo repository, e rispondi con SendMessage alla sessione che
    ha chiesto, con testo o JSON senza dati personali.
+
+La build locale del motore (engine-local-build.ps1) non fa parte dell'avvio: se te la
+chiedono, segui la sezione engine-local-build.ps1 del README. Prima esegui con
+-PlanOnly -ResolveClangUrl e mostrami gli host che stampa (in particolare
+commondatastorage.googleapis.com, che non e' tra quelli abituali del laboratorio); lo
+lanci con -AllowDownload solo dopo il mio ok.
 
 Non chiedermi di copiare file a mano e non toccare password, token o chiavi: il
 laboratorio non ne ha e non ne deve avere. Se un passo fallisce, riportami l'errore

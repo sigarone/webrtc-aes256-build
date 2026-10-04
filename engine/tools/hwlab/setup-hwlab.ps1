@@ -13,7 +13,8 @@
        Kitware.CMake, Ninja-build.Ninja and Microsoft.VisualStudio.2022.BuildTools
        with the C++ workload. Every id is verified with `winget show` first.
        The HEVC Video Extensions are NOT installed: the probe must see the machine
-       as it is.
+       as it is. They are only reported: registered for the current user (the value
+       that counts), provisioned in the system image, registered for any user.
     3. Creates C:\hwlab with work and reports subfolders.
     4. Clones https://github.com/sigarone/webrtc-aes256-build into
        C:\hwlab\work\webrtc-aes256-build, or updates it (fast-forward only). The clone
@@ -385,6 +386,84 @@ function Sync-Repository {
 }
 
 # ---------------------------------------------------------------------------------
+# The HEVC Video Extensions (the same text as in hwlab-common.ps1; CI compares the two)
+# ---------------------------------------------------------------------------------
+
+#region hevc-extensions
+# One definition of "the HEVC Video Extensions are installed". The text of this region is
+# identical in hwlab-common.ps1 and setup-hwlab.ps1 (CI compares them); change both.
+#
+# The packages are registered per user, and an application process sees only the packages
+# registered for the user it runs as. So three facts are reported, each with its own name:
+#
+#   registered_current_user   Get-AppxPackage for the current user. This is the value the
+#                             summaries use ("installed"): it is what the application sees.
+#   registered_any_user       Get-AppxPackage -AllUsers. Needs elevation, otherwise $null.
+#                             A package registered for another account does not help the
+#                             current user (an elevated "all users" query once said true
+#                             while the probe, running as the current user, saw nothing).
+#   provisioned_system_image  Get-AppxProvisionedPackage -Online. Needs elevation, otherwise
+#                             $null. Provisioned means: part of the system image and
+#                             installed for users when they first sign in, not for accounts
+#                             that already exist.
+#
+# $null always means "could not be read", never "no".
+function Get-HevcExtensionStatus {
+  $families = @('Microsoft.HEVCVideoExtension_8wekyb3d8bbwe', 'Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe')
+  $names = @($families | ForEach-Object { $_.Substring(0, $_.IndexOf('_')) })
+  $elevated = $false
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $elevated = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch { }
+
+  $current = $null
+  $currentList = @()
+  try {
+    $found = @()
+    foreach ($n in $names) {
+      $found += @(Get-AppxPackage -Name $n -ErrorAction Stop | Where-Object { $families -contains $_.PackageFamilyName })
+    }
+    $current = ($found.Count -gt 0)
+    foreach ($p in $found) { $currentList += ('{0} {1}' -f $p.Name, $p.Version) }
+  } catch { $current = $null }
+
+  $anyUser = $null
+  if ($elevated) {
+    try {
+      $all = @()
+      foreach ($n in $names) {
+        $all += @(Get-AppxPackage -AllUsers -Name $n -ErrorAction Stop | Where-Object { $families -contains $_.PackageFamilyName })
+      }
+      $anyUser = ($all.Count -gt 0)
+    } catch { $anyUser = $null }
+  }
+
+  $prov = $null
+  if ($elevated) {
+    try {
+      $pp = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+          $pub = ([string]$_.PackageName).Substring(([string]$_.PackageName).LastIndexOf('_') + 1)
+          $families -contains ('{0}_{1}' -f $_.DisplayName, $pub)
+        })
+      $prov = ($pp.Count -gt 0)
+    } catch { $prov = $null }
+  }
+
+  return [ordered]@{
+    family_names                     = $families
+    summary_basis                    = 'registered_current_user'
+    installed                        = $current
+    registered_current_user          = $current
+    registered_current_user_packages = @($currentList)
+    registered_any_user              = $anyUser
+    provisioned_system_image         = $prov
+    elevated                         = $elevated
+  }
+}
+#endregion hevc-extensions
+
+# ---------------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------------
 
@@ -485,8 +564,11 @@ try {
   }
 
   # 5. HEVC Video Extensions: report only, never install -----------------------
+  # Same definition as hw-inventory.ps1: "installed" means registered for the current
+  # user, which is what the application process sees. Provisioned (system image) and
+  # registered for any user are reported next to it, with their own names.
   try {
-    $hevcExtensions = (@(Get-AppxPackage -AllUsers -Name 'Microsoft.HEVCVideoExtension*' -ErrorAction Stop).Count -gt 0)
+    $hevcExtensions = Get-HevcExtensionStatus
   } catch { $hevcExtensions = $null }
 
   if (@($pkgState | Where-Object { $_.status -eq 'failed' }).Count -gt 0) {
@@ -513,8 +595,8 @@ if ($script:LogReady) {
     packages                     = @($pkgState | ForEach-Object { [ordered]@{ id = $_.id; status = $_.status; version = $_.version } })
     windows_sdk_found            = $sdkFound
     repository                   = [ordered]@{ url = $RepoUrl; path = $RepoDir; branch = $Branch; commit = $repoSha }
-    hevc_video_extensions_installed = $hevcExtensions
-    hevc_video_extensions_note   = 'never installed by this kit, on purpose'
+    hevc_video_extensions        = $hevcExtensions
+    hevc_video_extensions_note   = 'never installed by this kit, on purpose; installed means registered for the current user (what the application sees)'
   }
   try {
     $json = $summary | ConvertTo-Json -Depth 6
@@ -527,7 +609,10 @@ if ($script:LogReady) {
   foreach ($s in $pkgState) { Write-Host ('  package {0,-40} {1} {2}' -f $s.id, $s.status, $s.version) }
   if ($null -ne $sdkFound) { Write-Host ('  Windows SDK found        : {0}' -f $sdkFound) }
   if ($repoSha) { Write-Host ('  repository               : {0} at {1}' -f $RepoDir, $repoSha) }
-  if ($null -ne $hevcExtensions) { Write-Host ('  HEVC Video Extensions    : {0} (not installed by this kit, on purpose)' -f $(if ($hevcExtensions) { 'installed' } else { 'not installed' })) }
+  if ($null -ne $hevcExtensions) {
+    function Format-Tri($v) { if ($null -eq $v) { return 'unknown' } elseif ($v) { return 'yes' } else { return 'no' } }
+    Write-Host ('  HEVC Video Extensions    : registered for the current user {0}; provisioned in the system image {1}; registered for any user {2} (not installed by this kit, on purpose)' -f (Format-Tri $hevcExtensions.registered_current_user), (Format-Tri $hevcExtensions.provisioned_system_image), (Format-Tri $hevcExtensions.registered_any_user))
+  }
   if ($script:RebootRequired) { Write-Host '  A restart is needed before the Build Tools are fully usable.' -ForegroundColor Yellow }
   if ($ready) { Write-Host '  RESULT: ready' -ForegroundColor Green } else { Write-Host ('  RESULT: not ready (exit code {0}), see {1}' -f $script:ExitCode, $script:LogFile) -ForegroundColor Red }
   Write-Host ('  summary file: {0}' -f $SummaryFile)
