@@ -404,6 +404,7 @@ if (-not $PreflightOnly) {
   [System.IO.File]::WriteAllText($script:LogFile, '')
 }
 
+# Note: @($steps) throws 'Argument types do not match' in Windows PowerShell 5.1 for a List[object]; use ToArray().
 $steps = New-Object System.Collections.Generic.List[object]
 $report = [ordered]@{}
 $exitCode = 0
@@ -541,7 +542,11 @@ try {
   Write-Log ('call test: ok in {0} s' -f $tres.Seconds) 'OK'
 } catch {
   $exitCode = $script:ExitOnFail
-  if (-not $script:FailureMessage) { $script:FailureMessage = $_.Exception.Message }
+  if (-not $script:FailureMessage) {
+    # An error that did not come from Stop-Build: say where it happened, so that it is not lost.
+    $script:FailureMessage = $_.Exception.Message
+    Write-Log ('unexpected error: {0} (script line {1})' -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) 'ERROR'
+  }
   $failedStep = if ($steps.Count -gt 0 -and -not $steps[$steps.Count - 1].ok) { $steps[$steps.Count - 1].name } else { 'preflight' }
 }
 
@@ -578,7 +583,7 @@ $report = [ordered]@{
     reason   = 'gh attestation verify needs the GitHub CLI and a GitHub token, and the lab holds neither by design. CI verifies the attestation of webrtc.lib; locally only the sha256 pins of the repository apply (verify_pins.cmake).'
   }
   toolchain     = $toolchain
-  steps         = @($steps)
+  steps         = $steps.ToArray()
   test          = $testInfo
   warnings      = @($script:Warnings)
   log_file      = ('engine-build-' + $stamp + '.log')
