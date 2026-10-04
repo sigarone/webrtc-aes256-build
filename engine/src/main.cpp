@@ -15,6 +15,9 @@
 // replies err "unsupported" to every other command (the MSVC build of the IPC layer).
 // The CI executable (QMEDIA_CI_BUILD) additionally accepts --ci-audio-in/--ci-audio-out (files that
 // replace the sound card) and --ci-allow-loopback; the production executable rejects those flags.
+// The hardware bench executable (QMEDIA_HW_BENCH, tools/hwlab/audio-bench.ps1) uses the real
+// sound card like the production one and only adds --hw-allow-loopback; it is a separate target and
+// its flag does not exist in the production executable either.
 
 #include <cstdint>
 #include <cstdlib>
@@ -97,6 +100,9 @@ int main(int argc, char** argv) {
       engine_options.fake_audio = true;
       engine_options.fake_audio_out = argv[++i];
     } else if (std::strcmp(argv[i], "--ci-allow-loopback") == 0) {
+      engine_options.allow_loopback = true;
+#elif defined(QMEDIA_WITH_WEBRTC_ENGINE) && defined(QMEDIA_HW_BENCH)
+    } else if (std::strcmp(argv[i], "--hw-allow-loopback") == 0) {
       engine_options.allow_loopback = true;
 #endif
     } else {

@@ -281,11 +281,11 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cmake -S engine -B build-rtc -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=%RUNNER_TEMP%/qm/toolchain.cmake" -DQMEDIA_WITH_WEBRTC=ON -DQMEDIA_BUILD_TESTS=ON "-DCMAKE_CXX_FLAGS=" || exit /b 1
 
-      - name: Build the engine, the CI engine and the call test driver
+      - name: Build the engine, the CI engine, the hardware bench engine and the test drivers
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cmake --build build-rtc --target qaudion-media qaudion-media-ci qmedia_call_test || exit /b 1
+          cmake --build build-rtc --target qaudion-media qaudion-media-ci qaudion-media-hw qmedia_call_test qmedia_audio_bench || exit /b 1
 
       - name: Engine executable hardening flags and CI-only code
         shell: pwsh
@@ -303,17 +303,43 @@ jobs:
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
           if ($text.Contains("ci-audio-in") -or $text.Contains("FileAudioDevice")) { throw "CI-only code found in the production engine" }
           if ($text.Contains("ci-audio-out") -or $text.Contains("ci-allow-loopback")) { throw "CI-only code found in the production engine" }
+          # Nor does it carry any of the hardware bench (real-audio bench, tools/hwlab): that flag and
+          # the bench driver's strings live only in qaudion-media-hw and qmedia_audio_bench.
+          foreach ($s in @("hw-allow-loopback", "qmedia_audio_bench", "engine-audio-bench", "audio-bench")) {
+            if ($text.Contains($s)) { throw "hardware-bench code ($s) found in the production engine" }
+          }
           # Behaviour of the binary itself: the CI flags are not options of the production
           # executable (exit code 2 = bad command line, before anything is read or opened).
-          foreach ($flagArgs in @(@("--ci-allow-loopback"), @("--ci-audio-in", "x"), @("--ci-audio-out", "x"))) {
+          foreach ($flagArgs in @(@("--ci-allow-loopback"), @("--ci-audio-in", "x"), @("--ci-audio-out", "x"), @("--hw-allow-loopback"))) {
             & $exe --pipe '\\.\pipe\qmedia-flag-check' @flagArgs
             if ($LASTEXITCODE -ne 2) { throw "the production engine accepted $($flagArgs[0]) (exit $LASTEXITCODE)" }
           }
-          Write-Host "the production engine rejects every CI flag (exit 2)"
+          Write-Host "the production engine rejects every CI and hardware-bench flag (exit 2)"
           $ci = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path build-rtc\qaudion-media-ci.exe).Path))
           if (-not $ci.Contains("ci-audio-in")) { throw "the CI engine lacks its CI flags" }
+          # The hardware bench engine is a separate build: its own flag only, no file audio device.
+          $hw = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path build-rtc\qaudion-media-hw.exe).Path))
+          if (-not $hw.Contains("hw-allow-loopback")) { throw "the bench engine lacks its flag" }
+          if ($hw.Contains("ci-audio-in") -or $hw.Contains("FileAudioDevice") -or $hw.Contains("ci-allow-loopback")) { throw "CI-only code found in the bench engine" }
+          foreach ($flagArgs in @(@("--ci-allow-loopback"), @("--ci-audio-in", "x"), @("--ci-audio-out", "x"))) {
+            & (Resolve-Path build-rtc\qaudion-media-hw.exe).Path --pipe '\\.\pipe\qmedia-flag-check' @flagArgs
+            if ($LASTEXITCODE -ne 2) { throw "the bench engine accepted $($flagArgs[0]) (exit $LASTEXITCODE)" }
+          }
+          Write-Host "the bench engine rejects every CI flag (exit 2)"
           Write-Host ("size: " + $bytes.Length + " bytes")
           exit 0  # the flag checks above end with a native exit code of 2 on purpose
+
+      - name: Bench logic without hardware (dry run with file devices, device listing)
+        shell: pwsh
+        run: |
+          # The real-audio bench driver on the CI runner: the whole call with the file devices
+          # (never the sound card), and its JSON report must say the strict transport was ok.
+          $bd = Join-Path $env:RUNNER_TEMP "bench"
+          build-rtc\qmedia_audio_bench.exe --dry --seconds 6 --work $bd --out (Join-Path $bd "report.json")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $r = Get-Content -Raw (Join-Path $bd "report.json") | ConvertFrom-Json
+          if (-not $r.transport_ok) { throw "the bench call did not report a strict transport" }
+          if ($r.mode -ne "dry-file-devices") { throw "unexpected bench mode" }
 
       - name: Two engines, one call (DTLS 1.3, PQC group, AES-256 everywhere, frame keys, negative cases)
         shell: pwsh
