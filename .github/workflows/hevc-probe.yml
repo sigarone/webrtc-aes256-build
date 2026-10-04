@@ -173,6 +173,13 @@ jobs:
           Write-Host ("D3D11 decode attempts that reached set_d3d_manager: " + $ran.Count)
           $d3d | ForEach-Object { Write-Host ("  {0} {1}: {2}" -f $_.mft, $_.resolution, ((@($_.steps) | ForEach-Object { "{0}={1}" -f $_.stage, $_.hresult }) -join ' ')) }
           if ($ran.Count -eq 0) { throw 'self-test: no decode attempt got as far as the set_d3d_manager call' }
+          # A decode mode that failed at 720p is not repeated at 1080p. That is not_attempted, with the
+          # reason, and must never count as a failure of its own.
+          if ($s.h264_dxva_decode_720p_status -eq 'failed') {
+            if ($s.h264_dxva_decode_1080p_status -ne 'not_attempted') { throw "self-test: dxva 1080p is $($s.h264_dxva_decode_1080p_status) after a failed 720p, expected not_attempted" }
+            $na = @($rep.tests | Where-Object { $_.status -eq 'not_attempted' -and $_.reason_code -eq 'earlier_stage_failed' -and $_.reason })
+            if ($na.Count -eq 0) { throw 'self-test: no not_attempted entry with the reason earlier_stage_failed' }
+          }
 
       - name: 1080p alone, and 720p alone (attempts independent of each other)
         shell: pwsh
