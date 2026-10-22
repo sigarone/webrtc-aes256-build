@@ -1,0 +1,407 @@
+Opus encoder: runtime ceiling on the coded audio band (P13), for a
+microphone that is a Bluetooth hands-free link, without touching the fixed
+60 ms / 32 kbps CBR configuration.
+
+New process-wide knob in the P8 tuning API, read by the P5 encoder code:
+- `qaudion::SetOpusEncoderMaxPlaybackRate(hz)` / `OpusEncoderMaxPlaybackRate()`
+  (rtc_base/qaudion_tuning.{h,cc}): -1 (the default) = no app limit; 8000..48000
+  = cap the coded band at that playback rate; any other value is ignored (the
+  previous value is kept), never RTC_CHECKed. Bumps `TuningGeneration()` only
+  when the stored value changes, like the other setters. Android:
+  `PeerConnectionFactory.setQaudionOpusEncoderMaxPlaybackRate(int)`; ObjC:
+  `+[RTCPeerConnectionFactory setQaudionOpusEncoderMaxPlaybackRate:]` (NSInteger
+  clamped just outside the valid range, so an out-of-range value is ignored and
+  never turned into a valid cap).
+- `audio_encoder_opus.{cc,h}`: the effective rate is
+  `min(SDP maxplaybackrate, app limit)`, handed to the existing
+  `WebRtcOpus_SetMaxPlaybackRate()` (its bucket mapping, <= 8000 narrowband,
+  <= 16000 wideband, ..., is what turns it into OPUS_SET_MAX_BANDWIDTH, a
+  ceiling that libopus may stay under, not a forced bandwidth). The SDP value
+  stays a hard ceiling: the app can only lower it. It is applied in
+  `RecreateEncoderInstance()` - moved from where upstream sets it to after the
+  `TuningGeneration()` read, for the same reason P5 reads the generation first
+  - and re-applied in `EncodeImpl()`'s existing one-atomic-load generation
+  poll, so a change in the middle of a call is picked up on the next frame.
+- Logs (numbers only): the existing `Q-AUDION opus-enc complexity=.. min_loss_pct=..`
+  line gets ` max_rate_hz=..`; and, only while an app limit is active, one
+  `Q-AUDION opus-enc tx_mode=.. tx_bw=.. bytes=.. max_rate_hz=..` line each time
+  the mode/band read from the packet's TOC byte changes (mode 0 SILK, 1 hybrid,
+  2 CELT; band 0 narrowband, 1 mediumband, 2 wideband, 3 super-wideband, 4
+  fullband), at most 16 per encoder instance. This is the field confirmation
+  that the limit reached the bitstream.
+
+Not touched, on purpose: bitrate, frame size / ptime, CBR, in-band FEC, DTX,
+channel count. Nothing here calls WebRtcOpus_SetBitRate, _EnableCbr, _SetFec,
+_SetDtx or changes `config_`. Packet size and packet rate cannot change: with
+OPUS_SET_VBR(0) at 32 kbps and 60 ms every packet is 240 bytes in every
+mode/band (checked on libopus itself, see "Measured").
+
+Why a hook is needed at all: libopus (float build, Chromium's third_party/opus
+at upstream 55513e81, no FIXED_POINT or DISABLE_FLOAT_API in its BUILD.gn)
+runs its signal analysis, and with it bandwidth detection, only at complexity
+>= 7 (opus_encoder.c: `if (st->silk_mode.complexity >= 7 && st->Fs>=16000)`).
+The app's complexity tiers 10/8 are above that, 6/5 are below. And the
+detection has a floor that depends on the rate: for `equiv_rate <= 30000` the
+detected band is never reported below wideband (`min_detected_bandwidth`), and
+at 32 kbps CBR 60 ms with a 10 % loss floor equiv_rate is about 24-29 kbps. So
+libopus never goes to narrowband by itself in this configuration, goes to
+wideband only when the analysis is on and agrees, and with the analysis off
+(tiers 6/5) codes hybrid super-wideband/fullband whatever the input.
+
+Measured (standalone harness against libopus built from that exact upstream
+commit, float, VOIP, 60 ms, 32 kbps CBR, in-band FEC on, planned loss 10 %,
+~59 s of synthetic speech per voice, inputs band-limited like a CVSD link
+(300-3400 Hz at 8 kHz) and like an mSBC link (16 kHz), then upsampled to
+48 kHz; ITU P.862 PESQ with the 8 kHz or 16 kHz reference, no packet loss
+applied, classic PLC):
+- Packet size: 240 bytes for every packet in every mode/band, with and
+  without the cap.
+- Band chosen without a cap, narrowband input: complexity 10/8: wideband
+  SILK for ~99 % of the packets; complexity 6/5: hybrid super-wideband or
+  fullband for ~99 %. Never narrowband.
+- With a cap (narrowband for the CVSD-like input): always SILK-only at the
+  capped band; the encoder CPU time drops by about 40 % at complexity 10
+  (0.8 ms against 1.4 ms per 60 ms frame on the build server) and by about
+  20 % at complexity 5.
+- Quality: capping is NOT a clear gain. PESQ-NB, narrowband input, two voices:
+  complexity 10: 3.12 / 3.10 without a cap, 3.22 / 2.99 with the narrowband
+  cap; complexity 5: 4.44 / 4.32 without a cap (hybrid), 3.17 / 2.89 with
+  it. The same input scores 4.5 with in-band FEC off in the four
+  configurations tried (no cap and wideband cap, complexity 10 and 5), and
+  also with FEC on and the planned loss at 0 %: what lowers the score is
+  SILK-only mode with FEC on and a non-zero planned loss (4.53 at 0 %, 3.36 at
+  3 %, 3.12 at 10 %, 2.34 at 20 %), which hybrid mode does not show. So at
+  the policy's 32 kbps / 10 % floor a cap forces SILK-only mode and the
+  clean-path score drops to the level the analysis-on tiers already have;
+  with real packet loss the SILK-only mode has its LBRR to recover frames,
+  and this harness (classic PLC, no deep PLC/OSCE of the real decoder) cannot
+  say how the two compare on a lossy link. The cap gives no measured gain on
+  the clean path and a loss at the complexity tiers that run hybrid today, so
+  the apps are expected to use this hook behind a switch that stays off until
+  a field comparison says otherwise.
+
+Order: last of the audio series, after P9 (m150/series). It touches only
+files P8 (qaudion_tuning.{h,cc}, PeerConnectionFactory.java,
+peer_connection_factory.cc, RTCPeerConnectionFactory.{h,mm}) and P5
+(audio_encoder_opus.{cc,h}) already touch, and no other patch of the series
+touches any of them. No new GN target, no new dependency.
+
+Touches (dir "."): rtc_base/qaudion_tuning.h, rtc_base/qaudion_tuning.cc,
+modules/audio_coding/codecs/opus/audio_encoder_opus.cc,
+modules/audio_coding/codecs/opus/audio_encoder_opus.h,
+sdk/android/api/org/webrtc/PeerConnectionFactory.java,
+sdk/android/src/jni/pc/peer_connection_factory.cc,
+sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h,
+sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm.
+
+Tests (not part of the series, added by m150/ci/apply-tests.py): T6 gets three
+tests for the new setter (domain, ignored values, generation); T12
+(m150/tests/audio_encoder_opus_qaudion_tests.inc, spliced into
+audio_encoder_opus_unittest.cc) drives the real AudioEncoderOpusImpl with the
+wire policy: a cap set before the call is narrowband from the first packet, a
+wideband cap never codes above wideband, the SDP limit stays a hard ceiling,
+a cap set and lifted in the middle of a call takes hold and releases (libopus
+needs seconds for it: its SILK layer changes its internal rate one step at a
+time on frames without speech), and every packet is 240 bytes throughout.
+
+Verified: `git apply --check` and a real apply are clean against a
+reconstruction of the pinned tree for the eight files above: the raw files of
+webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582 with P8 and P5
+applied in series order (the other patches of the series do not touch these
+files). The scenarios of the T12 tests were replayed on libopus itself (same
+upstream commit, same encoder settings, same test signal): narrowband from
+the first packet with a cap at start, wideband never above wideband, and a
+mid-call cap reaching narrowband after about 100 packets and leaving it within
+7 after the lift (hybrid again after about 190).
+
+Not verified: nothing here was compiled or run through GN/clang (no
+toolchain on the author's machine; the build workflows do it) - the C++, the
+JNI/ObjC glue and the gtest additions are read-checked only. The first run of
+test-m150-patches on this branch is the compile check. The behaviour on a real
+Bluetooth route and on arm64 (NEON paths of the same code) is not measured.
+
+What remains for a shippable binary (not done here): dispatch
+build-m150-android and build-m150-ios (and the Windows build if the desktop
+engine should carry it) from this branch with a new release_suffix, then
+point the apps at the new artifacts (the Android AAR in libs/, the iOS
+WebRTC binaryTarget url and checksum in Package.swift). The apps call the new
+setter through a lookup that does nothing on a binary without it.
+
+diff --git a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
+index 6b58830..fd13650 100644
+--- a/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
++++ b/modules/audio_coding/codecs/opus/audio_encoder_opus.cc
+@@ -108,6 +108,38 @@ float QaudionMinLossFraction() {
+                    kMaxPacketLossFraction);
+ }
+ 
++// Q-Audion (P13): the max playback rate libopus is told to code up to. The SDP
++// value stays a hard ceiling (a remote that asked for narrowband must never
++// get more); the app can only lower it further, e.g. while the microphone is
++// a Bluetooth hands-free link that has no signal above 4 or 8 kHz. -1 from the
++// app means "no limit". Bitrate, ptime and CBR are not involved.
++int QaudionEffectiveMaxPlaybackRate(int sdp_max_playback_rate_hz) {
++  const int app_limit_hz = qaudion::OpusEncoderMaxPlaybackRate();
++  return app_limit_hz > 0 ? std::min(sdp_max_playback_rate_hz, app_limit_hz)
++                          : sdp_max_playback_rate_hz;
++}
++
++// Q-Audion (P13): what an encoded packet really used, from its TOC byte
++// (RFC 6716 section 3.1, config = toc >> 3). Small numbers only, so the line
++// survives the apps' log redactor: mode 0 SILK, 1 hybrid, 2 CELT; band
++// 0 narrowband, 1 mediumband, 2 wideband, 3 super-wideband, 4 fullband.
++int QaudionTocMode(uint8_t toc) {
++  const int config = toc >> 3;
++  return config < 12 ? 0 : (config < 16 ? 1 : 2);
++}
++
++int QaudionTocBand(uint8_t toc) {
++  const int config = toc >> 3;
++  if (config < 12) {
++    return config / 4;  // SILK-only: NB, MB, WB, four frame sizes each.
++  }
++  if (config < 16) {
++    return config < 14 ? 3 : 4;  // Hybrid: SWB, FB.
++  }
++  constexpr int kCeltBand[4] = {0, 2, 3, 4};  // CELT-only: NB, WB, SWB, FB.
++  return kCeltBand[(config - 16) / 4];
++}
++
+ int CalculateDefaultBitrate(int max_playback_rate, size_t num_channels) {
+   const int bitrate = [&] {
+     if (max_playback_rate <= 8000) {
+@@ -629,6 +661,17 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
+       complexity_ = wanted_complexity;
+       RTC_CHECK_EQ(0, WebRtcOpus_SetComplexity(inst_, complexity_));
+     }
++    // P13: the same for the app's cap on the coded band. The value is read
++    // after the generation above, like the complexity (see
++    // RecreateEncoderInstance()): a concurrent change can only cost one more
++    // harmless pass on the next frame, never a lost update.
++    if (const int wanted_max_rate =
++            QaudionEffectiveMaxPlaybackRate(config_.max_playback_rate_hz);
++        wanted_max_rate != qaudion_max_playback_rate_hz_) {
++      qaudion_max_playback_rate_hz_ = wanted_max_rate;
++      RTC_CHECK_EQ(0, WebRtcOpus_SetMaxPlaybackRate(
++                          inst_, qaudion_max_playback_rate_hz_));
++    }
+     // Re-applies the (possibly new) floor on top of the last real loss
+     // estimate: the smoothed RTCP loss when this encoder is driven by
+     // OnReceivedUplinkPacketLossFraction (0 before the first report, so the
+@@ -641,7 +684,8 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
+                                : packet_loss_fraction_smoother_->GetAverage());
+     RTC_LOG(LS_WARNING) << "Q-AUDION opus-enc complexity=" << complexity_
+                         << " min_loss_pct="
+-                        << qaudion::OpusMinPacketLossPercent();
++                        << qaudion::OpusMinPacketLossPercent()
++                        << " max_rate_hz=" << qaudion_max_playback_rate_hz_;
+   }
+ 
+   if (input_buffer_.empty())
+@@ -670,6 +714,24 @@ AudioEncoder::EncodedInfo AudioEncoderOpusImpl::EncodeImpl(
+       });
+   input_buffer_.clear();
+ 
++  // Q-Audion (P13): field confirmation that an app limit on the coded band
++  // reached the bitstream. Only while such a limit is active (a normal call
++  // logs nothing here), once per change of the packet's mode/band, at most
++  // 16 lines per encoder instance. Numbers only (see QaudionTocMode()).
++  if (qaudion_max_playback_rate_hz_ < config_.max_playback_rate_hz &&
++      info.encoded_bytes > 0 && qaudion_tx_log_budget_ > 0) {
++    const uint8_t toc = encoded->data()[encoded->size() - info.encoded_bytes];
++    const int toc_config = toc >> 3;
++    if (toc_config != qaudion_last_tx_config_) {
++      qaudion_last_tx_config_ = toc_config;
++      --qaudion_tx_log_budget_;
++      RTC_LOG(LS_WARNING) << "Q-AUDION opus-enc tx_mode=" << QaudionTocMode(toc)
++                          << " tx_bw=" << QaudionTocBand(toc)
++                          << " bytes=" << info.encoded_bytes
++                          << " max_rate_hz=" << qaudion_max_playback_rate_hz_;
++    }
++  }
++
+   // Will use new packet size for next encoding.
+   config_.frame_size_ms = next_frame_length_ms_;
+ 
+@@ -739,8 +801,6 @@ bool AudioEncoderOpusImpl::RecreateEncoderInstance() {
+   } else {
+     RTC_CHECK_EQ(0, WebRtcOpus_DisableFec(inst_));
+   }
+-  RTC_CHECK_EQ(
+-      0, WebRtcOpus_SetMaxPlaybackRate(inst_, config_.max_playback_rate_hz));
+   // Q-Audion (M150 hardening, P5 / finding #14): capture the tuning
+   // generation BEFORE reading the override it corresponds to, not after.
+   // Reading it after (as an earlier draft of this patch did) would let a
+@@ -753,6 +813,12 @@ bool AudioEncoderOpusImpl::RecreateEncoderInstance() {
+   // frame, never a lost update.
+   qaudion_tuning_gen_ = qaudion::TuningGeneration();
+   const int qaudion_complexity = qaudion::OpusEncoderComplexity();
++  // P13: the max playback rate goes in here, after the generation read and
++  // not where upstream sets it, for the same reason as the complexity below.
++  qaudion_max_playback_rate_hz_ =
++      QaudionEffectiveMaxPlaybackRate(config_.max_playback_rate_hz);
++  RTC_CHECK_EQ(
++      0, WebRtcOpus_SetMaxPlaybackRate(inst_, qaudion_max_playback_rate_hz_));
+   // Use the default complexity if the start bitrate is within the hysteresis
+   // window, unless the app has set a runtime override (Q-Audion, P8).
+   complexity_ = qaudion_complexity >= 0
+diff --git a/modules/audio_coding/codecs/opus/audio_encoder_opus.h b/modules/audio_coding/codecs/opus/audio_encoder_opus.h
+index f840659..1dedc67 100644
+--- a/modules/audio_coding/codecs/opus/audio_encoder_opus.h
++++ b/modules/audio_coding/codecs/opus/audio_encoder_opus.h
+@@ -172,6 +172,13 @@ class AudioEncoderOpusImpl final : public AudioEncoder {
+   // the same task queue that owns `inst_`, so no synchronization is needed
+   // on this field itself; the atomic is qaudion_tuning.h's, not this one's.
+   uint32_t qaudion_tuning_gen_ = 0;
++  // Q-Audion (P13): the max playback rate last handed to libopus
++  // (min(SDP maxplaybackrate, qaudion::OpusEncoderMaxPlaybackRate())), and the
++  // bookkeeping of the "tx_bw" log line. Same threading as qaudion_tuning_gen_:
++  // only RecreateEncoderInstance() and EncodeImpl() touch them.
++  int qaudion_max_playback_rate_hz_ = 0;
++  int qaudion_last_tx_config_ = -1;
++  int qaudion_tx_log_budget_ = 16;
+   std::vector<int16_t> input_buffer_;
+   OpusEncInst* inst_;
+   uint32_t first_timestamp_in_buffer_;
+diff --git a/rtc_base/qaudion_tuning.cc b/rtc_base/qaudion_tuning.cc
+index 2016019..95cafee 100644
+--- a/rtc_base/qaudion_tuning.cc
++++ b/rtc_base/qaudion_tuning.cc
+@@ -19,6 +19,8 @@ namespace {
+ std::atomic<int> g_enc_complexity{-1};
+ std::atomic<int> g_dec_complexity{-1};
+ std::atomic<int> g_min_loss_percent{10};
++// -1 = no app limit on the encoder's coded band (P13).
++std::atomic<int> g_enc_max_playback_rate{-1};
+ #if !QAUDION_TRANSPORT_STRICT
+ // Strict builds hard-wire level 3 and never read or write this.
+ std::atomic<int> g_transport_level{0};
+@@ -75,6 +77,19 @@ int OpusMinPacketLossPercent() {
+   return g_min_loss_percent.load(std::memory_order_acquire);
+ }
+ 
++void SetOpusEncoderMaxPlaybackRate(int hz) {
++  if (hz != -1 && (hz < 8000 || hz > 48000)) {
++    return;
++  }
++  if (g_enc_max_playback_rate.exchange(hz, std::memory_order_acq_rel) != hz) {
++    Bump();
++  }
++}
++
++int OpusEncoderMaxPlaybackRate() {
++  return g_enc_max_playback_rate.load(std::memory_order_acquire);
++}
++
+ void SetRequireDtlsPqc() {
+   if (!g_require_pqc.exchange(true, std::memory_order_acq_rel)) {
+     Bump();
+diff --git a/rtc_base/qaudion_tuning.h b/rtc_base/qaudion_tuning.h
+index 72f0d94..652e2ad 100644
+--- a/rtc_base/qaudion_tuning.h
++++ b/rtc_base/qaudion_tuning.h
+@@ -74,6 +74,23 @@ int OpusDecoderComplexity();
+ void SetOpusMinPacketLossPercent(int percent);
+ int OpusMinPacketLossPercent();
+ 
++// ---------------------------------------------------------------------------
++// Opus encoder: upper bound on the coded audio band (P13). Expressed like the
++// SDP "maxplaybackrate" parameter, as a playback rate in Hz, because that is
++// the vocabulary WebRtcOpus_SetMaxPlaybackRate already maps to libopus's
++// OPUS_SET_MAX_BANDWIDTH (<= 8000 narrowband, <= 12000 mediumband, <= 16000
++// wideband, <= 24000 super-wideband, above that fullband).
++// -1 (the default) means "no app limit". 8000..48000 caps the band at that
++// rate, mid-call changes included (picked up on the next encoded frame). The
++// encoder never goes above what the SDP negotiated either: the effective cap
++// is min(SDP maxplaybackrate, this value). It is a ceiling, not a forced
++// bandwidth: libopus still chooses the narrower band when it wants to.
++// Bitrate, ptime, CBR, FEC and the packet size are not touched by it. Any
++// other value is ignored (the previous value, valid or -1, is kept) - never
++// RTC_CHECKed.
++void SetOpusEncoderMaxPlaybackRate(int hz);
++int OpusEncoderMaxPlaybackRate();
++
+ // ---------------------------------------------------------------------------
+ // Require the DTLS handshake to have negotiated the X25519MLKEM768 hybrid
+ // group (checked by the crypto author's P7). Tighten-only for the life of
+diff --git a/sdk/android/api/org/webrtc/PeerConnectionFactory.java b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+index 5092bb2..a543169 100644
+--- a/sdk/android/api/org/webrtc/PeerConnectionFactory.java
++++ b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+@@ -697,6 +697,15 @@ public class PeerConnectionFactory {
+     nativeSetQaudionOpusMinPacketLossPercent(percent);
+   }
+ 
++  /**
++   * Upper bound, in Hz, on the audio band the Opus encoder codes (P13): 8000 narrowband, 16000
++   * wideband, ..., or -1 for no app limit (the build default). It only lowers what the SDP
++   * negotiated, never raises it, and leaves bitrate, packet size and CBR alone. May change mid-call.
++   */
++  public static void setQaudionOpusEncoderMaxPlaybackRate(int hz) {
++    nativeSetQaudionOpusEncoderMaxPlaybackRate(hz);
++  }
++
+   /** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
+   public static void setQaudionRequireDtlsPqc() {
+     nativeSetQaudionRequireDtlsPqc();
+@@ -726,6 +735,7 @@ public class PeerConnectionFactory {
+   private static native void nativeSetQaudionOpusEncoderComplexity(int complexity);
+   private static native void nativeSetQaudionOpusDecoderComplexity(int complexity);
+   private static native void nativeSetQaudionOpusMinPacketLossPercent(int percent);
++  private static native void nativeSetQaudionOpusEncoderMaxPlaybackRate(int hz);
+   private static native void nativeSetQaudionRequireDtlsPqc();
+   private static native void nativeRaiseQaudionTransportLevel(int level);
+   private static native void nativeSetQaudionDisableMagicBytesBypass();
+diff --git a/sdk/android/src/jni/pc/peer_connection_factory.cc b/sdk/android/src/jni/pc/peer_connection_factory.cc
+index 2c279f6..6aab901 100644
+--- a/sdk/android/src/jni/pc/peer_connection_factory.cc
++++ b/sdk/android/src/jni/pc/peer_connection_factory.cc
+@@ -252,6 +252,12 @@ static void JNI_PeerConnectionFactory_SetQaudionOpusMinPacketLossPercent(
+   qaudion::SetOpusMinPacketLossPercent(percent);
+ }
+ 
++static void JNI_PeerConnectionFactory_SetQaudionOpusEncoderMaxPlaybackRate(
++    JNIEnv* jni,
++    jint hz) {
++  qaudion::SetOpusEncoderMaxPlaybackRate(hz);
++}
++
+ static void JNI_PeerConnectionFactory_SetQaudionRequireDtlsPqc(JNIEnv* jni) {
+   qaudion::SetRequireDtlsPqc();
+ }
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+index ab9cccf..f7b0c1d 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+@@ -174,6 +174,13 @@ RTC_OBJC_EXPORT
+ /** Floor (0..20%) of the loss hint given to Opus, i.e. minimum in-band FEC. Build default 10. */
+ + (void)setQaudionOpusMinPacketLossPercent:(NSInteger)percent;
+ 
++/**
++ * Upper bound, in Hz, on the audio band the Opus encoder codes (P13): 8000 narrowband, 16000
++ * wideband, ..., or -1 for no app limit (the build default). It only lowers what the SDP
++ * negotiated, never raises it, and leaves bitrate, packet size and CBR alone. May change mid-call.
++ */
+++ (void)setQaudionOpusEncoderMaxPlaybackRate:(NSInteger)hz;
++
+ /** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
+ + (void)setQaudionRequireDtlsPqc;
+ 
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+index 251418d..4ccc6a1 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+@@ -576,6 +576,13 @@ static int QaudionClampNSInteger(NSInteger value, NSInteger lo, NSInteger hi) {
+   webrtc::qaudion::SetOpusMinPacketLossPercent(QaudionClampNSInteger(percent, 0, 20));
+ }
+ 
+++ (void)setQaudionOpusEncoderMaxPlaybackRate:(NSInteger)hz {
++  // -1 (no limit) is part of the valid domain, like the complexity setters. Anything else outside
++  // 8000..48000 is clamped just past the ends of the C++ API's range, so the API ignores it
++  // (it is not turned into a valid cap): NSInteger must not be narrowed unchecked (finding #14).
++  webrtc::qaudion::SetOpusEncoderMaxPlaybackRate(QaudionClampNSInteger(hz, -2, 48001));
++}
++
+ + (void)setQaudionRequireDtlsPqc {
+   webrtc::qaudion::SetRequireDtlsPqc();
+ }

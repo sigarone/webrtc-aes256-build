@@ -33,6 +33,13 @@ third_party P4a-opus-dnn-osce-build.patch
 # handshake delivered the peer certificate (transcript-v5 check (b)).
 . P9-stats-remote-cert-cache.patch
 #
+# P13: app-controlled ceiling on the Opus encoder's coded band
+# (qaudion::SetOpusEncoderMaxPlaybackRate), for a Bluetooth hands-free
+# microphone. Touches only files P8 and P5 already touch (qaudion_tuning.{h,cc},
+# audio_encoder_opus.{cc,h}, the Android/ObjC factory glue); no other patch
+# of the series touches them. Inert until the app calls the setter.
+. P13-opus-encoder-max-playback-rate.patch
+#
 # Build-tooling author: P10 touches the separate 'build' repo (DEPS
 # 'src/build'), not the webrtc src tree or third_party, so it has no hunk
 # overlap with P1-P8/P4a and its position in this file does not matter.
