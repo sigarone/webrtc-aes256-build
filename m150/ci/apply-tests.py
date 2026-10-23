@@ -15,9 +15,15 @@ binaries stay exactly what the apps get.
        peer (DTLS 1.2 only, AES-128 SRTP only, no DTLS-SRTP) must not connect
        to a strict peer, plus positive controls and the strict CryptoOptions.
 
-Both are compiled into rtc_base_unittests, i.e. into rtc_unittests. Every
-anchor is checked: a moved anchor fails the job instead of silently skipping
-a test. Idempotent (a second run changes nothing).
+  T12  m150/tests/audio_encoder_opus_qaudion_tests.inc is spliced into
+       modules/audio_coding/codecs/opus/audio_encoder_opus_unittest.cc (P13:
+       the app's ceiling on the Opus coded band, driven through the real
+       AudioEncoderOpusImpl with the 60 ms / 32 kbps CBR wire policy).
+
+T6 and T11 are compiled into rtc_base_unittests, i.e. into rtc_unittests; T12
+into modules_unittests. Every anchor is checked: a moved anchor fails the job
+instead of silently skipping a test. Idempotent (a second run changes
+nothing).
 
   --dev-target  also define a small test executable (qaudion_dev_unittests =
                 rtc_base_unittests + test main) so the tests can be built and
@@ -31,6 +37,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = os.path.join(os.path.dirname(HERE), "tests")
 MARK_INC = "// Q-Audion strict-transport tests (T11)."
+MARK_OPUS_INC = "// Q-Audion Opus band-limit tests (T12)."
 
 
 def die(msg):
@@ -146,6 +153,43 @@ def patch_ssl_test(src):
     print("apply-tests: ssl_stream_adapter_unittest.cc patched")
 
 
+def patch_opus_encoder_test(src):
+    path = os.path.join(src, "modules", "audio_coding", "codecs", "opus", "audio_encoder_opus_unittest.cc")
+    text = read(path)
+    if MARK_OPUS_INC in text:
+        print("apply-tests: audio_encoder_opus_unittest.cc already patched")
+        return
+    crlf = "\r\n" in text
+    if crlf:
+        text = text.replace("\r\n", "\n")
+    inc = read(os.path.join(TESTS, "audio_encoder_opus_qaudion_tests.inc")).replace("\r\n", "\n")
+    if MARK_OPUS_INC not in inc:
+        die("marker missing from audio_encoder_opus_qaudion_tests.inc")
+    # includes (sorted positions)
+    a = "#include <cstddef>\n"
+    if a not in text:
+        die("anchor '#include <cstddef>' not found in audio_encoder_opus_unittest.cc")
+    text = text.replace(a, "#include <cmath>\n" + a, 1)
+    b = '#include "rtc_base/checks.h"\n'
+    if b not in text:
+        die("anchor '#include \"rtc_base/checks.h\"' not found in audio_encoder_opus_unittest.cc")
+    text = text.replace(b, b + '#include "rtc_base/qaudion_tuning.h"\n', 1)
+    # the helpers the tests use live in the file's anonymous namespace
+    for needed in ("constexpr int kDefaultOpusPayloadType", "constexpr int64_t kInitialTimeUs"):
+        if needed not in text:
+            die("anchor '%s' not found in audio_encoder_opus_unittest.cc" % needed)
+    # splice before the closing namespace at the end of the file
+    tail = "}  // namespace webrtc\n"
+    idx = text.rfind(tail)
+    if idx == -1 or text[idx + len(tail):].strip():
+        die("closing namespace not found at the end of audio_encoder_opus_unittest.cc")
+    text = text[:idx] + inc + ("\n" if not inc.endswith("\n\n") else "") + text[idx:]
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    write(path, text)
+    print("apply-tests: audio_encoder_opus_unittest.cc patched")
+
+
 def main():
     args = [a for a in sys.argv[1:] if a != "--dev-target"]
     dev = len(args) != len(sys.argv) - 1
@@ -159,6 +203,7 @@ def main():
     write(dst, read(os.path.join(TESTS, "qaudion_tuning_unittest.cc")).replace("\r\n", "\n"))
     patch_build_gn(src, dev)
     patch_ssl_test(src)
+    patch_opus_encoder_test(src)
     return 0
 
 

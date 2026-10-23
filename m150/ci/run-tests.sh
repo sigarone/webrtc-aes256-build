@@ -1,5 +1,5 @@
 #!/bin/sh
-# run-tests.sh - run the T1-T11 unit-test filters (webrtc-plan.md v2 §6.1)
+# run-tests.sh - run the T1-T12 unit-test filters (webrtc-plan.md v2 §6.1)
 # against already-built rtc_unittests / modules_unittests. Shared by
 # test-m150-patches.yml (Linux x64) and build-m150-windows.yml (Windows x64)
 # so the filters live in exactly one place.
@@ -80,6 +80,13 @@ T10_FILTER="*RTCStatsCollectorTest*CertificateStatsCache*"
 # ssl_stream_adapter_unittest.cc by m150/ci/apply-tests.py. Strict config only
 # (the tests are compiled out of the switchable one).
 T11_FILTER="*QaudionStrict*"
+# T12 (P13, Opus encoder band ceiling): the real AudioEncoderOpusImpl with the
+# 60 ms / 32 kbps CBR wire policy - a cap set before the call is narrowband
+# from the first packet, a wideband cap never codes above wideband, the SDP
+# limit stays a hard ceiling, a cap set and lifted in the middle of a call
+# takes hold and releases, every packet keeps its size. Spliced into
+# audio_encoder_opus_unittest.cc by m150/ci/apply-tests.py. Both configs.
+T12_FILTER="QaudionOpusBandLimit.*"
 
 any=0
 # <name>:<binary>:<filter>. In the strict config, T1/T2 are the upstream
@@ -93,7 +100,7 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
             "T7:rtc_unittests:$T7_FILTER" "T8:rtc_unittests:$T8_FILTER" \
             "T9:rtc_unittests:$T9_FILTER" \
             "T10:peerconnection_unittests:$T10_FILTER" \
-            "T11:rtc_unittests:$T11_FILTER"; do
+            "T11:rtc_unittests:$T11_FILTER" "T12:modules_unittests:$T12_FILTER"; do
   name=${spec%%:*}
   rest=${spec#*:}
   bin=${rest%%:*}
@@ -114,7 +121,7 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   # Minimum number of tests a filter must select. T6/T11 are ours: if a guard
   # (#if) ever drops most of them the remaining few must not keep the job green.
   min=1
-  case "$name" in T6) min=7 ;; T11) min=11 ;; esac
+  case "$name" in T6) min=10 ;; T11) min=11 ;; T12) min=4 ;; esac
   if [ "${n:-0}" -lt "$min" ]; then
     echo "::error::$name: filter '$filt' selects ${n:-0} test(s) in $bin, expected at least $min - the check would silently pass"
     exit 1
@@ -125,6 +132,6 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   any=$((any + 1))
 done
 if [ "$any" -eq 0 ]; then
-  echo "::warning::no T1-T11 filters ran - build-only smoke passed, no tests ran"
+  echo "::warning::no T1-T12 filters ran - build-only smoke passed, no tests ran"
 fi
 echo "run-tests: $any filter group(s) passed ($CONFIG)"

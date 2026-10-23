@@ -23,17 +23,20 @@ class TuningRestorer {
   TuningRestorer()
       : enc_(qaudion::OpusEncoderComplexity()),
         dec_(qaudion::OpusDecoderComplexity()),
-        loss_(qaudion::OpusMinPacketLossPercent()) {}
+        loss_(qaudion::OpusMinPacketLossPercent()),
+        max_rate_(qaudion::OpusEncoderMaxPlaybackRate()) {}
   ~TuningRestorer() {
     qaudion::SetOpusEncoderComplexity(enc_);
     qaudion::SetOpusDecoderComplexity(dec_);
     qaudion::SetOpusMinPacketLossPercent(loss_);
+    qaudion::SetOpusEncoderMaxPlaybackRate(max_rate_);
   }
 
  private:
   int enc_;
   int dec_;
   int loss_;
+  int max_rate_;
 };
 
 TEST(QaudionTuning, BuildInfoCarriesTheTransportMarker) {
@@ -150,6 +153,43 @@ TEST(QaudionTuning, GenerationMovesOnlyWhenAStoredValueChanges) {
   EXPECT_EQ(qaudion::TuningGeneration(), g0);
   // A real change does.
   qaudion::SetOpusMinPacketLossPercent(13);
+  EXPECT_NE(qaudion::TuningGeneration(), g0);
+}
+
+TEST(QaudionTuning, EncoderMaxPlaybackRateTakesNoLimitOrARateInRange) {
+  TuningRestorer restore;
+  // Nobody asked for a limit: the build default is "no limit".
+  qaudion::SetOpusEncoderMaxPlaybackRate(-1);
+  EXPECT_EQ(qaudion::OpusEncoderMaxPlaybackRate(), -1);
+  qaudion::SetOpusEncoderMaxPlaybackRate(8000);
+  EXPECT_EQ(qaudion::OpusEncoderMaxPlaybackRate(), 8000);
+  qaudion::SetOpusEncoderMaxPlaybackRate(16000);
+  EXPECT_EQ(qaudion::OpusEncoderMaxPlaybackRate(), 16000);
+  qaudion::SetOpusEncoderMaxPlaybackRate(48000);
+  EXPECT_EQ(qaudion::OpusEncoderMaxPlaybackRate(), 48000);
+}
+
+TEST(QaudionTuning, EncoderMaxPlaybackRateIgnoresEverythingElse) {
+  TuningRestorer restore;
+  qaudion::SetOpusEncoderMaxPlaybackRate(16000);
+  // 0 is not "no limit" (that is -1): a caller that passes it by mistake must
+  // not end up with a band cap, and must not lose the one it has either.
+  for (int bad : {0, -2, 1, 7999, 48001, 96000, -48000}) {
+    qaudion::SetOpusEncoderMaxPlaybackRate(bad);
+    EXPECT_EQ(qaudion::OpusEncoderMaxPlaybackRate(), 16000) << bad;
+  }
+}
+
+TEST(QaudionTuning, EncoderMaxPlaybackRateBumpsTheGenerationOnlyOnAChange) {
+  TuningRestorer restore;
+  qaudion::SetOpusEncoderMaxPlaybackRate(8000);
+  const uint32_t g0 = qaudion::TuningGeneration();
+  qaudion::SetOpusEncoderMaxPlaybackRate(8000);
+  qaudion::SetOpusEncoderMaxPlaybackRate(0);
+  qaudion::SetOpusEncoderMaxPlaybackRate(100000);
+  EXPECT_EQ(qaudion::TuningGeneration(), g0);
+  // Leaving the limit is a change too: the encoder has to learn about it.
+  qaudion::SetOpusEncoderMaxPlaybackRate(-1);
   EXPECT_NE(qaudion::TuningGeneration(), g0);
 }
 
