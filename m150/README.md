@@ -20,7 +20,7 @@ remain the rollback path.
 
 ```
 m150/series                 <- SOURCE-PATCH author's apply order (does not exist yet)
-m150/patches/P1..P13-*.patch <- SOURCE-PATCH author's patches (P12 = frame anti-replay window, P13 = Opus band ceiling)
+m150/patches/P1..P14-*.patch <- SOURCE-PATCH author's patches (P12 = frame anti-replay window, P13 = Opus band ceiling, P14 = privacy-sensitive call capture)
 m150/apply-series.sh        <- reads series and applies it
 m150/fetch-opus-dnn-weights.sh
 m150/gates.sh                <- G1-G9, see webrtc-plan.md §2.5
@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/webrtc-sdk/webrtc/<new_ref>/DEPS | 
 | `windows` (plain, x64) | `rtc_qaudion_transport_strict=true` | none |
 
 The LiveKit-prefixed `-lk` variants (and their prefixing patches) are gone:
-the apps no longer use LiveKit. P1-P13 (from `m150/series`) apply identically
+the apps no longer use LiveKit. P1-P14 (from `m150/series`) apply identically
 to every variant. `apply-series.sh` enforces this; it is NOT encoded per-line
 in `series` itself. (`test-webrtc-m150-patches` still builds a `switchable`
 config next to `strict`, because that is the only place the upstream-behaviour
