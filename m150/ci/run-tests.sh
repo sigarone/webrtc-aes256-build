@@ -44,7 +44,9 @@ T4_FILTER="*AudioDecoderOpusTest*Plc*:*AudioDecoderOpusTest*Fec*"
 # AudioEncoderOpusImpl::GetNewComplexity(), which P5's qaudion override
 # sits next to (SetTargetBitrate must not clobber an active override).
 T5_FILTER="AudioEncoderOpusTest.ConfigComplexityAdaptation"
-# T6 (BuildInfo/transport markers, runtime tuning API): rtc_base/
+# T6 (BuildInfo/transport markers, runtime tuning API, and since P15 the
+# clearable DTLS PQC requirement: set/read/clear, one generation bump per
+# change): rtc_base/
 # qaudion_tuning_unittest.cc, added to rtc_base_unittests by m150/ci/
 # apply-tests.py (the tests are not part of the shipped patch series). Both
 # configs: the marker and the pinned/tighten-only semantics differ by
@@ -79,6 +81,8 @@ T10_FILTER="*RTCStatsCollectorTest*CertificateStatsCache*"
 # AEAD_AES_256_GCM / X25519MLKEM768) and the strict CryptoOptions. Spliced into
 # ssl_stream_adapter_unittest.cc by m150/ci/apply-tests.py. Strict config only
 # (the tests are compiled out of the switchable one).
+# T11d (P15, QaudionStrictPqcRequirementTest.*): a client limited to X25519 is
+# refused while the DTLS PQC requirement is on and accepted once it is cleared.
 T11_FILTER="*QaudionStrict*"
 # T12 (P13, Opus encoder band ceiling): the real AudioEncoderOpusImpl with the
 # 60 ms / 32 kbps CBR wire policy - a cap set before the call is narrowband
@@ -121,7 +125,7 @@ for spec in "T1:rtc_unittests:$T1_FILTER" "T2:rtc_unittests:$T2_FILTER" \
   # Minimum number of tests a filter must select. T6/T11 are ours: if a guard
   # (#if) ever drops most of them the remaining few must not keep the job green.
   min=1
-  case "$name" in T6) min=10 ;; T11) min=11 ;; T12) min=4 ;; esac
+  case "$name" in T6) min=13 ;; T11) min=14 ;; T12) min=4 ;; esac
   if [ "${n:-0}" -lt "$min" ]; then
     echo "::error::$name: filter '$filt' selects ${n:-0} test(s) in $bin, expected at least $min - the check would silently pass"
     exit 1

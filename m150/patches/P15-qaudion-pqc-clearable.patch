@@ -1,0 +1,222 @@
+DTLS post-quantum requirement is clearable (P15), so a server-flag rollback
+takes effect without restarting the app.
+
+Until now the requirement was one-way: qaudion::SetRequireDtlsPqc() (P8) did
+`g_require_pqc.exchange(true)` and nothing could lower it, so an app that
+turned it on from a server flag and later had that flag rolled back had to be
+restarted before DTLS handshakes without X25519MLKEM768 worked again.
+
+- rtc_base/qaudion_tuning.{h,cc}: `void SetRequireDtlsPqc(bool required = true)`.
+  It stores the value and bumps TuningGeneration() only when the stored value
+  changes, like the other reversible setters. The no-argument call still means
+  "true" (the engine's runtime.cpp and any old caller compile unchanged).
+  RequireDtlsPqc() is unchanged. The value is read once per DTLS handshake,
+  when that handshake completes (P7's QaudionHandshakeMeetsPolicy()): a change
+  applies to handshakes that complete after it and never touches a connection
+  that is already established. The default stays false; strict builds already
+  pin the transport level, not this knob.
+- rtc_base/openssl_stream_adapter.cc (P7's QaudionHandshakeMeetsPolicy()):
+  one `const bool require_pqc = qaudion::RequireDtlsPqc();` read feeds both the
+  verdict and the `Q-AUDION dtls ... pqc_req=` line, so with a concurrent
+  clear/set the log line always agrees with the decision that was taken
+  (before, the function read the atomic twice).
+- Android: `PeerConnectionFactory.setQaudionRequireDtlsPqc(boolean required)`;
+  the no-argument overload stays for one release and calls it with true. The
+  native method is now `nativeSetQaudionRequireDtlsPqcValue(boolean)` (JNI
+  `jboolean`); the old argument-less native is gone. The new native name is
+  deliberate: it makes the binary distinguishable from a P8-only build, so the
+  G8 gate can pin it (an overload keeps the Java method name, and the JNI
+  export of an argument-less/boolean pair would not differ).
+- iOS: `+[RTCPeerConnectionFactory setQaudionRequireDtlsPqc:(BOOL)required]`;
+  the old argument-less selector stays as an alias for YES for one release.
+- Windows/engine: the C++ symbol changes to take a bool
+  (...SetRequireDtlsPqc@qaudion@webrtc@@YAX_N@Z); engine/src/runtime.cpp calls
+  the no-argument form and is unaffected.
+
+Order: after P13/P14 (last of the audio/API series; m150/series). It edits
+only text that P7, P8 and P13 added (qaudion_tuning.{h,cc} and the factory glue
+of P8, the policy function of P7) and touches no file of any other patch in a
+way that overlaps. No new GN target, no new dependency.
+
+Touches (dir "."): rtc_base/qaudion_tuning.h, rtc_base/qaudion_tuning.cc,
+rtc_base/openssl_stream_adapter.cc,
+sdk/android/api/org/webrtc/PeerConnectionFactory.java,
+sdk/android/src/jni/pc/peer_connection_factory.cc,
+sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h,
+sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm.
+
+Tests (not part of the series, added by m150/ci/apply-tests.py): T6 gets tests
+for set true / read true, set false / read false and one TuningGeneration()
+bump per real change; T11d (m150/tests/ssl_stream_adapter_strict_tests.inc,
+spliced into ssl_stream_adapter_unittest.cc, strict config) handshakes a client
+limited to X25519 against a strict server: refused while the requirement is on,
+accepted once it is cleared.
+
+Generated against a reconstruction of the pinned tree: the raw files of
+webrtc-sdk/webrtc @ ba469aa2093ba950066258ca0a59a6fbd1295582 with P8, P13 and P7
+applied in series order for the seven files above (the other patches of the
+series do not touch them). Not compiled locally (no toolchain); the
+test-webrtc-m150-patches workflow is the compile and test check.
+
+diff --git a/rtc_base/openssl_stream_adapter.cc b/rtc_base/openssl_stream_adapter.cc
+index f78c486..c11d08c 100644
+--- a/rtc_base/openssl_stream_adapter.cc
++++ b/rtc_base/openssl_stream_adapter.cc
+@@ -1616,8 +1616,10 @@ bool OpenSSLStreamAdapter::QaudionHandshakeMeetsPolicy() {
+   // stream at all (e.g. a data-channel-only connection) - nothing to check.
+   const bool srtp_ok =
+       srtp_ciphers_.empty() || srtp_id == SRTP_AEAD_AES_256_GCM;
+-  const bool pqc_ok = !qaudion::RequireDtlsPqc() ||
+-                      group_id == SSL_GROUP_X25519_MLKEM768;
++  // P15: read once, so the verdict and the log line below always agree even
++  // if the app clears or sets the requirement while this runs.
++  const bool require_pqc = qaudion::RequireDtlsPqc();
++  const bool pqc_ok = !require_pqc || group_id == SSL_GROUP_X25519_MLKEM768;
+   const bool ok = (level < 1 || srtp_ok) && (level < 2 || cipher_ok) &&
+                   (level < 3 || is_dtls13) && pqc_ok;
+ 
+@@ -1627,7 +1629,7 @@ bool OpenSSLStreamAdapter::QaudionHandshakeMeetsPolicy() {
+       "Q-AUDION dtls v=%04x cipher=%04x srtp=%04x group=%04x level=%d "
+       "pqc_req=%d ok=%d",
+       static_cast<unsigned>(version), cipher_id, srtp_id, group_id, level,
+-      qaudion::RequireDtlsPqc() ? 1 : 0, ok ? 1 : 0);
++      require_pqc ? 1 : 0, ok ? 1 : 0);
+   return ok;
+ }
+ #endif  // OPENSSL_IS_BORINGSSL
+diff --git a/rtc_base/qaudion_tuning.cc b/rtc_base/qaudion_tuning.cc
+index 95cafee..0c88f85 100644
+--- a/rtc_base/qaudion_tuning.cc
++++ b/rtc_base/qaudion_tuning.cc
+@@ -90,8 +90,8 @@ int OpusEncoderMaxPlaybackRate() {
+   return g_enc_max_playback_rate.load(std::memory_order_acquire);
+ }
+ 
+-void SetRequireDtlsPqc() {
+-  if (!g_require_pqc.exchange(true, std::memory_order_acq_rel)) {
++void SetRequireDtlsPqc(bool required) {
++  if (g_require_pqc.exchange(required, std::memory_order_acq_rel) != required) {
+     Bump();
+   }
+ }
+diff --git a/rtc_base/qaudion_tuning.h b/rtc_base/qaudion_tuning.h
+index 652e2ad..8f6886a 100644
+--- a/rtc_base/qaudion_tuning.h
++++ b/rtc_base/qaudion_tuning.h
+@@ -93,9 +93,14 @@ int OpusEncoderMaxPlaybackRate();
+ 
+ // ---------------------------------------------------------------------------
+ // Require the DTLS handshake to have negotiated the X25519MLKEM768 hybrid
+-// group (checked by the crypto author's P7). Tighten-only for the life of
+-// the process: there is no way to turn this back off short of restarting.
+-void SetRequireDtlsPqc();
++// group (checked by the crypto author's P7). Clearable (P15): the app sets
++// it from a server flag and can lower it again, e.g. on a flag rollback,
++// without restarting. The value is read once per DTLS handshake, when that
++// handshake completes: a change applies to handshakes that complete after
++// it and never touches a connection that is already established. Defaults
++// to false; SetRequireDtlsPqc() with no argument means true. Bumps
++// TuningGeneration() only when the stored value changes.
++void SetRequireDtlsPqc(bool required = true);
+ bool RequireDtlsPqc();
+ 
+ // ---------------------------------------------------------------------------
+@@ -119,7 +124,8 @@ bool MagicBytesBypassAllowed();
+ // ---------------------------------------------------------------------------
+ // Bumped once for every setter call above that actually changed a stored
+ // value (a call that is out of range, or that repeats the current value, or
+-// that tries to loosen a tighten-only knob, does not bump it). Consumers
++// that tries to loosen a tighten-only knob, does not bump it; the DTLS PQC
++// requirement is not one of those since P15). Consumers
+ // that must react to a change - the Opus encoder/decoder complexity and FEC
+ // floor - poll this once per call/frame instead of taking a lock or being
+ // pushed a callback.
+diff --git a/sdk/android/api/org/webrtc/PeerConnectionFactory.java b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+index a543169..8e26d47 100644
+--- a/sdk/android/api/org/webrtc/PeerConnectionFactory.java
++++ b/sdk/android/api/org/webrtc/PeerConnectionFactory.java
+@@ -706,9 +706,18 @@ public class PeerConnectionFactory {
+     nativeSetQaudionOpusEncoderMaxPlaybackRate(hz);
+   }
+ 
+-  /** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
++  /**
++   * Whether DTLS handshakes must have negotiated X25519MLKEM768 (P15). Clearable: pass false to
++   * lift the requirement again without restarting. Read once per handshake, when it completes;
++   * connections that are already up are not affected.
++   */
++  public static void setQaudionRequireDtlsPqc(boolean required) {
++    nativeSetQaudionRequireDtlsPqcValue(required);
++  }
++
++  /** Same as setQaudionRequireDtlsPqc(true). Kept for one release. */
+   public static void setQaudionRequireDtlsPqc() {
+-    nativeSetQaudionRequireDtlsPqc();
++    setQaudionRequireDtlsPqc(true);
+   }
+ 
+   /**
+@@ -736,7 +745,7 @@ public class PeerConnectionFactory {
+   private static native void nativeSetQaudionOpusDecoderComplexity(int complexity);
+   private static native void nativeSetQaudionOpusMinPacketLossPercent(int percent);
+   private static native void nativeSetQaudionOpusEncoderMaxPlaybackRate(int hz);
+-  private static native void nativeSetQaudionRequireDtlsPqc();
++  private static native void nativeSetQaudionRequireDtlsPqcValue(boolean required);
+   private static native void nativeRaiseQaudionTransportLevel(int level);
+   private static native void nativeSetQaudionDisableMagicBytesBypass();
+   private static native String nativeGetQaudionBuildInfo();
+diff --git a/sdk/android/src/jni/pc/peer_connection_factory.cc b/sdk/android/src/jni/pc/peer_connection_factory.cc
+index 6aab901..c14098d 100644
+--- a/sdk/android/src/jni/pc/peer_connection_factory.cc
++++ b/sdk/android/src/jni/pc/peer_connection_factory.cc
+@@ -258,8 +258,10 @@ static void JNI_PeerConnectionFactory_SetQaudionOpusEncoderMaxPlaybackRate(
+   qaudion::SetOpusEncoderMaxPlaybackRate(hz);
+ }
+ 
+-static void JNI_PeerConnectionFactory_SetQaudionRequireDtlsPqc(JNIEnv* jni) {
+-  qaudion::SetRequireDtlsPqc();
++static void JNI_PeerConnectionFactory_SetQaudionRequireDtlsPqcValue(
++    JNIEnv* jni,
++    jboolean required) {
++  qaudion::SetRequireDtlsPqc(required);
+ }
+ 
+ static void JNI_PeerConnectionFactory_RaiseQaudionTransportLevel(
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+index f7b0c1d..64f42a7 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.h
+@@ -181,7 +181,14 @@ RTC_OBJC_EXPORT
+  */
+ + (void)setQaudionOpusEncoderMaxPlaybackRate:(NSInteger)hz;
+ 
+-/** From now on, reject DTLS handshakes that did not negotiate X25519MLKEM768. Tighten-only. */
++/**
++ * Whether DTLS handshakes must have negotiated X25519MLKEM768 (P15). Clearable: pass NO to lift
++ * the requirement again without restarting. Read once per handshake, when it completes;
++ * connections that are already up are not affected.
++ */
+++ (void)setQaudionRequireDtlsPqc:(BOOL)required;
++
++/** Same as setQaudionRequireDtlsPqc:YES. Kept for one release. */
+ + (void)setQaudionRequireDtlsPqc;
+ 
+ /**
+diff --git a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+index 4ccc6a1..445aee9 100644
+--- a/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
++++ b/sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm
+@@ -583,8 +583,12 @@ static int QaudionClampNSInteger(NSInteger value, NSInteger lo, NSInteger hi) {
+   webrtc::qaudion::SetOpusEncoderMaxPlaybackRate(QaudionClampNSInteger(hz, -2, 48001));
+ }
+ 
+++ (void)setQaudionRequireDtlsPqc:(BOOL)required {
++  webrtc::qaudion::SetRequireDtlsPqc(required != NO);
++}
++
+ + (void)setQaudionRequireDtlsPqc {
+-  webrtc::qaudion::SetRequireDtlsPqc();
++  [self setQaudionRequireDtlsPqc:YES];
+ }
+ 
+ + (void)raiseQaudionTransportLevel:(NSInteger)level {

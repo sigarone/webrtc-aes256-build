@@ -173,7 +173,7 @@ bool Runtime::Init(const Options& opts) {
       webrtc::qaudion::BuildInfo().find("transport=strict") == std::string::npos) {
     return false;
   }
-  webrtc::qaudion::SetRequireDtlsPqc();  // tighten-only; the strict build already pins it
+  webrtc::qaudion::SetRequireDtlsPqc();  // = true (clearable since P15); the strict build already pins the rest
 
   WSADATA wsa;
   wsa_started_ = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
