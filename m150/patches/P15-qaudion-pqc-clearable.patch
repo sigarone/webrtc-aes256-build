@@ -47,7 +47,7 @@ sdk/objc/api/peerconnection/RTCPeerConnectionFactory.mm.
 
 Tests (not part of the series, added by m150/ci/apply-tests.py): T6 gets tests
 for set true / read true, set false / read false and one TuningGeneration()
-bump per real change; T11d (m150/tests/ssl_stream_adapter_pqc_tests.inc,
+bump per real change; T11d (m150/tests/ssl_stream_adapter_strict_tests.inc,
 spliced into ssl_stream_adapter_unittest.cc, strict config) handshakes a client
 limited to X25519 against a strict server: refused while the requirement is on,
 accepted once it is cleared.
@@ -211,7 +211,7 @@ index 4ccc6a1..445aee9 100644
  }
  
 ++ (void)setQaudionRequireDtlsPqc:(BOOL)required {
-+  webrtc::qaudion::SetRequireDtlsPqc(required == YES);
++  webrtc::qaudion::SetRequireDtlsPqc(required != NO);
 +}
 +
  + (void)setQaudionRequireDtlsPqc {
