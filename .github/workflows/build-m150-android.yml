@@ -155,6 +155,8 @@ jobs:
         run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" android
 
       - name: Fetch Opus DNN weights (sha256-pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
       - name: Build raw AAR (arm64-v8a)

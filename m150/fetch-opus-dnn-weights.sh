@@ -62,22 +62,53 @@ trap 'rm -rf "$WORK"' EXIT
 TARBALL="$WORK/opus_data.tar.gz"
 
 echo "::group::fetch-opus-dnn-weights: download"
+# Primary source: upstream (xiph). media.xiph.org is intermittently
+# unreachable from GitHub runners, so after all attempts fail we fall back to
+# a byte-identical mirror kept as a release asset of THIS repo. The mirror
+# tag and asset name are derived from the pinned MODEL_SHA256, so a changed
+# pin can never silently pick up a mirror of different bytes (it would simply
+# not exist). Whatever source is used, the sha256 check below is the only
+# gate and fails closed.
+MIRROR_TAG="opus-dnn-weights-$(printf '%s' "$MODEL_SHA256" | cut -c1-8)"
+MIRROR_ASSET="opus_data-${MODEL_SHA256}.tar.gz"
+SOURCE=""
 echo "url: $MODEL_URL"
 i=0
-ok=0
 while [ "$i" -lt 5 ]; do
   i=$((i + 1))
-  if curl -fsSL --connect-timeout 15 --max-time 300 -o "$TARBALL" "$MODEL_URL"; then
-    ok=1
+  if curl -fsSL --connect-timeout 30 --max-time 300 -o "$TARBALL" "$MODEL_URL"; then
+    SOURCE="xiph ($MODEL_URL)"
     break
   fi
-  echo "download attempt $i failed, retrying..."
+  rm -f "$TARBALL"
+  echo "download attempt $i from xiph failed, retrying..."
   sleep $((i * 3))
 done
-if [ "$ok" -ne 1 ]; then
-  echo "::error::fetch-opus-dnn-weights: could not download $MODEL_URL after $i attempts" >&2
+if [ -z "$SOURCE" ]; then
+  echo "::warning::fetch-opus-dnn-weights: xiph unreachable after $i attempts, falling back to mirror release $MIRROR_TAG"
+  if [ -z "${GITHUB_REPOSITORY:-}" ] || [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || ! command -v gh >/dev/null 2>&1; then
+    echo "::error::fetch-opus-dnn-weights: mirror fallback unavailable (needs gh, GITHUB_REPOSITORY and GH_TOKEN)" >&2
+    exit 1
+  fi
+  MIRROR_DIR="$WORK/mirror"
+  mkdir -p "$MIRROR_DIR"
+  j=0
+  while [ "$j" -lt 3 ]; do
+    j=$((j + 1))
+    if GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}" gh release download "$MIRROR_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$MIRROR_ASSET" --dir "$MIRROR_DIR" --clobber && [ -s "$MIRROR_DIR/$MIRROR_ASSET" ]; then
+      mv "$MIRROR_DIR/$MIRROR_ASSET" "$TARBALL"
+      SOURCE="mirror (release $MIRROR_TAG of $GITHUB_REPOSITORY)"
+      break
+    fi
+    echo "mirror download attempt $j failed, retrying..."
+    sleep $((j * 5))
+  done
+fi
+if [ -z "$SOURCE" ]; then
+  echo "::error::fetch-opus-dnn-weights: could not download the weights from xiph or from the mirror" >&2
   exit 1
 fi
+echo "fetch-opus-dnn-weights: source used: $SOURCE"
 ls -lh "$TARBALL"
 echo "::endgroup::"
 
@@ -113,4 +144,4 @@ echo "extracted into $OPUS_SRC/dnn:"
 ls -lh $(for m in $ALLOWED_MEMBERS; do printf '%s\n' "$OPUS_SRC/$m"; done)
 echo "::endgroup::"
 
-echo "fetch-opus-dnn-weights: ok (sha256 $MODEL_SHA256, $(printf '%s\n' $ALLOWED_MEMBERS | wc -l | tr -d ' ') files)"
+echo "fetch-opus-dnn-weights: ok (source: $SOURCE, sha256 $MODEL_SHA256, $(printf '%s\n' $ALLOWED_MEMBERS | wc -l | tr -d ' ') files)"
