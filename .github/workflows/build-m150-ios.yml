@@ -128,6 +128,8 @@ jobs:
         run: bash ctrl/m150/apply-series.sh "$RUNNER_TEMP/webrtc/src" ios
 
       - name: Fetch Opus DNN weights (sha256-pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$RUNNER_TEMP/webrtc/src/third_party/opus/src"
 
       - name: Force real ninja (Siso's iOS dep-scan invents missing SDK modulemaps - same fix as build-ios.yml)
