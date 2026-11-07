@@ -45,6 +45,13 @@ third_party P4a-opus-dnn-osce-build.patch
 # series touches that file).
 . P14-privacy-sensitive-capture.patch
 #
+# P15: the DTLS post-quantum requirement (qaudion::SetRequireDtlsPqc) becomes
+# clearable, so a server-flag rollback needs no app restart. Edits only text
+# that P7, P8 and P13 added (qaudion_tuning.{h,cc}, the factory glue of P8, the
+# policy function of P7); applied after P13/P14. The old no-argument Java/ObjC
+# entry points stay for one release.
+. P15-qaudion-pqc-clearable.patch
+#
 # Build-tooling author: P10 touches the separate 'build' repo (DEPS
 # 'src/build'), not the webrtc src tree or third_party, so it has no hunk
 # overlap with P1-P8/P4a and its position in this file does not matter.

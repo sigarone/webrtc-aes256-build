@@ -4,8 +4,10 @@
  *  rtc_base/ and added to rtc_base_unittests by m150/ci/apply-tests.py.
  *
  *  The tuning state is process-wide, so every test restores what it changes;
- *  the one-way (tighten-only) setters are not called here at all, because
- *  they cannot be undone for the other tests running in the same binary.
+ *  the one-way (tighten-only) setters (transport level, magic-bytes bypass)
+ *  are not called here at all, because they cannot be undone for the other
+ *  tests running in the same binary. The DTLS PQC requirement is clearable
+ *  since P15, so it is tested and restored like the other reversible knobs.
  */
 #include "rtc_base/qaudion_tuning.h"
 
@@ -24,12 +26,14 @@ class TuningRestorer {
       : enc_(qaudion::OpusEncoderComplexity()),
         dec_(qaudion::OpusDecoderComplexity()),
         loss_(qaudion::OpusMinPacketLossPercent()),
-        max_rate_(qaudion::OpusEncoderMaxPlaybackRate()) {}
+        max_rate_(qaudion::OpusEncoderMaxPlaybackRate()),
+        require_pqc_(qaudion::RequireDtlsPqc()) {}
   ~TuningRestorer() {
     qaudion::SetOpusEncoderComplexity(enc_);
     qaudion::SetOpusDecoderComplexity(dec_);
     qaudion::SetOpusMinPacketLossPercent(loss_);
     qaudion::SetOpusEncoderMaxPlaybackRate(max_rate_);
+    qaudion::SetRequireDtlsPqc(require_pqc_);
   }
 
  private:
@@ -37,6 +41,7 @@ class TuningRestorer {
   int dec_;
   int loss_;
   int max_rate_;
+  bool require_pqc_;
 };
 
 TEST(QaudionTuning, BuildInfoCarriesTheTransportMarker) {
@@ -191,6 +196,40 @@ TEST(QaudionTuning, EncoderMaxPlaybackRateBumpsTheGenerationOnlyOnAChange) {
   // Leaving the limit is a change too: the encoder has to learn about it.
   qaudion::SetOpusEncoderMaxPlaybackRate(-1);
   EXPECT_NE(qaudion::TuningGeneration(), g0);
+}
+
+// P15: the DTLS post-quantum requirement is no longer one-way.
+TEST(QaudionTuning, RequireDtlsPqcCanBeSetAndCleared) {
+  TuningRestorer restore;
+  qaudion::SetRequireDtlsPqc(true);
+  EXPECT_TRUE(qaudion::RequireDtlsPqc());
+  qaudion::SetRequireDtlsPqc(false);
+  EXPECT_FALSE(qaudion::RequireDtlsPqc());
+  // The argument-less call keeps meaning "required".
+  qaudion::SetRequireDtlsPqc();
+  EXPECT_TRUE(qaudion::RequireDtlsPqc());
+}
+
+TEST(QaudionTuning, RequireDtlsPqcBumpsTheGenerationOncePerChange) {
+  TuningRestorer restore;
+  qaudion::SetRequireDtlsPqc(false);
+  const uint32_t g0 = qaudion::TuningGeneration();
+  qaudion::SetRequireDtlsPqc(false);
+  EXPECT_EQ(qaudion::TuningGeneration(), g0);
+  qaudion::SetRequireDtlsPqc(true);
+  EXPECT_EQ(qaudion::TuningGeneration(), g0 + 1);
+  qaudion::SetRequireDtlsPqc(true);
+  EXPECT_EQ(qaudion::TuningGeneration(), g0 + 1);
+  qaudion::SetRequireDtlsPqc(false);
+  EXPECT_EQ(qaudion::TuningGeneration(), g0 + 2);
+}
+
+TEST(QaudionTuning, BuildInfoFollowsTheDtlsPqcRequirement) {
+  TuningRestorer restore;
+  qaudion::SetRequireDtlsPqc(true);
+  EXPECT_NE(qaudion::BuildInfo().find(" pqc_required=1"), std::string::npos);
+  qaudion::SetRequireDtlsPqc(false);
+  EXPECT_NE(qaudion::BuildInfo().find(" pqc_required=0"), std::string::npos);
 }
 
 }  // namespace

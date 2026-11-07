@@ -101,7 +101,7 @@ make_so_plain() {
   { printf 'Failed to derive HkdfSha256 key from secret.\000'
     printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000Q-AUDION frame-replay drop dup=\000'
     printf 'transport=strict\000'
-    printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000'
+    printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionRequireDtlsPqcValue\000setQaudionRequireDtlsPqc:\000'
     printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'
   } > "$1"
   pad_file "$1"
@@ -121,7 +121,7 @@ make_xcframework() { # $1=out_dir $2=so_maker
   d="$1"; rm -rf "$d"; mkdir -p "$d/ios-arm64/WebRTC.framework" "$d/ios-arm64-simulator/WebRTC.framework" "$d/Headers"
   "$2" "$d/ios-arm64/WebRTC.framework/WebRTC"
   "$2" "$d/ios-arm64-simulator/WebRTC.framework/WebRTC"
-  printf 'setQaudionOpusEncoderComplexity' > "$d/Headers/RTCPeerConnectionFactory.h"
+  printf 'setQaudionOpusEncoderComplexity\nsetQaudionRequireDtlsPqc:(BOOL)required' > "$d/Headers/RTCPeerConnectionFactory.h"
   cat > "$d/Info.plist" <<'EOF'
 <?xml version="1.0"?>
 <plist><dict>
@@ -147,7 +147,7 @@ expect_happy "ios plain: all gates pass" sh "$GATES" ios plain "$XC" "$DNN" "$SS
 echo "=== negative: G1 fails when key material present ==="
 AARBAD="$T/g1bad.aar"
 # a leaky .so variant instead of the clean one
-make_so_leaky() { { printf 'secret \000 len \000 slat << \000\n derived_key \000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000Q-AUDION frame-replay drop dup=\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
+make_so_leaky() { { printf 'secret \000 len \000 slat << \000\n derived_key \000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000Q-AUDION frame-replay drop dup=\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionRequireDtlsPqcValue\000setQaudionRequireDtlsPqc:\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
 make_aar "$AARBAD" make_so_leaky arm64-v8a
 # rc=2, not 1: this fixture also lacks the G1 positive-control string, so
 # assert-no-key-strings.sh fails closed on "can't even see this code" before
@@ -156,7 +156,7 @@ make_aar "$AARBAD" make_so_leaky arm64-v8a
 expect "G1 catches leaked key material" 2 sh "$GATES" android plain "$AARBAD" "$DNN" "$SSLH"
 
 echo "=== negative: G3 fails when the P12 frame-replay marker is missing ==="
-make_so_noreplay() { { printf 'Failed to derive HkdfSha256 key from secret.\000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
+make_so_noreplay() { { printf 'Failed to derive HkdfSha256 key from secret.\000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionRequireDtlsPqcValue\000setQaudionRequireDtlsPqc:\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
 AARG3="$T/g3bad.aar"
 make_aar "$AARG3" make_so_noreplay arm64-v8a
 expect "G3 catches a build without the Q-AUDION frame-replay marker" 1 sh "$GATES" android plain "$AARG3" "$DNN" "$SSLH"
@@ -165,7 +165,7 @@ echo "=== negative: the removed -lk variant is rejected ==="
 expect "gates.sh refuses the removed lk variant" 2 sh "$GATES" android lk "$AAR" "$DNN" "$SSLH"
 
 echo "=== negative: G2 fails when plain build carries the relaxed-cipher marker ==="
-make_so_relaxed() { { printf 'Failed to derive HkdfSha256 key from secret.\000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000Q-AUDION frame-replay drop dup=\000'; printf '!AESGCM+AES256\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
+make_so_relaxed() { { printf 'Failed to derive HkdfSha256 key from secret.\000'; printf 'Q-AUDION dtls\000Q-AUDION opus-dec\000Q-AUDION opus-enc\000Q-AUDION frame-replay drop dup=\000'; printf '!AESGCM+AES256\000transport=strict\000'; printf 'setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_setQaudionOpusEncoderComplexity\000Java_org_webrtc_PeerConnectionFactory_nativeSetQaudionRequireDtlsPqcValue\000setQaudionRequireDtlsPqc:\000'; printf 'plcmodel_arrays\000fargan_arrays\000plc_dense_in_weights_float\000'; } > "$1"; pad_file "$1"; }
 AARG2="$T/g2bad.aar"
 make_aar "$AARG2" make_so_relaxed arm64-v8a
 expect "G2 catches the relaxed-cipher marker in a plain build" 1 sh "$GATES" android plain "$AARG2" "$DNN" "$SSLH"

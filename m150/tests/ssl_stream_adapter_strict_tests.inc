@@ -219,6 +219,81 @@ TEST_F(QaudionStrictDtlsTest, StockDtls12ClientIsRefusedByAProtocolVersionAlert)
   EXPECT_NE(server_ssl_->GetState(), SS_OPEN);
 }
 
+// T11d (P15): the DTLS post-quantum requirement is read when a handshake
+// completes and can be cleared again. A client that can only do X25519 is
+// refused by a strict server while the requirement is on, and the very same
+// setup connects once it is cleared; with the hybrid group on both ends the
+// requirement is met.
+class QaudionPqcRequirementRestorer {
+ public:
+  QaudionPqcRequirementRestorer() : previous_(qaudion::RequireDtlsPqc()) {}
+  ~QaudionPqcRequirementRestorer() { qaudion::SetRequireDtlsPqc(previous_); }
+
+ private:
+  const bool previous_;
+};
+
+class QaudionStrictPqcRequirementTest : public QaudionStrictDtlsTest {
+ protected:
+  // The client offers X25519 only (a peer without the hybrid group); the
+  // server keeps the strict build's default groups.
+  void ClientWithoutHybridGroup() {
+    SetDtlsSrtpCryptoSuites({kSrtpAeadAes256Gcm}, true);
+    SetDtlsSrtpCryptoSuites({kSrtpAeadAes256Gcm}, false);
+    ASSERT_TRUE(client_ssl_->SetSslGroupIds(
+        {CryptoOptions::EphemeralKeyExchangeCipherGroups::kX25519}));
+    CryptoOptions::EphemeralKeyExchangeCipherGroups groups;
+    ASSERT_TRUE(server_ssl_->SetSslGroupIds(groups.GetEnabled()));
+  }
+};
+
+TEST_F(QaudionStrictPqcRequirementTest,
+       RequirementOnRefusesAClientWithoutThePqcGroup) {
+  QaudionPqcRequirementRestorer restore;
+  ClientWithoutHybridGroup();
+  qaudion::SetRequireDtlsPqc(true);
+  TestHandshake(/*expect_success=*/false);
+
+  EXPECT_NE(client_ssl_->GetState(), SS_OPEN);
+  EXPECT_NE(server_ssl_->GetState(), SS_OPEN);
+}
+
+TEST_F(QaudionStrictPqcRequirementTest, ClearedRequirementAcceptsTheSameSetup) {
+  QaudionPqcRequirementRestorer restore;
+  ClientWithoutHybridGroup();
+  qaudion::SetRequireDtlsPqc(true);
+  qaudion::SetRequireDtlsPqc(false);  // a server-flag rollback, no restart
+  TestHandshake();
+
+  EXPECT_EQ(client_ssl_->GetSslGroupId(),
+            CryptoOptions::EphemeralKeyExchangeCipherGroups::kX25519);
+  EXPECT_EQ(server_ssl_->GetSslGroupId(),
+            CryptoOptions::EphemeralKeyExchangeCipherGroups::kX25519);
+  // Only the PQC requirement was lifted: the rest of the strict policy still
+  // holds for the connection that came up.
+  for (bool client : {true, false}) {
+    int version = 0;
+    ASSERT_TRUE(GetSslVersionBytes(client, &version));
+    EXPECT_EQ(version, kDtls13VersionBytes);
+    int srtp = 0;
+    ASSERT_TRUE(GetDtlsSrtpCryptoSuite(client, &srtp));
+    EXPECT_EQ(srtp, kSrtpAeadAes256Gcm);
+  }
+}
+
+TEST_F(QaudionStrictPqcRequirementTest, RequirementOnIsMetByTheHybridGroup) {
+  QaudionPqcRequirementRestorer restore;
+  SetDtlsSrtpCryptoSuites({kSrtpAeadAes256Gcm}, true);
+  SetDtlsSrtpCryptoSuites({kSrtpAeadAes256Gcm}, false);
+  EnableDefaultGroupsOnBothEnds();
+  qaudion::SetRequireDtlsPqc(true);
+  TestHandshake();
+
+  EXPECT_EQ(
+      client_ssl_->GetSslGroupId(),
+      CryptoOptions::EphemeralKeyExchangeCipherGroups::kX25519_MLKEM768);
+}
+
 #endif  // QAUDION_TRANSPORT_STRICT && OPENSSL_IS_BORINGSSL
 
 // T11b: the crypto options a strict build hands to every PeerConnection.

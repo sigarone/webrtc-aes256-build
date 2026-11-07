@@ -328,7 +328,7 @@ echo "::endgroup::"
 gate_ok G7
 
 # ---------------------------------------------------------------------------
-# G8 - P8 runtime API present: Android classes.jar has
+# G8 (+P15) - P8 runtime API present: Android classes.jar has
 # setQaudionOpusEncoderComplexity under org/webrtc/,
 # AND the .so has the matching JNI symbol/string. iOS: the umbrella header
 # under Headers/ declares it, and the selector is in the binary.
@@ -348,6 +348,14 @@ if [ "$PLATFORM" = windows ]; then
     done
     [ "$found" -eq 1 ] || gate_fail "G8 (no ${fn}@qaudion symbol in webrtc.lib)"
   done
+  # P15: SetRequireDtlsPqc takes a bool (clearable), i.e. ...YAX_N@Z. A P8-only
+  # build exports the argument-less ...YAXXZ and must not pass.
+  grep -q -F 'SetRequireDtlsPqc(bool' "$QH" || gate_fail "G8 (qaudion_tuning.h does not declare SetRequireDtlsPqc(bool), P15 missing)"
+  found=0
+  for f in $BINARIES; do
+    grep -a -q -F 'SetRequireDtlsPqc@qaudion@webrtc@@YAX_N@Z' "$f" 2>/dev/null && found=1
+  done
+  [ "$found" -eq 1 ] || gate_fail "G8 (no SetRequireDtlsPqc(bool) symbol in webrtc.lib, P15 missing)"
 elif [ "$PLATFORM" = android ]; then
   CJ="$AAR_SCAN/classes.jar"
   [ -f "$CJ" ] || gate_fail "G8 (no classes.jar in AAR)"
@@ -362,6 +370,15 @@ elif [ "$PLATFORM" = android ]; then
     grep -a -q -i -F 'QaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
   done
   [ "$found" -eq 1 ] || gate_fail "G8 (no QaudionOpusEncoderComplexity JNI export in any .so)"
+  # P15: the clearable DTLS PQC requirement. The Java overload keeps its name, so
+  # the pin is the new native method (boolean argument): in classes.jar and as a
+  # JNI export in the .so. A P8-only build has neither.
+  unzip -p "$CJ" "$PCF_CLASS" | grep -a -q -F 'nativeSetQaudionRequireDtlsPqcValue' || gate_fail "G8 (PeerConnectionFactory.class lacks nativeSetQaudionRequireDtlsPqcValue, P15 missing)"
+  found=0
+  for f in $BINARIES; do
+    grep -a -q -i -F 'QaudionRequireDtlsPqcValue' "$f" 2>/dev/null && found=1
+  done
+  [ "$found" -eq 1 ] || gate_fail "G8 (no QaudionRequireDtlsPqcValue JNI export in any .so, P15 missing)"
 else
   # Several headers match *PeerConnectionFactory* (e.g. ...FactoryOptions.h),
   # so look for the declaration itself in the framework's public headers.
@@ -373,6 +390,14 @@ else
     grep -a -q -F 'setQaudionOpusEncoderComplexity' "$f" 2>/dev/null && found=1
   done
   [ "$found" -eq 1 ] || gate_fail "G8 (selector setQaudionOpusEncoderComplexity: not found in any Mach-O slice)"
+  # P15: the clearable DTLS PQC requirement, selector WITH the BOOL argument
+  # (the trailing colon is what tells it from the old argument-less one).
+  grep -q -F 'setQaudionRequireDtlsPqc:(BOOL)' "$HDR" || gate_fail "G8 (RTCPeerConnectionFactory.h does not declare setQaudionRequireDtlsPqc:(BOOL), P15 missing)"
+  found=0
+  for f in $BINARIES; do
+    grep -a -q -F 'setQaudionRequireDtlsPqc:' "$f" 2>/dev/null && found=1
+  done
+  [ "$found" -eq 1 ] || gate_fail "G8 (selector setQaudionRequireDtlsPqc: not found in any Mach-O slice, P15 missing)"
 fi
 echo "::endgroup::"
 gate_ok G8

@@ -8,7 +8,8 @@ exist in the test jobs, so the patch set that BUILDINFO.json lists and the
 binaries stay exactly what the apps get.
 
   T6   rtc_base/qaudion_tuning_unittest.cc (new file): the runtime tuning API
-       and the "Q-AUDION build m150 transport=..." marker of P8.
+       (incl. the clearable DTLS PQC requirement of P15) and the
+       "Q-AUDION build m150 transport=..." marker of P8.
   T11  m150/tests/ssl_stream_adapter_strict_tests.inc is spliced into
        rtc_base/ssl_stream_adapter_unittest.cc (strict configuration only,
        guarded by QAUDION_TRANSPORT_STRICT inside the include): a stock-like
@@ -141,6 +142,11 @@ def patch_ssl_test(src):
     if a not in text:
         die("anchor '#include <openssl/digest.h>' not found")
     text = text.replace(a, "#include <openssl/bio.h>\n" + a + "#include <openssl/err.h>\n", 1)
+    # T11d (P15) reads and writes the DTLS PQC requirement of the tuning API.
+    q = '#include "rtc_base/message_digest.h"\n'
+    if q not in text:
+        die("anchor '#include \"rtc_base/message_digest.h\"' not found")
+    text = text.replace(q, q + '#include "rtc_base/qaudion_tuning.h"\n', 1)
     # splice before the two closing namespaces at the end of the file
     tail = "}  // namespace\n}  // namespace webrtc\n"
     idx = text.rfind(tail)
