@@ -106,6 +106,8 @@ jobs:
           python3 ctrl/m150/ci/kat2inc.py ctrl/m150/kat/group-calls-v2-frame-crypto.json "$WORKDIR/src/api/crypto/frame_crypto_kat_vectors.inc"
 
       - name: Fetch Opus DNN weights
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: |
           set -euo pipefail
           bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"

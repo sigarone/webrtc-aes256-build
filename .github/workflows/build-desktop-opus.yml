@@ -148,6 +148,8 @@ jobs:
         # Verifies against MODEL_SHA256, the constant baked into this script
         # itself (NOT the opus_weights_sha256 input — precheck's cross-check
         # step already failed the whole run if those two disagree).
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: bash ctrl/desktop-opus/fetch-opus-dnn-weights.sh "$RUNNER_TEMP/work/opus"
 
       - name: Assemble the addon build directory

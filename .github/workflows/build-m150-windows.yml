@@ -161,6 +161,8 @@ jobs:
         run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
 
       - name: Fetch Opus DNN weights (sha256-pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
       - name: Build webrtc.lib (x64, release)
@@ -265,6 +267,8 @@ jobs:
         run: bash ctrl/m150/apply-series.sh "$WORKDIR/src" win
 
       - name: Fetch Opus DNN weights
+        env:
+          GH_TOKEN: ${{ github.token }}  # mirror fallback (gh release download)
         run: bash ctrl/m150/fetch-opus-dnn-weights.sh "$WORKDIR/src/third_party/opus/src"
 
       - name: Generate frame-crypto KAT include (sha256-pinned shared vectors, T7)
